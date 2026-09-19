@@ -1,0 +1,791 @@
+/* Resurrección — mobile-first research instrument.
+   Vanilla JS, no build step. Efficient: SSE-driven partial renders,
+   bounded lists, no full-view re-renders per event. */
+(() => {
+  "use strict";
+
+  const TOKEN_KEY = "resurreccion_token";
+  const state = {
+    sessions: [], current: null, counts: null,
+    traceAfter: 0, view: "research",
+    mode: "prompt", images: [],
+    liveSessionId: null, recording: false,
+    reportOpen: null,
+    ws: { trace: new Map(), cands: [], opps: [], errors: [] },
+    liveTimer: null, recTimer: null, elapsedTimer: null,
+    lastRefresh: 0,
+  };
+
+  // ---------- helpers ----------
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+  const esc = (s) => String(s ?? "").replace(/[&<>\"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const THROTTLE_MS = 4000;
+
+  function authHeaders() {
+    const token = localStorage.getItem(TOKEN_KEY);
+    return token ? { "X-Auth-Token": token } : {};
+  }
+
+  async function api(path, opts = {}) {
+    const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) } });
+    if (res.status === 401) { showLogin(); throw new Error("Sign in required"); }
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail ?? detail; } catch {}
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  let toastTimer = null;
+  function toast(msg) {
+    const t = $("#toast");
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+  }
+
+  function confirmModal(title, body, confirmLabel) {
+    return new Promise((resolve) => {
+      const root = $("#modal-root");
+      root.innerHTML = `
+        <div class="modal-veil">
+          <div class="modal">
+            <h3>${esc(title)}</h3><p>${esc(body)}</p>
+            <div class="row">
+              <button class="btn ghost" data-a="no">Cancel</button>
+              <button class="btn danger" data-a="yes">${esc(confirmLabel || "Confirm")}</button>
+            </div>
+          </div>
+        </div>`;
+      root.querySelectorAll("button").forEach((b) =>
+        b.addEventListener("click", () => { root.innerHTML = ""; resolve(b.dataset.a === "yes"); }));
+    });
+  }
+
+  function fmtElapsed(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+  }
+  function fmtClock(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+    catch { return ""; }
+  }
+  const PHASE_LABEL = {
+    initializing: "Initializing", discovery: "Discovery", exploration: "Exploration",
+    verification: "Verification", synthesis: "Synthesis", reporting: "Reporting", done: "Complete",
+  };
+
+  // ---------- views / router ----------
+  function showLogin() {
+    $("#login-view").classList.add("active");
+    $("#login-view").classList.remove("hidden");
+    $("#app-view").style.display = "none";
+    stopAllStreams();
+  }
+
+  function showApp() {
+    $("#login-view").classList.add("hidden");
+    $("#login-view").classList.remove("active");
+    $("#app-view").style.display = "flex";
+    setView("research");
+    refreshSessions();
+    refreshSettings();
+  }
+
+  function setView(name) {
+    state.view = name;
+    $$(".view").forEach((v) => v.classList.remove("active"));
+    $(name === "research" ? "#v-research" : `#v-${name}`).classList.add("active");
+    $$("#tabbar button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+    $("#tb-context").textContent =
+      name === "research" && state.current ? state.current.name :
+      name === "live" && state.liveSessionId ? liveSessionName() : "";
+    if (name === "sessions") renderSessionsView();
+    if (name === "live") renderLiveView();
+    if (name === "reports") renderReportsView();
+    if (name === "settings") refreshSettings();
+  }
+
+  function liveSessionName() {
+    const s = state.sessions.find((x) => x.id === state.liveSessionId);
+    return s ? s.name : "";
+  }
+
+  // ---------- sessions ----------
+  async function refreshSessions() {
+    try {
+      const data = await api("/api/sessions");
+      state.sessions = data.sessions;
+      if (state.view === "sessions") renderSessionsView();
+      if (state.view === "live" && !state.liveSessionId) renderLiveView();
+      if (state.current) {
+        const s = state.sessions.find((x) => x.id === state.current.id);
+        if (s) { state.current = { ...state.current, ...s }; updateWsHead(state.current); }
+      }
+    } catch {}
+  }
+
+  function statusChip(s) {
+    const live = ["running", "queued", "verifying"].includes(s);
+    return `<span class="chip ${esc(s)}${live ? " pulse" : ""}"><span class="dot"></span>${esc(s)}</span>`;
+  }
+
+  function renderSessionsView() {
+    const el = $("#sess-list");
+    if (!state.sessions.length) {
+      el.innerHTML = `<div class="empty"><div class="mark">◈</div><p>No sessions yet.<br>Start your first research from the Research tab.</p></div>`;
+      return;
+    }
+    el.innerHTML = state.sessions.map((s) => {
+      const c = s.counts || {};
+      return `
+      <div class="sess-row" data-id="${esc(s.id)}">
+        <div class="sess-main">
+          <div class="sess-name">${esc(s.name)}</div>
+          <div class="sess-meta">
+            <span>${esc(PHASE_LABEL[s.phase] || s.phase)}</span>
+            <span>${fmtElapsed(s.elapsed_seconds)}</span>
+            <span>${esc((s.marketplaces || []).join(", ") || "auto")}</span>
+          </div>
+        </div>
+        <div class="sess-side">
+          ${statusChip(s.status)}
+          <span class="sess-count">${c.verified ?? 0}✓ · ${c.discovered ?? 0}◇</span>
+        </div>
+      </div>`;
+    }).join("");
+    el.querySelectorAll(".sess-row").forEach((row) =>
+      row.addEventListener("click", () => openSession(row.dataset.id, "research")));
+  }
+
+  async function openSession(id, targetView) {
+    state.liveSessionId = id;
+    state.ws = { trace: new Map(), cands: [], opps: [], errors: [] };
+    state.traceAfter = 0;
+    state.lastRefresh = 0;
+    $("#ws-trace").innerHTML = "";
+    $("#start-pane").classList.add("hidden");
+    $("#ws-pane").classList.remove("hidden");
+    $("#research-empty").classList.add("hidden");
+    setView(targetView || "research");
+    const { session } = await api(`/api/sessions/${id}`);
+    state.current = session;
+    updateWsHead(session);
+    renderCounts(session.counts || { discovered: 0, rejected: 0, verifying: 0, verified: 0 });
+    // Terminal sessions have nothing new to stream; skip the connection.
+    if (!["completed", "failed", "cancelled"].includes(session.status)) connectStream(id);
+    else state.lastRefresh = Date.now();
+    try {
+      const [cands, opps] = await Promise.all([
+        api(`/api/sessions/${id}/candidates`),
+        api(`/api/sessions/${id}/opportunities`),
+      ]);
+      renderCandidates(cands.candidates);
+      renderOpportunities(opps.opportunities);
+    } catch (e) { toast(e.message); }
+  }
+
+  function updateWsHead(s) {
+    $("#ws-name").textContent = s.name || "—";
+    $("#ws-mode").textContent = ({ prompt: "Directed", keywords: "Seeded", auto: "Autonomous" })[s.mode] || s.mode;
+    $("#ws-elapsed").textContent = fmtElapsed(s.elapsed_seconds);
+    const st = $("#ws-status");
+    st.className = `chip ${esc(s.status)}${["running", "queued"].includes(s.status) ? " pulse" : ""}`;
+    $("#ws-status-t").textContent = s.status;
+    $("#ws-progress").style.width = `${Math.round((s.progress || 0) * 100)}%`;
+    $("#ws-phase").textContent = PHASE_LABEL[s.phase] || s.phase;
+    $("#tb-context").textContent = state.view === "research" ? s.name : $("#tb-context").textContent;
+    renderActions(s);
+  }
+
+  function renderActions(s) {
+    const el = $("#ws-actions");
+    const btns = [];
+    if (s.status === "draft") btns.push(`<button class="btn primary small" data-act="start">Start research</button>`);
+    if (["interrupted", "paused"].includes(s.status)) btns.push(`<button class="btn primary small" data-act="resume">Resume</button>`);
+    if (s.status === "running") btns.push(`<button class="btn small" data-act="pause">Pause</button>`);
+    if (!["completed", "cancelled"].includes(s.status)) btns.push(`<button class="btn small danger" data-act="cancel">Cancel</button>`);
+    el.innerHTML = btns.join("");
+    el.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => sessionAction(b.dataset.act)));
+  }
+
+  async function sessionAction(act) {
+    const id = state.current?.id;
+    if (!id) return;
+    if (act === "cancel") {
+      const ok = await confirmModal(
+        "Cancel this session?",
+        "The research stops permanently. Everything learned so far stays available.",
+        "Cancel session");
+      if (!ok) return;
+    }
+    try {
+      const { session } = await api(`/api/sessions/${id}/${act}`, { method: "POST" });
+      state.current = session;
+      updateWsHead(session);
+      toast(({ start: "Research started", pause: "Pausing at a safe boundary", resume: "Resuming", cancel: "Cancelled" })[act] || act);
+      refreshSessions();
+    } catch (e) { toast(e.message); }
+  }
+
+  // ---------- SSE live stream ----------
+  let es = null;
+  function connectStream(sessionId) {
+    stopStream();
+    if (!window.EventSource) return;
+    try {
+      // Cookie-based SSE (EventSource can't send headers); backend also
+      // accepts the query-token fallback for quirky mobile browsers.
+      es = new EventSource(`/api/sessions/${sessionId}/stream`);
+      es.onmessage = (ev) => { try { applySnapshot(JSON.parse(ev.data)); } catch {} };
+      es.onerror = () => { /* EventSource auto-reconnects */ };
+    } catch {}
+  }
+  function stopStream() { if (es) { es.close(); es = null; } }
+  function stopAllStreams() {
+    stopStream();
+    clearInterval(state.liveTimer); state.liveTimer = null;
+    clearInterval(state.recTimer); state.recTimer = null;
+    clearInterval(state.elapsedTimer); state.elapsedTimer = null;
+    state.recording = false;
+    updateRecUI();
+  }
+
+  function applySnapshot(snap) {
+    const s = snap.session;
+    if (!state.current || s.id !== state.current.id) return;
+    const prevStatus = state.current.status;
+    state.current = { ...state.current, ...s };
+    updateWsHead(state.current);
+    renderCounts(snap.counts || state.current.counts);
+    // Trace: incremental append only — never re-render the whole feed.
+    if (snap.trace?.length) {
+      const feed = $("#ws-trace");
+      const frag = document.createDocumentFragment();
+      for (const t of snap.trace) {
+        if (state.ws.trace.has(t.id)) continue;
+        state.ws.trace.set(t.id, t);
+        const div = document.createElement("div");
+        div.className = `trace-item ${esc(t.kind)}`;
+        div.innerHTML = `<div class="trace-t">${esc(fmtClock(t.created_at))}</div>
+          <div class="trace-x"><span class="k">${esc(t.kind)}</span>${esc(t.text)}</div>`;
+        frag.appendChild(div);
+      }
+      if (frag.childNodes.length) {
+        feed.appendChild(frag);
+        $("#ws-trace-empty").hidden = true;
+        // Bound the feed in DOM and in the dedup map (6h sessions).
+        while (feed.children.length > 120) feed.removeChild(feed.firstChild);
+        if (state.ws.trace.size > 400) {
+          const excess = state.ws.trace.size - 400;
+          let dropped = 0;
+          for (const key of state.ws.trace.keys()) {
+            if (dropped++ >= excess) break;
+            state.ws.trace.delete(key);
+          }
+        }
+        if (nearBottom(feed.parentElement)) feed.parentElement.scrollTop = feed.parentElement.scrollHeight;
+      }
+    }
+    if (snap.recent_errors?.length) {
+      state.ws.errors = snap.recent_errors;
+      $("#ws-errors").textContent = snap.recent_errors
+        .map((e) => `[${fmtClock(e.created_at)}] ${e.severity}${e.recoverable ? " · recovered" : ""}: ${e.message}`)
+        .join("\n");
+    }
+    // Status transitions fetch the heavier lists.
+    if (s.status !== prevStatus || ["completed", "failed"].includes(s.status)) {
+      refreshFindings(s.id);
+      if (["completed", "failed", "cancelled"].includes(s.status) && state.recording) stopRecording();
+    }
+    // Elapsed clock stays honest between SSE pushes (heartbeat every 15s).
+    if (!state.elapsedTimer && state.current && ["running", "queued", "verifying"].includes(state.current.status)) {
+      state.elapsedTimer = setInterval(() => {
+        if (!state.current) return;
+        const t0 = Date.parse(state.current.updated_at || "") || 0;
+        if (!t0) return;
+        const base = state.current.elapsed_seconds || 0;
+        $("#ws-elapsed").textContent = fmtElapsed(base + Math.max(0, (Date.now() - t0) / 1000));
+      }, 1000);
+    } else if (state.elapsedTimer && state.current && !["running", "queued", "verifying"].includes(state.current.status)) {
+      clearInterval(state.elapsedTimer); state.elapsedTimer = null;
+      $("#ws-elapsed").textContent = fmtElapsed(state.current.elapsed_seconds);
+    }
+    const now = Date.now();
+    if (now - state.lastRefresh > THROTTLE_MS) {
+      state.lastRefresh = now;
+      refreshSessions();
+    }
+  }
+
+  function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
+
+  async function refreshFindings(id) {
+    try {
+      const [cands, opps] = await Promise.all([
+        api(`/api/sessions/${id}/candidates`),
+        api(`/api/sessions/${id}/opportunities`),
+      ]);
+      renderCandidates(cands.candidates);
+      renderOpportunities(opps.opportunities);
+    } catch {}
+  }
+
+  function renderCounts(c) {
+    if (!c) return;
+    $("#st-cand").textContent = (c.discovered ?? 0) + (c.verifying ?? 0) + (c.verified ?? 0);
+    $("#st-ver").textContent = c.verified ?? 0;
+    $("#st-rej").textContent = c.rejected ?? 0;
+    $("#st-opp").textContent = c.verified ?? 0;
+  }
+
+  function renderCandidates(cands) {
+    state.ws.cands = cands;
+    const el = $("#ws-cands");
+    if (!cands.length) {
+      el.innerHTML = `<div class="empty" style="padding:26px"><p class="muted" style="font-size:0.84rem;margin:0">No candidates yet — discovery runs first.</p></div>`;
+      return;
+    }
+    el.innerHTML = cands.slice(0, 30).map((c) => `
+      <div class="cand">
+        <div><div class="n">${esc(c.niche)}</div>
+        <div class="s">${esc(c.marketplace || "any market")}${c.rationale ? " — " + esc(c.rationale.slice(0, 90)) : ""}</div></div>
+        <span class="st st-${esc(c.status)}" style="font-size:0.68rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase">${esc(c.status)}</span>
+      </div>`).join("");
+    $("#cand-more").textContent = cands.length > 30 ? `showing 30 of ${cands.length}` : "";
+  }
+
+  function renderOpportunities(opps) {
+    state.ws.opps = opps;
+    const el = $("#ws-opps");
+    if (!opps.length) {
+      el.innerHTML = `<div class="empty" style="padding:26px"><p class="muted" style="font-size:0.84rem;margin:0">Verified opportunities appear here after synthesis.</p></div>`;
+      return;
+    }
+    el.innerHTML = opps.map((o) => {
+      const m = o.meta || {};
+      const conf = Math.round((o.confidence || 0) * 100);
+      return `
+      <div class="opp">
+        <h3>${esc(o.title)}</h3>
+        <div class="niche">${esc(o.niche)} · ${esc(o.marketplace || "")}</div>
+        <dl class="kv">
+          ${m.target_reader ? `<dt>Reader</dt><dd>${esc(m.target_reader)}</dd>` : ""}
+          ${m.market_gap ? `<dt>Market gap</dt><dd>${esc(m.market_gap)}</dd>` : ""}
+          ${m.differentiation ? `<dt>Edge</dt><dd>${esc(m.differentiation)}</dd>` : ""}
+          ${o.keywords?.length ? `<dt>Keywords</dt><dd>${esc(o.keywords.join(", "))}</dd>` : ""}
+          <dt>Verification</dt><dd class="${esc(m.verification_status || "").includes("reject") ? "error-text" : "ok-text"}">${esc(m.verification_status || "verified")}</dd>
+        </dl>
+        <div class="conf-bar"><i style="width:${conf}%"></i></div>
+        <div class="muted" style="font-size:0.7rem;margin-top:4px">confidence ${conf}%</div>
+      </div>`;
+    }).join("");
+  }
+
+  // ---------- live view (browser frames) ----------
+  function toggleLiveView() {
+    const img = $("#lv-img"), off = $("#lv-off"), btn = $("#lv-toggle");
+    if (img.classList.contains("hidden")) {
+      img.classList.remove("hidden"); off.classList.add("hidden");
+      btn.textContent = "Hide live view";
+      loadLiveFrame();
+      if (!state.liveTimer) state.liveTimer = setInterval(loadLiveFrame, 2500);
+    } else {
+      img.classList.add("hidden"); off.classList.remove("hidden");
+      btn.textContent = "Show live view";
+      clearInterval(state.liveTimer); state.liveTimer = null;
+    }
+  }
+  async function loadLiveFrame() {
+    const id = state.current?.id;
+    if (!id) return;
+    const img = $("#lv-img");
+    try {
+      const res = await fetch(`/api/sessions/${id}/live-view/frame`, { headers: authHeaders() });
+      if (res.status === 200) {
+        const blob = await res.blob();
+        if (img.src) URL.revokeObjectURL(img.src);
+        img.src = URL.createObjectURL(blob);
+      }
+    } catch {}
+  }
+
+  // ---------- recording ----------
+  function updateRecUI() {
+    const btn = $("#tb-record");
+    btn.classList.toggle("hidden", !state.current || !["running", "queued", "paused"].includes(state.current.status));
+    btn.classList.toggle("recording", state.recording);
+    $("#tb-record-label").textContent = state.recording ? "Stop" : "Record";
+    $("#rec-badge").classList.toggle("hidden", !state.recording);
+  }
+
+  async function toggleRecording() {
+    const id = state.current?.id;
+    if (!id) return;
+    if (!state.recording) {
+      if (state.current.status !== "running") {
+        toast("Recording is available while research is running");
+        return;
+      }
+      try {
+        await api(`/api/sessions/${id}/recording/start`, { method: "POST" });
+        state.recording = true;
+        updateRecUI();
+        toast("Recording — live view + trace are being captured");
+        if (!$("#lv-img").classList.contains("hidden")) toggleLiveView();
+      } catch (e) { toast(e.message); }
+    } else {
+      await stopRecording();
+    }
+  }
+
+  async function stopRecording() {
+    const id = state.current?.id;
+    if (!id || !state.recording) return;
+    try {
+      const { recording } = await api(`/api/sessions/${id}/recording/stop`, { method: "POST" });
+      state.recording = false;
+      updateRecUI();
+      if (recording?.artifact_id) toast("Recording saved to session artifacts");
+      else toast("Recording ended (nothing captured)");
+    } catch (e) {
+      state.recording = false;
+      updateRecUI();
+      toast(e.message);
+    }
+  }
+
+  // ---------- live tab ----------
+  function renderLiveView() {
+    const body = $("#live-body");
+    const running = state.sessions.filter((s) => ["running", "queued", "paused"].includes(s.status));
+    if (!running.length) {
+      body.innerHTML = `<div class="panel"><div class="empty"><div class="mark">◈</div><p>No live sessions.<br>Research appears here the moment it starts.</p></div></div>`;
+      return;
+    }
+    body.innerHTML = running.map((s) => `
+      <div class="panel">
+        <div class="sess-row" data-id="${esc(s.id)}">
+          <div class="sess-main">
+            <div class="sess-name">${esc(s.name)}</div>
+            <div class="sess-meta"><span>${esc(PHASE_LABEL[s.phase] || s.phase)}</span><span>${fmtElapsed(s.elapsed_seconds)}</span></div>
+          </div>
+          ${statusChip(s.status)}
+        </div>
+      </div>`).join("");
+    // Opening from Live lands in the Research workspace (the session's home).
+    body.querySelectorAll(".sess-row").forEach((row) =>
+      row.addEventListener("click", () => openSession(row.dataset.id, "research")));
+  }
+
+  // ---------- reports ----------
+  async function renderReportsView() {
+    const body = $("#reports-body");
+    if (!state.sessions.length) {
+      body.innerHTML = `<div class="panel"><div class="empty"><div class="mark">▤</div><p>No sessions yet.</p></div></div>`;
+      return;
+    }
+    body.innerHTML = `<div class="panel"><div class="empty"><div class="spinner"></div></div></div>`;
+    const perSession = await Promise.all(state.sessions.map(async (s) => {
+      try { return { s, reports: (await api(`/api/sessions/${s.id}/reports`)).reports }; }
+      catch { return { s, reports: [] }; }
+    }));
+    const rows = perSession.flatMap(({ s, reports }) => reports.map((r) => ({ s, r })));
+    if (!rows.length) {
+      body.innerHTML = `<div class="panel"><div class="empty"><div class="mark">▤</div><p>Reports appear as sessions complete.</p></div></div>`;
+      return;
+    }
+    body.innerHTML = `<div class="panel">${rows.map(({ s, r }) => `
+      <div class="rep-row" data-sid="${esc(s.id)}" data-rid="${esc(r.id)}">
+        <div>
+          <div class="rep-title">${esc(r.title)}${r.kind === "final" ? ' <span class="chip completed" style="margin-left:6px">final</span>' : ""}</div>
+          <div class="rep-sub">${esc(s.name)} · ${esc(fmtClock(r.created_at))}</div>
+        </div>
+        <span class="muted">›</span>
+      </div>`).join("")}</div>`;
+    body.querySelectorAll(".rep-row").forEach((row) =>
+      row.addEventListener("click", () => openReport(row.dataset.sid, row.dataset.rid, row.querySelector(".rep-title").textContent.trim())));
+  }
+
+  // Minimal, safe markdown → HTML for report bodies.
+  function mdToHtml(md) {
+    const lines = String(md || "").split("\n");
+    const out = [];
+    let inUl = false, inOl = false, tableBuf = [], inQuote = false;
+    const inline = (t) => esc(t)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>");
+    const flushTable = () => {
+      if (!tableBuf.length) return;
+      const rows = tableBuf.filter((r) => !/^\|[\s:|-]+\|$/.test(r.trim()));
+      const cells = rows.map((r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+      if (cells.length) {
+        const [head, ...body] = cells;
+        out.push('<div class="rtable-wrap"><table class="rt"><thead><tr>' +
+          head.map((h) => `<th>${inline(h)}</th>`).join("") + "</tr></thead><tbody>" +
+          body.map((r) => "<tr>" + r.map((c) => `<td>${inline(c)}</td>`).join("") + "</tr>").join("") +
+          "</tbody></table></div>");
+      }
+      tableBuf = [];
+    };
+    const flushLists = () => {
+      if (inUl) { out.push("</ul>"); inUl = false; }
+      if (inOl) { out.push("</ol>"); inOl = false; }
+      if (inQuote) { out.push("</blockquote>"); inQuote = false; }
+    };
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+      if (/^\s*\|.*\|\s*$/.test(line)) { flushLists(); tableBuf.push(line); continue; }
+      flushTable();
+      if (!line.trim()) { flushLists(); continue; }
+      const h = /^(#{1,4})\s+(.*)/.exec(line);
+      if (h) { flushLists(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+      if (/^---+\s*$/.test(line)) { flushLists(); out.push("<hr>"); continue; }
+      const ul = /^[-*]\s+(.*)/.exec(line);
+      if (ul) { if (inOl) { out.push("</ol>"); inOl = false; } if (!inUl) { out.push("<ul>"); inUl = true; } out.push(`<li>${inline(ul[1])}</li>`); continue; }
+      const ol = /^\d+[.)]\s+(.*)/.exec(line);
+      if (ol) { if (inUl) { out.push("</ul>"); inUl = false; } if (!inOl) { out.push("<ol>"); inOl = true; } out.push(`<li>${inline(ol[1])}</li>`); continue; }
+      const q = /^>\s?(.*)/.exec(line);
+      if (q) { if (!inQuote) { out.push('<blockquote>'); inQuote = true; } out.push(inline(q[1]) + "<br>"); continue; }
+      flushLists();
+      out.push(`<p>${inline(line)}</p>`);
+    }
+    flushTable(); flushLists();
+    return out.join("\n");
+  }
+
+  async function openReport(sid, rid, title) {
+    state.reportOpen = { sid, rid };
+    const body = $("#reports-body");
+    body.innerHTML = `<div class="panel"><div class="empty"><div class="spinner"></div></div></div>`;
+    try {
+      // The API returns { report, body_markdown }; v2 reports also carry a
+      // structured model we expose as a download (editable source of truth).
+      const data = await api(`/api/sessions/${sid}/reports/${rid}`);
+      const report = data.report ?? {};
+      const md = data.body_markdown ?? "";
+      const sections = splitReportSections(md);
+      body.innerHTML = `
+        <div class="spread mt14" style="margin-bottom:10px">
+          <button class="btn small ghost" id="rep-back">‹ All reports</button>
+          <span class="row">
+            <a class="btn small ghost" href="/api/sessions/${esc(sid)}/reports/${esc(rid)}/model" target="_blank" rel="noopener">Model</a>
+            <button class="btn small primary" id="rep-pdf">Export PDF</button>
+            <a class="btn small" href="/api/sessions/${esc(sid)}/reports/${esc(rid)}/file" target="_blank" rel="noopener">Download</a>
+          </span>
+        </div>
+        <div class="panel"><div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">${esc(report.title || title)}</h2>
+          <span class="chip ${esc(report.kind)}">${esc(report.kind)}</span></div>
+        <div class="section report-body" id="rep-body">${sections}</div></div>`;
+      $("#rep-back").addEventListener("click", renderReportsView);
+      $("#rep-pdf").addEventListener("click", () => exportPdf(sid, rid));
+      // Collapsible h2 sections for phone usability on long reports.
+      $("#rep-body").querySelectorAll("h2").forEach((h) => {
+        const wrap = document.createElement("div");
+        h.parentNode.insertBefore(wrap, h);
+        const det = document.createElement("details");
+        det.className = "sect";
+        const sum = document.createElement("summary");
+        sum.textContent = h.textContent;
+        const bd = document.createElement("div");
+        bd.className = "sect-body";
+        let n = h.nextSibling;
+        while (n && !(n.nodeType === 1 && /^H[12]$/i.test(n.tagName))) {
+          const next = n.nextSibling;
+          bd.appendChild(n);
+          n = next;
+        }
+        det.appendChild(sum); det.appendChild(bd);
+        wrap.appendChild(det);
+        det.open = true; // sections start expanded; owner collapses what's read
+        h.remove();
+      });
+    } catch (e) {
+      body.innerHTML = `<div class="panel"><div class="empty error-text">${esc(e.message)}</div></div>`;
+    }
+  }
+
+  function splitReportSections(md) { return mdToHtml(md); }
+
+  async function exportPdf(sid, rid) {
+    const btn = $("#rep-pdf");
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Rendering…';
+    try {
+      const res = await api(`/api/sessions/${sid}/reports/${rid}/export-pdf`, { method: "POST" });
+      const a = document.createElement("a");
+      a.href = `/api/sessions/${sid}/artifacts/${res.pdf.id}/file`;
+      a.download = res.pdf.path ? res.pdf.path.split("/").pop() : "report.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      toast("PDF exported — 6×9 report saved to session artifacts");
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+
+  // ---------- start research ----------
+  function bindStartResearch() {
+    $$("#mode-row .mode-btn").forEach((b) => b.addEventListener("click", () => {
+      $$("#mode-row .mode-btn").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      state.mode = b.dataset.mode;
+      const wrap = $("#f-prompt-wrap"), ta = $("#ns-prompt");
+      if (state.mode === "prompt") {
+        wrap.classList.remove("hidden"); $("#ns-prompt-label").textContent = "Research brief";
+        ta.placeholder = "e.g. Low-content journals for competitive swimmers recovering from injury…";
+        ta.rows = 5;
+      } else if (state.mode === "keywords") {
+        wrap.classList.remove("hidden"); $("#ns-prompt-label").textContent = "Keywords, ideas, rough concepts";
+        ta.placeholder = "grief journal, estate planner, first marathon…";
+        ta.rows = 3;
+      } else {
+        wrap.classList.add("hidden");
+      }
+      $("#ns-create-label").textContent =
+        state.mode === "auto" ? "Start Autonomous Discovery" : "Start Research";
+    }));
+
+    $("#ns-add-img").addEventListener("click", () => $("#ns-images").click());
+    $("#ns-images").addEventListener("change", () => {
+      for (const f of $("#ns-images").files) {
+        if (state.images.length >= 6) break;
+        state.images.push(f);
+      }
+      $("#ns-images").value = "";
+      renderImgThumbs();
+    });
+    $("#ns-create").addEventListener("click", createSession);
+  }
+
+  function renderImgThumbs() {
+    const row = $("#ns-img-row");
+    row.innerHTML = "";
+    state.images.forEach((f, i) => {
+      const d = document.createElement("div");
+      d.className = "img-thumb";
+      const img = document.createElement("img");
+      img.src = URL.createObjectURL(f);
+      img.onload = () => URL.revokeObjectURL(img.src);
+      const x = document.createElement("button");
+      x.textContent = "×";
+      x.addEventListener("click", () => { state.images.splice(i, 1); renderImgThumbs(); });
+      d.appendChild(img); d.appendChild(x);
+      row.appendChild(d);
+    });
+    $("#ns-img-count").textContent = state.images.length ? `${state.images.length} attached` : "";
+  }
+
+  async function createSession() {
+    const btn = $("#ns-create");
+    const prompt = $("#ns-prompt").value.trim();
+    if (state.mode === "prompt" && !prompt) { toast("Enter a research brief first"); return; }
+    if (state.mode === "keywords" && !prompt && !state.images.length) { toast("Add keywords or a reference image"); return; }
+    btn.disabled = true;
+    try {
+      const { session } = await api("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          mode: state.mode,
+          prompt: state.mode === "auto" ? "" : prompt,
+          objective: $("#ns-objective").value.trim(),
+          marketplaces: $("#ns-marketplaces").value.split(",").map((s) => s.trim()).filter(Boolean),
+        }),
+      });
+      for (const f of state.images) {
+        const fd = new FormData();
+        fd.append("file", f);
+        await fetch(`/api/sessions/${session.id}/uploads`, { method: "POST", headers: authHeaders(), body: fd });
+      }
+      state.images = []; renderImgThumbs();
+      $("#ns-prompt").value = ""; $("#ns-objective").value = ""; $("#ns-marketplaces").value = "";
+      await refreshSessions();
+      await openSession(session.id, "research");
+      sessionAction("start");
+    } catch (e) { toast(e.message); }
+    finally { btn.disabled = false; }
+  }
+
+  // ---------- settings ----------
+  async function refreshSettings() {
+    try {
+      const [az, kd, mk] = await Promise.all([
+        api("/api/browser/auth/amazon").catch(() => null),
+        api("/api/browser/extensions/kdspy").catch(() => null),
+        api("/api/browser/marketplaces").catch(() => null),
+      ]);
+      const setChip = (id, ok, warn) => {
+        const c = $(id);
+        c.textContent = ok ? "ready" : warn ? "attention" : "—";
+        c.className = `chip ${ok ? "completed" : warn ? "paused" : ""}`;
+      };
+      if (az) {
+        $("#set-amazon-state").textContent =
+          az.auth?.status === "confirmed" ? "Signed in — persistent profile active" :
+          az.auth?.status ? `Status: ${az.auth.status}` : "Not configured";
+        setChip("#set-amazon-chip", az.auth?.status === "confirmed", !!az.auth?.status && az.auth.status !== "confirmed");
+      }
+      if (kd) {
+        const ok = kd.extension?.status === "ready" || kd.state?.status === "ready";
+        const present = kd.extension?.present ?? kd.present ?? false;
+        $("#set-kdspy-state").textContent = ok ? "Installed and validated" : present ? "Present — needs validation" : "Extension directory not found";
+        setChip("#set-kdspy-chip", ok, present && !ok);
+      }
+      if (mk) {
+        $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
+      }
+    } catch {}
+    try {
+      const m = await api("/api/methodology");
+      $("#set-version").textContent = `${m.title || "9-phase methodology"} · Resurrección`;
+    } catch {}
+  }
+
+  // ---------- login ----------
+  function bindAuth() {
+    $("#login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const err = $("#login-error");
+      err.hidden = true;
+      try {
+        const data = await api("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ username: $("#login-username").value, password: $("#login-password").value }),
+        });
+        localStorage.setItem(TOKEN_KEY, data.token);
+        showApp();
+      } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+    });
+    $("#logout-btn").addEventListener("click", async () => {
+      try { await api("/api/auth/logout", { method: "POST" }); } catch {}
+      localStorage.removeItem(TOKEN_KEY);
+      state.current = null; state.sessions = []; state.liveSessionId = null;
+      showLogin();
+    });
+  }
+
+  // ---------- boot ----------
+  function bindTabbar() {
+    $$("#tabbar button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
+    $("#lv-toggle").addEventListener("click", toggleLiveView);
+    $("#tb-record").addEventListener("click", toggleRecording);
+  }
+
+  async function init() {
+    bindAuth(); bindTabbar(); bindStartResearch();
+    if (!localStorage.getItem(TOKEN_KEY)) { showLogin(); return; }
+    try { await api("/api/auth/me"); showApp(); }
+    catch { localStorage.removeItem(TOKEN_KEY); showLogin(); }
+  }
+
+  init();
+})();

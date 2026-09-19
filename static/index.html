@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Resurrección</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ======================= LOGIN ======================= -->
+  <section id="login-view" class="view active">
+    <div class="login-card">
+      <div class="login-mark">Resurrección</div>
+      <h1>Research instrument.</h1>
+      <p class="login-sub">Autonomous KDP market research, verified end to end.</p>
+      <form id="login-form">
+        <div class="field"><label for="login-username">Username</label>
+          <input id="login-username" autocomplete="username" required></div>
+        <div class="field"><label for="login-password">Password</label>
+          <input id="login-password" type="password" autocomplete="current-password" required></div>
+        <button type="submit" class="btn primary block">Sign in</button>
+        <p id="login-error" class="error-text" hidden></p>
+      </form>
+    </div>
+  </section>
+
+  <!-- ======================= APP ======================= -->
+  <section id="app-view" class="view" style="display:none; flex:1; flex-direction:column;">
+    <header class="topbar">
+      <div class="brand">
+        <div class="word">RESURRE<span>CT</span>IO</div>
+        <div class="context" id="tb-context"></div>
+      </div>
+      <button id="tb-record" class="btn small ghost record-btn hidden" title="Record live view">
+        <span class="dot"></span><span id="tb-record-label">Record</span>
+      </button>
+    </header>
+
+    <main class="content">
+
+      <!-- ========== RESEARCH (start + session workspace) ========== -->
+      <div id="v-research" class="view active">
+
+        <!-- Start research -->
+        <div id="start-pane">
+          <div class="hero">
+            <div class="kicker">KDP Market Research</div>
+            <h1>Find opportunities<br>worth <em>publishing.</em></h1>
+            <p>Give a brief, a few keywords, or nothing at all. Resurrección researches real marketplaces, verifies every claim, and returns evidence-backed opportunities.</p>
+          </div>
+
+          <div class="mode-row" id="mode-row">
+            <button type="button" class="mode-btn active" data-mode="prompt">
+              <strong>Directed</strong><span>A detailed research brief</span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="keywords">
+              <strong>Seeded</strong><span>Keywords, ideas, images</span>
+            </button>
+            <button type="button" class="mode-btn" data-mode="auto">
+              <strong>Autonomous</strong><span>Discover niches for me</span>
+            </button>
+          </div>
+
+          <div class="panel">
+            <div class="section">
+              <div class="field" id="f-prompt-wrap">
+                <label for="ns-prompt" id="ns-prompt-label">Research brief</label>
+                <textarea id="ns-prompt" rows="5" placeholder="e.g. Low-content journals for competitive swimmers recovering from injury…"></textarea>
+              </div>
+              <div class="field">
+                <label for="ns-objective">Optimization objective <span class="muted">(optional)</span></label>
+                <input type="text" id="ns-objective" placeholder="e.g. lowest-competition verified gaps">
+              </div>
+              <div class="field">
+                <label for="ns-marketplaces">Marketplaces <span class="muted">(optional — agent picks if empty)</span></label>
+                <input type="text" id="ns-marketplaces" inputmode="url" autocomplete="off" placeholder="amazon.com, amazon.co.uk…">
+              </div>
+              <div class="field">
+                <span class="field-label">Reference images <span class="muted">(optional)</span></span>
+                <div class="row">
+                  <button type="button" id="ns-add-img" class="btn small ghost">+ Add image</button>
+                  <span class="muted" style="font-size:0.76rem" id="ns-img-count"></span>
+                </div>
+                <div class="img-row" id="ns-img-row"></div>
+                <input type="file" id="ns-images" accept="image/png,image/jpeg,image/webp,image/gif" multiple class="hidden">
+              </div>
+            </div>
+          </div>
+
+          <button id="ns-create" class="btn primary big-start">
+            <span id="ns-create-label">Start Research</span>
+          </button>
+          <p class="muted mt8" style="font-size:0.74rem; text-align:center">
+            Runs autonomously for hours — no need to keep this page open.
+          </p>
+        </div>
+
+        <!-- Session workspace -->
+        <div id="ws-pane" class="hidden">
+          <div class="ws-head">
+            <h1 id="ws-name">—</h1>
+            <div class="ws-sub">
+              <span class="chip" id="ws-status"><span class="dot"></span><span id="ws-status-t">—</span></span>
+              <span class="sep">·</span>
+              <span class="muted" style="font-size:0.78rem" id="ws-mode">—</span>
+              <span class="sep">·</span>
+              <span class="muted mono" style="font-size:0.78rem" id="ws-elapsed">0:00</span>
+            </div>
+            <div class="progress"><i id="ws-progress" style="width:0%"></i></div>
+            <div class="phase-line" id="ws-phase-line">
+              <span class="muted">Phase</span> <span class="ph" id="ws-phase">—</span>
+              <span class="muted" id="ws-phase-note"></span>
+            </div>
+            <div class="ws-actions" id="ws-actions"></div>
+          </div>
+
+          <div class="stat-grid">
+            <div class="stat"><div class="n" id="st-cand">0</div><div class="l">Candidates</div></div>
+            <div class="stat ok"><div class="n" id="st-ver">0</div><div class="l">Verified</div></div>
+            <div class="stat"><div class="n" id="st-rej">0</div><div class="l">Rejected</div></div>
+            <div class="stat accent"><div class="n" id="st-opp">0</div><div class="l">Opportunities</div></div>
+          </div>
+
+          <div class="panel">
+            <div class="liveview-wrap">
+              <div class="rec-badge hidden" id="rec-badge"><span class="dot"></span>REC</div>
+              <img id="lv-img" alt="" class="hidden">
+              <div class="liveview-off" id="lv-off">
+                <div class="mark">◈</div>
+                Live browser view is off<br>Research continues regardless.
+              </div>
+            </div>
+            <div class="panel-h">
+              <h2>Live research</h2>
+              <button id="lv-toggle" class="btn small ghost">Show live view</button>
+            </div>
+            <div class="trace-feed" id="ws-trace"></div>
+            <div class="section" id="ws-trace-empty" hidden>
+              <p class="muted" style="font-size:0.84rem; margin:0">Waiting for the agent to report activity…</p>
+            </div>
+          </div>
+
+          <div class="panel mt14">
+            <div class="panel-h"><h2>Candidates</h2><span class="muted mono" style="font-size:0.72rem" id="cand-more"></span></div>
+            <div id="ws-cands"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-h"><h2>Opportunities</h2></div>
+            <div id="ws-opps"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-h"><h2>Errors &amp; recoveries</h2></div>
+            <div class="section mono" id="ws-errors" style="max-height:180px; overflow-y:auto"></div>
+          </div>
+        </div>
+
+        <div id="research-empty" class="empty hidden">
+          <div class="mark">◈</div>
+          <p>Select or start a session.</p>
+        </div>
+      </div>
+
+      <!-- ========== SESSIONS ========== -->
+      <div id="v-sessions" class="view">
+        <div class="hero" style="padding-bottom:12px">
+          <div class="kicker">Archive</div>
+          <h1>Sessions</h1>
+        </div>
+        <div class="panel"><div id="sess-list"></div></div>
+      </div>
+
+      <!-- ========== LIVE ========== -->
+      <div id="v-live" class="view">
+        <div class="hero" style="padding-bottom:12px">
+          <div class="kicker">Realtime</div>
+          <h1>Live</h1>
+        </div>
+        <div id="live-body"></div>
+      </div>
+
+      <!-- ========== REPORTS ========== -->
+      <div id="v-reports" class="view">
+        <div class="hero" style="padding-bottom:12px">
+          <div class="kicker">Deliverables</div>
+          <h1>Reports</h1>
+        </div>
+        <div id="reports-body"></div>
+      </div>
+
+      <!-- ========== SETTINGS ========== -->
+      <div id="v-settings" class="view">
+        <div class="hero" style="padding-bottom:12px">
+          <div class="kicker">Configuration</div>
+          <h1>Settings</h1>
+        </div>
+        <div class="panel">
+          <div class="set-row">
+            <div><div class="set-k">Amazon authentication</div>
+              <div class="set-d" id="set-amazon-state">Checking…</div></div>
+            <span class="chip" id="set-amazon-chip">—</span>
+          </div>
+          <div class="set-row">
+            <div><div class="set-k">KDSpy Pro extension</div>
+              <div class="set-d" id="set-kdspy-state">Checking…</div></div>
+            <span class="chip" id="set-kdspy-chip">—</span>
+          </div>
+          <div class="set-row">
+            <div><div class="set-k">Marketplaces configured</div>
+              <div class="set-d">Available to the research agent</div></div>
+            <span class="chip" id="set-mkt-count">—</span>
+          </div>
+          <div class="set-row">
+            <div><div class="set-k">Methodology</div>
+              <div class="set-d">9-phase deterministic research process</div></div>
+            <button class="btn small ghost" id="set-view-methodology">View</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="set-row">
+            <div><div class="set-k">Sign out</div>
+              <div class="set-d">End this device's session</div></div>
+            <button class="btn small danger" id="logout-btn">Sign out</button>
+          </div>
+        </div>
+        <p class="muted" style="font-size:0.7rem; text-align:center" id="set-version"></p>
+      </div>
+
+    </main>
+
+    <nav class="tabbar" id="tabbar">
+      <button data-view="research" class="active">
+        <svg viewBox="0 0 24 24"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>
+        Research
+      </button>
+      <button data-view="sessions">
+        <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        Sessions
+      </button>
+      <button data-view="live">
+        <svg viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        Live
+      </button>
+      <button data-view="reports">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+        Reports
+      </button>
+      <button data-view="settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+      </button>
+    </nav>
+  </section>
+
+</div>
+
+<div id="toast" role="status"></div>
+<div id="modal-root"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

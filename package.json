@@ -1,0 +1,14 @@
+{
+  "name": "resurreccion-pdf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PDF export sidecar for Resurrección — renders the report HTML into a 6x9in PDF via PDFKit.",
+  "type": "commonjs",
+  "main": "scripts/render_pdf.js",
+  "scripts": {
+    "render": "node scripts/render_pdf.js"
+  },
+  "dependencies": {
+    "pdfkit": "^0.15.0"
+  }
+}

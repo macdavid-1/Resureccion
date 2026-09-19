@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime state (research data is durable storage, never repo content)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Node (PDFKit sidecar)
+node_modules/
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

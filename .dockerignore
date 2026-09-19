@@ -1,0 +1,22 @@
+# Never enter the production image
+.git/
+.gitignore
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+package-lock.json
+data/
+tests/
+docs/
+*.md
+README.md
+ENV_VARS.md
+Dockerfile
+.dockerignore
