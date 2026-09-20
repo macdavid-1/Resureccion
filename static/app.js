@@ -739,8 +739,34 @@
     $("#rbrowser").classList.remove("hidden");
     document.body.style.overflow = "hidden";
     $("#rb-url").textContent = session?.url || "—";
+    renderRbTabs();
     if (!rb.timer) rb.timer = setInterval(rbTick, 1200);
     rbTick();
+  }
+
+  // Tabs the SITE opened (target=_blank) — kdspy.com's Login opens its
+  // member form in a new tab; without a switcher it sits there invisible.
+  function renderRbTabs() {
+    const wrap = $("#rb-tabs");
+    const tabs = rb.session?.tabs || [];
+    if (tabs.length <= 1) { wrap.classList.add("hidden"); wrap.innerHTML = ""; return; }
+    wrap.classList.remove("hidden");
+    wrap.innerHTML = tabs.map((u, i) =>
+      `<button class="rb-tab ${i === (rb.session?.active_tab ?? 0) ? "active" : ""}" data-i="${i}">${esc(shortHost(u, i))}</button>`).join("");
+    wrap.querySelectorAll(".rb-tab").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const { session } = await api("/api/browser/interactive/action", {
+          method: "POST", body: JSON.stringify({ action: "switch_tab", args: { index: +b.dataset.i } }),
+        });
+        rb.session = session;
+        renderRbTabs();
+        rbTick();
+      }));
+  }
+
+  function shortHost(u, i) {
+    try { return `Tab ${i + 1} · ${new URL(u).hostname.replace(/^www\./, "")}`; }
+    catch { return `Tab ${i + 1}`; }
   }
 
   function rbHide() {
@@ -770,8 +796,10 @@
       // Refresh TTL + URL from state endpoint (cheap, no image).
       const st = await fetch("/api/browser/interactive/state", { headers: authHeaders() }).then((r) => r.json()).catch(() => null);
       if (st?.session) {
+        const prevTabCount = rb.session?.tabs?.length ?? 0;
         rb.session = st.session;
         $("#rb-url").textContent = st.session.url || "—";
+        if ((st.session.tabs?.length ?? 0) !== prevTabCount) renderRbTabs();
         const secs = st.session.seconds_remaining ?? 0;
         $("#rb-timer-t").textContent = fmtElapsed(secs) + " left";
         if (secs <= 0) { toast("Interactive session expired"); rbDone(); }
@@ -789,6 +817,7 @@
       });
       rb.session = data.session;
       $("#rb-url").textContent = data.session.url || "—";
+      renderRbTabs();
       rbTick();
     } catch (e) {
       toast(e.message);

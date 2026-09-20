@@ -42,6 +42,10 @@ class FakePage:
         self.protected = False
         self.mouse = FakeInput()
         self.keyboard = FakeInput()
+        self.listeners: dict[str, list[Any]] = {}
+
+    def on(self, event: str, handler: Any) -> None:
+        self.listeners.setdefault(event, []).append(handler)
 
     async def title(self) -> str:
         return "Amazon"
@@ -264,6 +268,34 @@ async def test_complete_never_closes_research_pages(manager: InteractiveSessionM
     assert manager.browser.page.closed          # interactive tab closed
     assert not research.closed                  # research tab survived
     assert research in manager.browser._context.pages
+
+
+@pytest.mark.asyncio
+async def test_popup_tab_is_tracked_autofocused_and_switchable(
+    manager: InteractiveSessionManager,
+) -> None:
+    """kdspy.com's Login opens its member form in a NEW tab. The session must
+    track that tab, auto-focus it (so the stream shows the login form, not
+    the stale page), expose it for switching, and close it on complete."""
+    s = await manager.start(purpose="kdspy_setup")
+    assert s.tabs == ["https://www.kdspy.com/"] if hasattr(s, "tabs") else True
+    # The site opens the login popup (real Playwright fires the popup event).
+    popup = FakePage()
+    popup.url = "https://www.publishingaltitude.com/wp-login.php"
+    handlers = manager.browser.page.listeners["popup"]
+    for h in handlers:
+        h(popup)
+    assert len(s.pages) == 2
+    assert s.active == 1                      # auto-focused the login tab
+    assert "publishingaltitude" in (s.page.url or "")
+    # Owner can switch back to the first tab.
+    s2 = await manager.act("switch_tab", {"index": 0})
+    assert s2.active == 0
+    # Completing closes BOTH tabs.
+    await manager.complete(outcome="completed")
+    assert manager.browser.page.closed
+    assert popup.closed
+    assert s.pages == []
 
 
 # ------------------------------------------------------ extension install

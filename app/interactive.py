@@ -44,6 +44,7 @@ ACTION_LIMITS: dict[str, dict[str, int]] = {
     "key": {"key": 40},
     "scroll": {"dy": 3000},
     "navigate": {"url": 2000},
+    "switch_tab": {"index": 8},
 }
 
 
@@ -61,18 +62,36 @@ class InteractiveSession:
     status: str = "open"  # open | completed | expired | cancelled
     last_url: str = ""
     last_title: str = ""
-    _page: Any = field(default=None, repr=False, compare=False)
+    # Pages owned by this session, in open order. index 0 is the tab the
+    # session started with; later entries are popups the site opened (e.g.
+    # kdspy.com's Login button opens its member-login page in a NEW TAB).
+    pages: list[Any] = field(default_factory=list)
+    active: int = 0
+
+    @property
+    def page(self) -> Any:
+        """The currently-viewed page (what frames and actions target)."""
+        if not self.pages:
+            return None
+        return self.pages[min(self.active, len(self.pages) - 1)]
+
+    @property
+    def _page(self) -> Any:  # back-compat alias used by frame/act/complete
+        return self.page
 
     def to_dict(self) -> dict[str, Any]:
+        p = self.page
         return {
             "id": self.id,
             "marketplace": self.marketplace_code,
             "purpose": self.purpose,
             "status": self.status,
-            "url": scrub_url(self.last_url),
+            "url": scrub_url(getattr(p, "url", "") or self.last_url),
             "title": self.last_title,
             "expires_at": _iso_from(self.expires_at),
             "seconds_remaining": max(0, int(self.expires_at - time.time())),
+            "tabs": [scrub_url(getattr(x, "url", "") or "") for x in self.pages],
+            "active_tab": self.active,
         }
 
 
@@ -148,7 +167,9 @@ class InteractiveSessionManager:
                 page = await self._open_page(mkt, purpose)
             except BrowserManagerError as exc:
                 raise InteractiveError(f"browser launch failed: {exc}") from exc
-            session._page = page
+            session.pages = [page]
+            session.active = 0
+            self._watch_popups(session, page)
             session.last_url = page.url or ""
             try:
                 session.last_title = (await page.title()) or ""
@@ -158,6 +179,27 @@ class InteractiveSessionManager:
             # Durable record for the owner UI.
             self.windows.create("interactive", "kdspy", ttl)
             return session
+
+    def _watch_popups(self, session: InteractiveSession, page: Any) -> None:
+        """Track tabs the site opens (target=_blank / window.open).
+
+        kdspy.com's Login opens its member-login form in a NEW tab — without
+        this, the owner taps the button, the stream keeps showing the old
+        page, and the login form sits invisible in a hidden tab. Every popup
+        becomes a switchable tab, auto-focuses, and joins the session so
+        complete() closes it too.
+        """
+        def _on_popup(popup: Any) -> None:
+            if session.status != "open":
+                return
+            if popup not in session.pages:
+                session.pages.append(popup)
+                session.active = len(session.pages) - 1  # auto-focus the new tab
+                self._watch_popups(session, popup)
+        try:
+            page.on("popup", _on_popup)
+        except Exception:
+            pass
 
     async def _open_page(self, mkt: Marketplace, purpose: str) -> Any:
         page = await self.browser.new_page(interactive=True)
@@ -209,15 +251,30 @@ class InteractiveSessionManager:
                 except (TypeError, ValueError):
                     raise InteractiveError(f"{action}: {k} must be numeric") from None
                 v = max(-cap, min(cap, v))
+            elif k == "index":  # non-negative int — 0 is valid, never falsy-coerce
+                try:
+                    v = max(0, min(int(float(v)), cap))
+                except (TypeError, ValueError):
+                    raise InteractiveError(f"{action}: {k} must be numeric") from None
             else:
-                v = str(v or "")
+                v = str(v if v is not None else "")
                 if len(v) > cap:
                     raise InteractiveError(f"{action}: argument too long")
             clean[k] = v
-        page = s._page
+        page = s.page
+        if page is None:
+            raise InteractiveError("no open interactive session")
         try:
-            if action == "click":
+            if action == "switch_tab":
+                idx = max(0, min(int(clean["index"]), len(s.pages) - 1))
+                s.active = idx
+                page = s.page
+            elif action == "click":
                 await self._click_snapped(page, clean["x"], clean["y"])
+                # A click may have opened a new tab; focus it when it did.
+                if s.pages and s.pages[-1] is not page and len(s.pages) > s.active + 1:
+                    s.active = len(s.pages) - 1
+                    page = s.page
             elif action == "type":
                 await page.keyboard.type(clean["text"], delay=15)
             elif action == "key":
@@ -287,11 +344,16 @@ class InteractiveSessionManager:
         if s is None:
             raise InteractiveError("no interactive session")
         s.status = outcome if outcome in ("completed", "cancelled") else "completed"
-        # Close ONLY the interactive tab and popups it spawned — research
-        # pages are never touched, so an owner sign-in can safely run while
-        # research continues in its own tabs.
-        await self._close_owned_pages(s._page)
-        s._page = None
+        # Close ONLY this session's tabs — the main tab plus every popup it
+        # opened. Research pages are never touched, so an owner sign-in can
+        # safely run while research continues in its own tabs.
+        for p in list(s.pages):
+            try:
+                await p.close()
+            except Exception:
+                pass
+        s.pages = []
+        s.active = 0
         row = self.windows.list(status="open")
         for w in row:
             if getattr(w, "account", None) == "interactive":
@@ -304,47 +366,16 @@ class InteractiveSessionManager:
     async def sweep_expired(self) -> int:
         """Close pages of sessions whose TTL elapsed. Cheap; call periodically."""
         s = self.current()
-        if s and s.status != "open" and s._page is not None:
-            page, s._page = s._page, None
-            try:
-                await page.close()
-            except Exception:
-                pass
+        if s and s.status != "open" and s.pages:
+            for p in list(s.pages):
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            s.pages = []
+            s.active = 0
             return 1
         return 0
-
-    # ------------------------------------------------------------------ intern
-    async def _close_owned_pages(self, main_page: Any) -> None:
-        """Close the interactive tab plus popups it opened — nothing else.
-
-        Popup identification is heuristic (pages lacking the protected marker
-        that appeared for this session); pages marked protected that are NOT
-        this session's main tab are other interactive work and stay open.
-        Research pages never carry the marker and are never closed here.
-        """
-        try:
-            ctx = getattr(self.browser, "_context", None)
-            if not ctx:
-                return
-            for p in list(ctx.pages):
-                if p is main_page:
-                    try:
-                        await p.close()
-                    except Exception:
-                        pass
-                    continue
-                protected = getattr(p, "_resurreccion_protected", False)
-                url = (getattr(p, "url", "") or "").strip()
-                # A blank popup spawned by the interactive flow (unmarked,
-                # about:blank or newtab) is safe to close; anything with real
-                # content that is unprotected belongs to research — leave it.
-                if not protected and (not url or url.startswith(("about:blank", "chrome://newtab"))):
-                    try:
-                        await p.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
 
 def _iso_from(ts: float) -> str:
