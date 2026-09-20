@@ -53,9 +53,14 @@ class FakePage:
         return b"\xff\xd8fake-jpeg"
 
 
+class FakeContext:
+    def __init__(self) -> None:
+        self.pages: list[FakePage] = []
+
+
 class FakeBrowser:
     def __init__(self) -> None:
-        self._context = None
+        self._context = FakeContext()
         self.launched = 0
         self.page = FakePage()
         self.navigated: list[str] = []
@@ -63,16 +68,21 @@ class FakeBrowser:
     async def open_marketplace(self, marketplace: Any, path: str = "/") -> FakePage:
         self.launched += 1
         self.page.url = f"https://{marketplace.domain}{path}"
+        self._context.pages.append(self.page)
         return self.page
 
     async def new_page(self, *, interactive: bool = False) -> FakePage:
         self.launched += 1
         self.page.protected = interactive
+        self._context.pages.append(self.page)
         return self.page
 
     async def navigate(self, page: Any, url: str) -> None:
         self.navigated.append(url)
         page.url = url
+
+    async def close_page(self, page: Any) -> None:
+        page.closed = True
 
 
 class FakeWindows:
@@ -189,6 +199,32 @@ async def test_complete_closes_page_and_records_outcome(manager: InteractiveSess
     assert manager.browser.page.closed
     open_rows = manager.windows.list(status="open")
     assert not open_rows
+
+
+@pytest.mark.asyncio
+async def test_start_after_complete_is_not_blocked(manager: InteractiveSessionManager) -> None:
+    """Regression: after a completed session, the persistent context's idle
+    about:blank page must not read as 'research is using the browser'."""
+    await manager.start(purpose="amazon_signin", marketplace="us")
+    await manager.complete(outcome="completed")
+    # Simulate the real leftover: the persistent context keeps one idle blank.
+    blank = FakePage()
+    blank.url = "about:blank"
+    manager.browser._context.pages = [blank]
+    s2 = await manager.start(purpose="amazon_signin", marketplace="us")
+    assert s2.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_busy_check_ignores_idle_blank_pages(manager: InteractiveSessionManager) -> None:
+    blank = FakePage()
+    blank.url = "about:blank"
+    manager.browser._context.pages = [blank]
+    assert not manager.is_research_busy()
+    real = FakePage()
+    real.url = "https://www.amazon.com/s?k=x"
+    manager.browser._context.pages.append(real)
+    assert manager.is_research_busy()
 
 
 @pytest.mark.asyncio

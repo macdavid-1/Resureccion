@@ -104,11 +104,22 @@ class InteractiveSessionManager:
         return s
 
     def is_research_busy(self) -> bool:
-        """Research holds the browser when any context page is already open
-        (research opens its pages lazily and closes them per action)."""
+        """True when pages with real content are open (research or leftovers).
+
+        A Playwright persistent context always carries one idle `about:blank`
+        page — that is background, not work. Only pages that actually navigated
+        somewhere count as the browser being in use, otherwise a completed
+        interactive session would block every future one.
+        """
         try:
             ctx = getattr(self.browser, "_context", None)
-            return bool(ctx and ctx.pages)
+            if not ctx:
+                return False
+            for p in ctx.pages:
+                url = (getattr(p, "url", "") or "").strip()
+                if url and not url.startswith(("about:blank", "chrome://newtab")):
+                    return True
+            return False
         except Exception:
             return False
 
@@ -150,16 +161,18 @@ class InteractiveSessionManager:
             return session
 
     async def _open_page(self, mkt: Marketplace, purpose: str) -> Any:
-        if purpose == "amazon_signin":
-            page = await self.browser.new_page(interactive=True)
-            url = f"{mkt.base_url}/"
-            await self.browser.navigate(page, url)
-            return page
-        # kdspy_setup and manual: plain new tab; the owner navigates.
         page = await self.browser.new_page(interactive=True)
-        if purpose == "kdspy_setup":
-            # KDSpy activation happens on its own site; start neutral.
-            await self.browser.navigate(page, "https://www.kdspy.com/")
+        try:
+            if purpose == "amazon_signin":
+                await self.browser.navigate(page, f"{mkt.base_url}/")
+            elif purpose == "kdspy_setup":
+                # KDSpy activation happens on its own site; start neutral.
+                await self.browser.navigate(page, "https://www.kdspy.com/")
+        except Exception:
+            # Never leave a half-navigated page behind: it would make the
+            # next start believe research is busy.
+            await self.browser.close_page(page)
+            raise
         return page
 
     # ----------------------------------------------------------------- frames
@@ -234,13 +247,22 @@ class InteractiveSessionManager:
         if s is None:
             raise InteractiveError("no interactive session")
         s.status = outcome if outcome in ("completed", "cancelled") else "completed"
-        page = s._page
         s._page = None
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
+        # Close the interactive tab AND any popups it spawned (sign-in flows
+        # open extras), so nothing blocks the next session. Research cannot be
+        # running here — start() refuses while it is.
+        try:
+            ctx = getattr(self.browser, "_context", None)
+            if ctx:
+                for p in list(ctx.pages):
+                    url = (getattr(p, "url", "") or "").strip()
+                    if url and not url.startswith(("about:blank", "chrome://newtab")):
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         row = self.windows.list(status="open")
         for w in row:
             if getattr(w, "account", None) == "interactive":
