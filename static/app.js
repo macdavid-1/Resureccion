@@ -796,6 +796,18 @@
     }
   }
 
+  // Immediate visual acknowledgment between tap and the next streamed frame.
+  function rbFlash(clientX, clientY) {
+    const img = $("#rb-frame");
+    const r = img.getBoundingClientRect();
+    const d = document.createElement("div");
+    d.className = "rb-tap";
+    d.style.left = `${clientX - r.left}px`;
+    d.style.top = `${clientY - r.top}px`;
+    $("#rb-frame-wrap").appendChild(d);
+    setTimeout(() => d.remove(), 420);
+  }
+
   async function rbDone() {
     if (!rb.session) { rbHide(); return; }
     const id = rb.session.id;
@@ -807,29 +819,36 @@
 
   function rbBind() {
     $("#rb-back").addEventListener("click", rbDone);
-    // Tap-to-click on the live frame (scales phone coordinates → viewport).
+    // Tap-to-click on the live frame: phone px → 1440×900 page px.
+    // object-fit: contain letterboxes the JPEG inside the element box; only
+    // the rendered image area accepts taps, and coordinates scale through the
+    // actual drawn rect — otherwise landscape taps land far off-target.
     const img = $("#rb-frame");
-    let lastTouch = 0;
+    let lastTapAt = 0, lastTapX = -1, lastTapY = -1;
     const doClick = (clientX, clientY) => {
       const r = img.getBoundingClientRect();
-      const nw = 1440, nh = Math.round(1440 * (img.naturalHeight || 900) / (img.naturalWidth || 1440));
-      const x = Math.round((clientX - r.left) * (nw / r.width));
-      const y = Math.round((clientY - r.top) * (nh / r.height));
-      rbAct("click", { x, y });
+      const natW = img.naturalWidth || 1440, natH = img.naturalHeight || 900;
+      const scale = Math.min(r.width / natW, r.height / natH);
+      const drawW = natW * scale, drawH = natH * scale;
+      const offX = (r.width - drawW) / 2, offY = (r.height - drawH) / 2;
+      const px = clientX - r.left - offX, py = clientY - r.top - offY;
+      if (px < 0 || py < 0 || px > drawW || py > drawH) return; // letterbox tap
+      rbFlash(clientX, clientY);
+      rbAct("click", { x: Math.round(px / scale), y: Math.round(py / scale) });
     };
-    img.addEventListener("click", (e) => {
+    // One pointer path: pointerup fires for touch AND mouse, replacing the
+    // legacy click/touchend pair that double-fired and raced a 30ms de-dupe.
+    img.addEventListener("pointerup", (e) => {
+      if (!e.isPrimary) return;
+      e.preventDefault();
       const now = Date.now();
-      if (now - lastTouch < 30) return;
-      lastTouch = now;
+      const sameSpot = Math.abs(e.clientX - lastTapX) < 28 && Math.abs(e.clientY - lastTapY) < 28;
+      // Same spot within 350ms = accidental double-fire (synthetic click after
+      // touch), NOT a second intentional tap — deliberate double-taps pass.
+      if (now - lastTapAt < 350 && sameSpot) return;
+      lastTapAt = now; lastTapX = e.clientX; lastTapY = e.clientY;
       doClick(e.clientX, e.clientY);
     });
-    img.addEventListener("touchend", (e) => {
-      const t = e.changedTouches[0];
-      if (!t) return;
-      e.preventDefault();
-      doClick(t.clientX, t.clientY);
-    }, { passive: false });
-    // Scroll with two-finger drag is unreliable; provide wheel-equivalent buttons.
     $("#rb-send").addEventListener("click", () => {
       const v = $("#rb-text").value;
       if (!v) return;
@@ -845,16 +864,20 @@
     });
     $$("#rbrowser .rb-key-row button").forEach((b) =>
       b.addEventListener("click", () => rbAct("key", { key: b.dataset.key })));
-    // Vertical swipe on the frame scrolls the page.
-    let touchY = null;
+    // Vertical swipe scrolls; batched per 120ms so a long flick is ONE
+    // round-trip instead of a storm competing with frame polling.
+    let touchY = null, lastScrollAt = 0, pendingDy = 0;
     img.addEventListener("touchstart", (e) => { touchY = e.touches[0].clientY; }, { passive: true });
     img.addEventListener("touchmove", (e) => {
       if (touchY === null || e.touches.length !== 1) return;
       const y = e.touches[0].clientY;
-      const dy = touchY - y;
-      if (Math.abs(dy) > 48) {
-        rbAct("scroll", { dy: Math.round(dy * 2) });
-        touchY = y;
+      pendingDy += touchY - y;
+      touchY = y;
+      const now = Date.now();
+      if (Math.abs(pendingDy) > 24 && now - lastScrollAt >= 120) {
+        rbAct("scroll", { dy: Math.round(pendingDy * 2) });
+        pendingDy = 0;
+        lastScrollAt = now;
       }
     }, { passive: true });
     img.addEventListener("touchend", () => { touchY = null; }, { passive: true });

@@ -452,6 +452,19 @@ details.sect > .sect-body { padding: 2px 14px 14px; border-top: 1px solid var(--
   position: absolute; inset: 0; display: grid; place-items: center;
   color: var(--text-3); font-size: 0.84rem; text-align: center; padding: 20px;
 }
+/* tap feedback: instant ring at the touch point, before the next frame */
+.rb-tap {
+  position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+  border: 2px solid rgba(18, 7, 218, 0.85);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.55) inset, 0 0 10px rgba(18,7,218,0.45);
+  pointer-events: none;
+  animation: rb-tap 420ms ease-out forwards;
+}
+@keyframes rb-tap {
+  from { transform: scale(0.55); opacity: 0.95; }
+  to   { transform: scale(1.7); opacity: 0; }
+}
 .rb-hint {
   padding: 6px 12px; text-align: center;
   font-size: 0.66rem; color: var(--text-3); letter-spacing: 0.06em;
@@ -514,6 +527,7 @@ textarea:focus-visible, select:focus-visible, summary:focus-visible {
   .chip.pulse .dot, .rec-badge .dot, .record-btn.recording .dot { animation: none; }
   .skeleton::after { animation: none; }
   .trace-item { animation: none; }
+  .rb-tap { animation-duration: 1ms; opacity: 0; }
   .btn, .progress i { transition: none; }
   .spinner { animation-duration: 1.6s; }
 }

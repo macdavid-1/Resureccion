@@ -180,12 +180,12 @@ class InteractiveSessionManager:
         if s is None or s.status != "open" or s._page is None:
             return None
         try:
-            return await s._page.screenshot(type="jpeg", quality=70)
+            return await s._page.screenshot(type="jpeg", quality=62)
         except Exception:
             # Page may be mid-navigation; retry once after a beat.
             await asyncio.sleep(0.4)
             try:
-                return await s._page.screenshot(type="jpeg", quality=70)
+                return await s._page.screenshot(type="jpeg", quality=62)
             except Exception:
                 return None
 
@@ -217,7 +217,7 @@ class InteractiveSessionManager:
         page = s._page
         try:
             if action == "click":
-                await page.mouse.click(clean["x"], clean["y"])
+                await self._click_snapped(page, clean["x"], clean["y"])
             elif action == "type":
                 await page.keyboard.type(clean["text"], delay=15)
             elif action == "key":
@@ -241,6 +241,47 @@ class InteractiveSessionManager:
         return s
 
     # -------------------------------------------------------------------- end
+    async def _click_snapped(self, page: Any, x: int, y: int) -> None:
+        """Tap-to-click with fat-finger tolerance.
+
+        The owner taps a 1440px-wide page rendered on a ~390px phone screen
+        (≈3.7x compression, ±10px finger accuracy ≈ ±37 page px). A raw
+        pixel click misses small targets constantly. So: resolve the element
+        under the tapped point, and when it sits inside something genuinely
+        interactive (a/button/input/label/…), click the CENTER of that
+        element instead — the whole control becomes the target. Plain text
+        taps stay pixel-exact.
+        """
+        snapped: dict[str, Any] | None = None
+        try:
+            snapped = await page.evaluate(
+                """([x, y]) => {
+                    const el = document.elementFromPoint(x, y);
+                    if (!el) return null;
+                    const t = el.closest(
+                        'a, button, [role=button], input, select, textarea, label, summary, [onclick], [jsaction]'
+                    );
+                    if (!t) return { interactive: false };
+                    const r = t.getBoundingClientRect();
+                    if (!r || r.width <= 0 || r.height <= 0) return { interactive: false };
+                    return {
+                        interactive: true,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                    };
+                }""",
+                [x, y],
+            )
+        except Exception:
+            snapped = None  # mid-navigation, CSP, about:blank — raw click
+        if isinstance(snapped, dict) and snapped.get("interactive"):
+            try:
+                await page.mouse.click(float(snapped["x"]), float(snapped["y"]))
+                return
+            except Exception:
+                pass  # fall through to the raw pixel click
+        await page.mouse.click(x, y)
+
     async def complete(self, *, outcome: str = "completed") -> InteractiveSession:
         s = self.current()
         if s is None:
