@@ -73,6 +73,10 @@ class FakeBrowser:
 
     async def new_page(self, *, interactive: bool = False) -> FakePage:
         self.launched += 1
+        # Mirror the real BrowserManager: protected pages carry the marker
+        # attribute the eviction/busy logic reads.
+        if interactive:
+            self.page._resurreccion_protected = True
         self.page.protected = interactive
         self._context.pages.append(self.page)
         return self.page
@@ -228,10 +232,38 @@ async def test_busy_check_ignores_idle_blank_pages(manager: InteractiveSessionMa
 
 
 @pytest.mark.asyncio
-async def test_research_busy_refuses_start(manager: InteractiveSessionManager) -> None:
-    manager.browser._context = type("Ctx", (), {"pages": [FakePage()]})()
-    with pytest.raises(InteractiveError, match="research"):
-        await manager.start(purpose="manual")
+async def test_busy_check_ignores_interactive_tabs(manager: InteractiveSessionManager) -> None:
+    """Owner tabs are marked protected and must never read as research work."""
+    await manager.start(purpose="amazon_signin", marketplace="us")
+    assert not manager.is_research_busy()
+
+
+@pytest.mark.asyncio
+async def test_start_coexists_with_open_research_pages(manager: InteractiveSessionManager) -> None:
+    """Regression for the 'research is using the browser' false gate: an
+    interactive session must open even while research pages are live — it is
+    just another tab in the shared persistent profile."""
+    research = FakePage()
+    research.url = "https://www.amazon.com/s?k=grief+journal"
+    manager.browser._context.pages.append(research)
+    s = await manager.start(purpose="amazon_signin", marketplace="us")
+    assert s.status == "open"
+    # The research page survived the interactive session starting.
+    assert research in manager.browser._context.pages
+    assert not research.closed
+
+
+@pytest.mark.asyncio
+async def test_complete_never_closes_research_pages(manager: InteractiveSessionManager) -> None:
+    """Closing the interactive session must leave research tabs untouched."""
+    research = FakePage()
+    research.url = "https://www.amazon.com/s?k=x"
+    manager.browser._context.pages.append(research)
+    await manager.start(purpose="manual")
+    await manager.complete(outcome="completed")
+    assert manager.browser.page.closed          # interactive tab closed
+    assert not research.closed                  # research tab survived
+    assert research in manager.browser._context.pages
 
 
 # ------------------------------------------------------ extension install

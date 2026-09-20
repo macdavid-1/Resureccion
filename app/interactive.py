@@ -104,18 +104,21 @@ class InteractiveSessionManager:
         return s
 
     def is_research_busy(self) -> bool:
-        """True when pages with real content are open (research or leftovers).
+        """True when non-interactive pages with real content are open.
 
-        A Playwright persistent context always carries one idle `about:blank`
-        page — that is background, not work. Only pages that actually navigated
-        somewhere count as the browser being in use, otherwise a completed
-        interactive session would block every future one.
+        Used ONLY for informational status — never as a gate. Interactive
+        sessions open their own protected tab in the shared persistent
+        profile and coexist with research (the owner's tabs are eviction-
+        safe, research never touches them, and closing an interactive
+        session closes only that tab and its popups).
         """
         try:
             ctx = getattr(self.browser, "_context", None)
             if not ctx:
                 return False
             for p in ctx.pages:
+                if getattr(p, "_resurreccion_protected", False):
+                    continue  # owner's interactive tabs are not research work
                 url = (getattr(p, "url", "") or "").strip()
                 if url and not url.startswith(("about:blank", "chrome://newtab")):
                     return True
@@ -129,10 +132,6 @@ class InteractiveSessionManager:
             existing = self.current()
             if existing and existing.status == "open":
                 return existing  # idempotent: reuse the open session
-            if self.is_research_busy():
-                raise InteractiveError(
-                    "research is using the browser — wait for it to pause or finish, then retry"
-                )
             mkt = get_marketplace(marketplace)
             now = time.time()
             ttl = int(min(max(ttl_seconds or self.config.browser_login_window_seconds, 60), MAX_INTERACTIVE_SECONDS))
@@ -247,22 +246,11 @@ class InteractiveSessionManager:
         if s is None:
             raise InteractiveError("no interactive session")
         s.status = outcome if outcome in ("completed", "cancelled") else "completed"
+        # Close ONLY the interactive tab and popups it spawned — research
+        # pages are never touched, so an owner sign-in can safely run while
+        # research continues in its own tabs.
+        await self._close_owned_pages(s._page)
         s._page = None
-        # Close the interactive tab AND any popups it spawned (sign-in flows
-        # open extras), so nothing blocks the next session. Research cannot be
-        # running here — start() refuses while it is.
-        try:
-            ctx = getattr(self.browser, "_context", None)
-            if ctx:
-                for p in list(ctx.pages):
-                    url = (getattr(p, "url", "") or "").strip()
-                    if url and not url.startswith(("about:blank", "chrome://newtab")):
-                        try:
-                            await p.close()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
         row = self.windows.list(status="open")
         for w in row:
             if getattr(w, "account", None) == "interactive":
@@ -283,6 +271,39 @@ class InteractiveSessionManager:
                 pass
             return 1
         return 0
+
+    # ------------------------------------------------------------------ intern
+    async def _close_owned_pages(self, main_page: Any) -> None:
+        """Close the interactive tab plus popups it opened — nothing else.
+
+        Popup identification is heuristic (pages lacking the protected marker
+        that appeared for this session); pages marked protected that are NOT
+        this session's main tab are other interactive work and stay open.
+        Research pages never carry the marker and are never closed here.
+        """
+        try:
+            ctx = getattr(self.browser, "_context", None)
+            if not ctx:
+                return
+            for p in list(ctx.pages):
+                if p is main_page:
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
+                    continue
+                protected = getattr(p, "_resurreccion_protected", False)
+                url = (getattr(p, "url", "") or "").strip()
+                # A blank popup spawned by the interactive flow (unmarked,
+                # about:blank or newtab) is safe to close; anything with real
+                # content that is unprotected belongs to research — leave it.
+                if not protected and (not url or url.startswith(("about:blank", "chrome://newtab"))):
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 def _iso_from(ts: float) -> str:
