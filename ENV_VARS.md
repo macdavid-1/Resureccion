@@ -82,9 +82,10 @@ itself, never silently.
 | `BROWSER_USER_AGENT` | no | — | Optional explicit UA override |
 | `BROWSER_LOCALE` | no | `en-US` | Browser locale |
 | `BROWSER_TIMEZONE` | no | `America/New_York` | Browser timezone |
-| `KDSPY_EXTENSION_PATH` | no | `$DATA_DIR/extensions/kdspy` | Owner uploads the **unpacked KDSpy Pro** extension here |
+| `KDSPY_EXTENSION_PATH` | no | `$DATA_DIR/extensions/kdspy` | Unpacked KDSpy extension lives here (installed via Settings) |
 | `KDSPY_MIN_VERSION` | no | — | Optional minimum version enforcement |
 | `KDSPY_EXTENSION_ID` | no | — | Optional known extension id |
+| `KDSPY_WEBSTORE_ID` | no | `oocoibgfbhcplhnfdjldohepoeboiloo` | Pins the Chrome Web Store listing the one-tap installer may fetch |
 | `BROWSER_LOGIN_WINDOW_SECONDS` | no | `900` | Interactive browser session TTL (Amazon sign-in / KDSpy setup from the phone). Hard-capped at 2700s |
 | `BROWSER_LOGIN_SECRET` | recommended | — | Shared secret required to open a manual login window (defense in depth on top of owner auth) |
 

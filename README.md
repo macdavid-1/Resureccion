@@ -139,12 +139,17 @@ shell required, on the preview or on the deployed Space:
    in the shared browser profile (`$DATA_DIR/browser_profiles/kdspy`), so
    every future research run is already signed in. The same flow is used
    again only if Amazon expires the session.
-2. **KDSpy Pro install.** Settings → KDSpy Pro → **Install**. Upload the
-   unpacked extension as a ZIP (Chrome web-store export) or select the folder
-   files. It is validated, installed atomically into
-   `$DATA_DIR/extensions/kdspy`, and the browser relaunches. The setup browser
-   then opens for KDSpy license activation — same persistent profile, so
-   Amazon stays signed in while KDSpy activates.
+2. **KDSpy Pro install — one tap.** Settings → KDSpy Pro → **Install from
+   Web Store**. Resurrección downloads the official KDSpy package directly
+   from Google's Chrome Web Store CDN (the endpoint Chrome itself uses),
+   verifies the CRX3 package structure, confirms the manifest declares the
+   pinned KDSPY listing, installs atomically into
+   `$DATA_DIR/extensions/kdspy`, and relaunches the browser. No ZIP is
+   needed — Chrome no longer lets users export extension folders anyway.
+   The setup browser then opens on kdspy.com for your account sign-in and
+   license activation — same persistent profile, so Amazon stays signed in
+   while KDSpy activates. (ZIP / folder-file upload remains available as a
+   manual fallback.)
 3. Amazon and KDSpy state are shown as status chips in Settings; the research
    agent pauses safely and waits if a marketplace wall is ever hit mid-run.
 

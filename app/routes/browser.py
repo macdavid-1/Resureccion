@@ -194,6 +194,30 @@ async def kdspy_validate(request: Request) -> dict:
     return {"extension": state.to_dict()}
 
 
+@router.post("/extensions/kdspy/install-store")
+async def kdspy_install_store(request: Request) -> dict:
+    """One-tap install: fetch KDSpy directly from the Chrome Web Store.
+
+    Downloads the official CRX from Google's CDN (the endpoint Chrome itself
+    uses for public items), verifies it cryptographically against the pinned
+    store ID, installs atomically, and relaunches the browser. No ZIP needed.
+    """
+    _auth(request)
+    mgr = _kdspy(request)
+    try:
+        info = await mgr.install_from_webstore()
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "source": "chrome_web_store",
+        "manifest": info.to_safe_dict(),
+        "extension": mgr.state().to_dict(),
+        "note": "extension installed — opening the setup browser for license activation",
+    }
+
+
 @router.post("/extensions/kdspy/install")
 async def kdspy_install_zip(request: Request, file: UploadFile = File(...)) -> dict:
     """Install the KDSpy Pro extension from a ZIP upload.

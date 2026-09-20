@@ -899,14 +899,38 @@
   }
 
   function bindKdspyUpload() {
-    $("#set-kdspy-open").addEventListener("click", () => {
-      const row = $("#kdspy-upload-row");
-      row.hidden = !row.hidden;
+    const installStatus = $("#kdspy-upload-status");
+    const status = (msg) => { installStatus.textContent = msg; };
+
+    // Primary: one-tap install from the Chrome Web Store (no ZIP needed).
+    $("#set-kdspy-open").addEventListener("click", async () => {
+      const btn = $("#set-kdspy-open");
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Fetching…';
+      status("Downloading KDSpy from the Chrome Web Store…");
+      try {
+        const res = await fetch("/api/browser/extensions/kdspy/install-store", {
+          method: "POST", headers: authHeaders(),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        status("");
+        await finishInstall(`KDSpy ${data.manifest?.version || ""}`.trim());
+      } catch (err) {
+        status("");
+        toast(err.message);
+        // Network problems (e.g. no egress) — reveal the manual fallback row.
+        $("#kdspy-upload-row").hidden = false;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
     });
+
     $("#set-amazon-open").addEventListener("click", () => openInteractive("amazon_signin", "us"));
     $("#kdspy-pick-zip").addEventListener("click", () => $("#kdspy-zip-input").click());
     $("#kdspy-pick-files").addEventListener("click", () => $("#kdspy-files-input").click());
-    const status = (msg) => { $("#kdspy-upload-status").textContent = msg; };
 
     async function finishInstall(label) {
       status(label + " installed. Relaunching browser…");

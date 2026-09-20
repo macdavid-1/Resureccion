@@ -100,6 +100,9 @@ class Config:
         ).expanduser().resolve()
         self.kdspy_expected_min_version = os.environ.get("KDSPY_MIN_VERSION", "").strip()
         self.kdspy_extension_id = os.environ.get("KDSPY_EXTENSION_ID", "").strip()
+        # Chrome Web Store ID of KDSpy — pins which package the one-tap store
+        # installer may ever accept (CRX3 key must hash to this ID).
+        self.kdspy_webstore_id = os.environ.get("KDSPY_WEBSTORE_ID", "").strip()
 
         # Login window security: owner must be authenticated to Resurrección and
         # a shared secret must be presented to open the one-shot login window.

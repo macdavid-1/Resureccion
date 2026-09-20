@@ -25,9 +25,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
-
-import app.kdspy as _self_mod
+from typing import Any, Awaitable, BinaryIO, Callable
 
 from app.browser_store import (
     EXT_FAILED,
@@ -39,6 +37,17 @@ from app.browser_store import (
 from app.config import Config
 
 KDSPY_EXTENSION_NAME = "kdspy"
+
+# The official Chrome Web Store product. A fetched package must declare this
+# name (case/punctuation-insensitive) — combined with fetching under the
+# pinned listing slug, a swapped/spoofed package cannot install.
+KDSPY_STORE_NAME = "kdspy"
+
+
+def _webstore_id_default() -> str:
+    from app.crx_store import KDSPY_WEBSTORE_ID_DEFAULT
+
+    return KDSPY_WEBSTORE_ID_DEFAULT
 
 # Upper bound for an extension bundle — extensions are small; anything larger
 # is wrong (or hostile).
@@ -56,10 +65,6 @@ class KDSpyError(Exception):
 
 
 class ExtensionInstallError(KDSpyError):
-    pass
-
-
-class KDSpyError(Exception):
     pass
 
 
@@ -175,6 +180,85 @@ class KDSpyManager:
             except Exception as exc:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise ExtensionInstallError(f"install failed: {exc}") from exc
+        return self.validate_installation_after_install()
+
+    async def install_from_webstore(
+        self, *, fetch: "Callable[[], Awaitable[bytes]] | None" = None
+    ) -> ExtensionManifestInfo:
+        """One-tap install: fetch the official CRX from Google's CDN.
+
+        The package must be a CRX3 whose embedded public key hashes to the
+        pinned store ID; the unpacked ZIP then passes the identical zip-slip,
+        file-type, manifest, and version defenses as an owner upload before
+        the atomic swap. KDSpy is a free public store item — this fetches the
+        exact package Chrome itself installs, no license data involved.
+        """
+        import io as _io
+
+        from app.crx_store import CrxError, fetch_crx, verify_crx
+
+        ext_id = (
+            self.config.kdspy_webstore_id
+            or _webstore_id_default()
+        )
+        try:
+            if fetch is not None:
+                data = await fetch()
+            else:
+                data = await fetch_crx(ext_id)
+            crx = verify_crx(data, ext_id)
+        except CrxError as exc:
+            raise ExtensionInstallError(f"Web Store package rejected: {exc}") from exc
+        except Exception as exc:
+            raise ExtensionInstallError(
+                f"could not download the extension from the Chrome Web Store: {exc}"
+            ) from exc
+        try:
+            zf = zipfile.ZipFile(_io.BytesIO(crx.zip_bytes))
+            names = zf.namelist()
+            if not names:
+                raise ExtensionInstallError("package payload is empty")
+            manifest_name = self._pick_manifest(names)
+            if manifest_name is None:
+                raise ExtensionInstallError("manifest.json not found in package payload")
+            self._check_zip_entries(zf, names)
+            staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            try:
+                root = Path(manifest_name).parent
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    p = Path(info.filename)
+                    rel = p.relative_to(root) if root != Path(".") else p
+                    target = staging / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(info))
+                info_obj = _parse_manifest(staging / "manifest.json")
+                if _store_name_of(info_obj.name) != KDSPY_STORE_NAME:
+                    raise ExtensionInstallError(
+                        f"package declares {info_obj.name!r}, not the pinned "
+                        f"{KDSPY_STORE_NAME.title()} store listing — refused"
+                    )
+                min_ver = self.config.kdspy_expected_min_version
+                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
+                    raise ExtensionInstallError(
+                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
+                    )
+                self._swap_in(staging)
+            except ExtensionInstallError:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            except KDSpyError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(str(exc)) from exc
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(f"install failed: {exc}") from exc
+        except zipfile.BadZipFile as exc:
+            raise ExtensionInstallError("package payload is not a valid ZIP") from exc
         return self.validate_installation_after_install()
 
     def install_from_files(self, files: list[tuple[str, BinaryIO]]) -> ExtensionManifestInfo:
@@ -369,3 +453,9 @@ class KDSpyManager:
 def _version_tuple(version: str) -> tuple[int, ...]:
     parts = re.findall(r"\d+", version)
     return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def _store_name_of(name: str) -> str:
+    """Normalize a store product name: 'KDSPY – Keyword Research…' → 'kdspy'."""
+    first = re.split(r"[–\-—|:]", name or "", maxsplit=1)[0]
+    return re.sub(r"[^a-z0-9]", "", first.strip().lower())
