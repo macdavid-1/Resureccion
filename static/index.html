@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <title>Resurrección</title>
-<link rel="stylesheet" href="/static/styles.css?v=3">
+<link rel="stylesheet" href="/static/styles.css?v=4">
 </head>
 <body>
 <div id="app">
@@ -114,6 +114,7 @@
               <span class="muted">Phase</span> <span class="ph" id="ws-phase">—</span>
               <span class="muted" id="ws-phase-note"></span>
             </div>
+            <div class="pause-banner hidden" id="ws-error-banner"></div>
             <div class="ws-actions" id="ws-actions"></div>
           </div>
 
@@ -208,6 +209,13 @@
               <span class="chip" id="set-amazon-chip">—</span>
               <button class="btn small" id="set-amazon-open">Sign in</button>
             </div>
+          </div>
+          <div class="set-row set-col">
+            <div>
+              <div class="set-k">AI model (DeepInfra)</div>
+              <div class="set-d" id="set-model-state">Checking…</div>
+            </div>
+            <span class="chip" id="set-model-chip">—</span>
           </div>
           <div class="set-row set-col">
             <div>
@@ -309,6 +317,6 @@
     <button class="btn small" data-key="Control+a">Select all</button>
   </div>
 </div>
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>

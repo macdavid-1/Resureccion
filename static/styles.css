@@ -271,6 +271,20 @@ select { appearance: none; }
 .phase-line { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.8rem; color: var(--text-2); }
 .phase-line .ph { color: var(--text); font-weight: 600; }
 
+/* paused/failed reason — why research is not moving, in plain words */
+.pause-banner {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid rgba(255, 176, 32, 0.35);
+  border-left: 3px solid #ffb020;
+  background: rgba(255, 176, 32, 0.06);
+  border-radius: 4px;
+  font-size: 0.8rem; line-height: 1.45; color: var(--text);
+  word-break: break-word;
+}
+.pause-banner.error { border-color: rgba(255, 92, 92, 0.35); border-left-color: #ff5c5c; background: rgba(255, 92, 92, 0.06); }
+.pause-banner .pb-k { display: block; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #ffb020; margin-bottom: 3px; }
+.pause-banner.error .pb-k { color: #ff5c5c; }
+
 /* trace feed */
 .trace-feed { display: flex; flex-direction: column; }
 .trace-item {

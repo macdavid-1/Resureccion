@@ -54,6 +54,27 @@ async def get_methodology(request: Request) -> dict:
     return {"methodology": _methodology(request).describe()}
 
 
+# ------------------------------------------------------------- system summary
+@router.get("/system")
+async def system_summary(request: Request) -> dict:
+    """Setup readiness for the Settings screen.
+
+    Reports WHICH capabilities are configured without ever exposing secret
+    values — only booleans and non-secret model identifiers. This is how the
+    owner sees "the model key is missing" instead of a bare paused session.
+    """
+    _auth(request)
+    cfg = _st(request).config
+    return {
+        "model": {
+            "api_key_set": bool(cfg.model_api_key),
+            "model": cfg.model_name,
+            "base_url": cfg.model_base_url,
+            "vision": bool(cfg.model_vision_enabled),
+        },
+    }
+
+
 # ---------------------------------------------------------------- integrity
 @router.get("/sessions/{session_id}/integrity")
 async def get_integrity(

@@ -197,8 +197,22 @@
     $("#ws-status-t").textContent = s.status;
     $("#ws-progress").style.width = `${Math.round((s.progress || 0) * 100)}%`;
     $("#ws-phase").textContent = PHASE_LABEL[s.phase] || s.phase;
+    renderPauseBanner(s);
     $("#tb-context").textContent = state.view === "research" ? s.name : $("#tb-context").textContent;
     renderActions(s);
+  }
+
+  // Why research is not moving — always visible, never a bare "paused".
+  function renderPauseBanner(s) {
+    const el = $("#ws-error-banner");
+    const reason = (s.error || "").trim();
+    const showFor = ["paused", "failed", "interrupted"].includes(s.status);
+    if (!showFor || !reason) { el.classList.add("hidden"); el.textContent = ""; return; }
+    const failed = s.status === "failed";
+    el.className = `pause-banner${failed ? " error" : ""}`;
+    const friendly = reason.replace(/^model failure:\s*/i, "").replace(/^authentication required:\s*/i, "Amazon sign-in needed — ");
+    el.innerHTML = `<span class="pb-k"></span>${esc(friendly)}`;
+    el.querySelector(".pb-k").textContent = failed ? "Research failed" : "Research paused";
   }
 
   function renderActions(s) {
@@ -883,11 +897,22 @@
           st === "validated" ? `Loaded in browser${kd.extension.version ? ` · v${kd.extension.version}` : ""}` :
           st === "installed" ? "Installed — loads on next browser launch" :
           st === "failed" ? `Problem: ${kd.extension.detail?.error || kd.extension.detail?.reason || "invalid extension"}` :
-          "Extension directory not found";
+          "Not installed yet";
         setChip("#set-kdspy-chip", ok, !!st && !ok);
-        $("#set-kdspy-open").textContent = ok ? "Update" : "Install";
-        $("#kdspy-upload-row").hidden = false;
+        // Keep the HTML label (“Install from Web Store”) — only the suffix
+        // changes once the extension is present. Never clobber the handler's
+        // primary action wording here.
+        const kdBtn = $("#set-kdspy-open");
+        if (!kdBtn.disabled) kdBtn.textContent = ok ? "Update" : "Install from Web Store";
       }
+      try {
+        const sys = await api("/api/system");
+        const mOk = !!sys.model?.api_key_set;
+        $("#set-model-state").textContent = mOk
+          ? `${sys.model.model} ready${sys.model.vision ? " · vision on" : ""}`
+          : "API key missing — add MODEL_API_KEY in the environment";
+        setChip("#set-model-chip", mOk, !mOk);
+      } catch {}
       if (mk) {
         $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
       }
