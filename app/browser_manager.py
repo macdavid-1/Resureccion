@@ -176,6 +176,10 @@ class BrowserManager:
             # Chromium must NOT receive a channel kwarg (it errors or resolves wrong).
             if self.config.browser_channel and self.config.browser_channel.lower() not in ("chromium", ""):
                 launch_kwargs["channel"] = self.config.browser_channel
+            elif self.kdspy.chromium_args() and self.config.browser_headless:
+                # The old headless shell cannot run extensions at all; the
+                # "chromium" channel opts into new headless mode, which can.
+                launch_kwargs["channel"] = "chromium"
             if self.config.browser_user_agent:
                 launch_kwargs["user_agent"] = self.config.browser_user_agent
             try:
@@ -206,11 +210,16 @@ class BrowserManager:
             if not workers:
                 try:
                     worker = await asyncio.wait_for(
-                        ctx.wait_for_event("serviceworker"), timeout=10
+                        ctx.wait_for_event("serviceworker"), timeout=8
                     )
                     workers = [worker]
                 except (asyncio.TimeoutError, Exception):
                     workers = []
+            if not workers and ctx.pages:
+                # MV3 service workers may only spin up once a page exists;
+                # give the context's initial page a moment, then re-check.
+                await asyncio.sleep(2.5)
+                workers = list(getattr(ctx, "service_workers", []) or [])
             if workers:
                 url = workers[0].url
                 ext_id = url.split("/")[2] if url.count("/") >= 2 else ""
