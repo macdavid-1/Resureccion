@@ -36,16 +36,32 @@ def main() -> int:
     html = HTML.read_text(encoding="utf-8")
     js = JS.read_text(encoding="utf-8")
 
-    # 1. Cache-busted asset references (prevents stale-JS-after-deploy).
+    # 1. Cache-busted asset references. Since app/main.py serves index.html
+    # through app.static_cache, versions are content hashes injected at
+    # request time — the raw file just needs a placeholder (?v=...) so the
+    # rewrite regex can hook it.
     check(
         "app.js is referenced with a version query",
-        bool(re.search(r'src="/static/app\.js\?v=\d+"', html)),
-        "bump ?v= in index.html whenever app.js changes behavior",
+        bool(re.search(r'src="/static/app\.js\?v=[a-zA-Z0-9]+"', html)),
+        "index.html must reference /static/app.js with a ?v= placeholder",
     )
     check(
         "styles.css is referenced with a version query",
-        bool(re.search(r'href="/static/styles\.css\?v=\d+"', html)),
+        bool(re.search(r'href="/static/styles\.css\?v=[a-zA-Z0-9]+"', html)),
     )
+    try:
+        from app.static_cache import asset_version, render_index
+
+        rendered = render_index(ROOT / "static")
+        for asset in ("app.js", "styles.css"):
+            expected = f'/static/{asset}?v={asset_version(ROOT / "static", asset)}'
+            check(f"rendered index references {asset} by content hash", expected in rendered)
+        check(
+            "rendered index has no stale numeric versions",
+            not re.search(r'\?v=\d+"', rendered),
+        )
+    except Exception as exc:  # pragma: no cover
+        check("static_cache import/render", False, str(exc))
 
     # 2. Handlers exist in app.js.
     for needle in ("function bindKdspyUpload", "function rbBind", '("#set-amazon-open").addEventListener', '("#set-kdspy-open").addEventListener'):

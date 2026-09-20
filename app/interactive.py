@@ -313,19 +313,37 @@ class InteractiveSessionManager:
         try:
             snapped = await page.evaluate(
                 """([x, y]) => {
-                    const el = document.elementFromPoint(x, y);
-                    if (!el) return null;
-                    const t = el.closest(
-                        'a, button, [role=button], input, select, textarea, label, summary, [onclick], [jsaction]'
-                    );
-                    if (!t) return { interactive: false };
-                    const r = t.getBoundingClientRect();
-                    if (!r || r.width <= 0 || r.height <= 0) return { interactive: false };
-                    return {
-                        interactive: true,
-                        x: r.left + r.width / 2,
-                        y: r.top + r.height / 2,
+                    const INTERACTIVE = 'a, button, [role=button], input, select, textarea, label, summary, [onclick], [jsaction]';
+                    const pick = (el) => {
+                        if (!el || !el.closest) return null;
+                        const t = el.closest(INTERACTIVE);
+                        if (!t) return null;
+                        const r = t.getBoundingClientRect();
+                        if (!r || r.width <= 0 || r.height <= 0) return null;
+                        if (r.width > 700 || r.height > 400) return null; // container, not a control
+                        return { interactive: true, x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
                     };
+                    const direct = pick(document.elementFromPoint(x, y));
+                    if (direct) return direct;
+                    // Fat-finger recovery: the phone renders a 1440px page at
+                    // ~0.27x, so a 20px-tall link is ~5px on screen — taps a
+                    // few pixels off land on dead space and feel ignored.
+                    // Probe outward in rings; the first ring containing a real
+                    // control wins (closest ring = nearest), smallest control
+                    // preferred so we hit the link, not its whole navbar.
+                    for (const rad of [14, 28, 42, 56]) {
+                        let best = null;
+                        for (let a = 0; a < 8; a++) {
+                            const th = (Math.PI / 4) * a;
+                            const cand = pick(document.elementFromPoint(x + rad * Math.cos(th), y + rad * Math.sin(th)));
+                            if (!cand) continue;
+                            const d = Math.hypot(cand.x - x, cand.y - y);
+                            const score = d + Math.sqrt(cand.area) / 8;
+                            if (!best || score < best.score) best = { ...cand, score };
+                        }
+                        if (best) return best;
+                    }
+                    return { interactive: false };
                 }""",
                 [x, y],
             )

@@ -50,6 +50,7 @@ from app.trace import ActivityTrace
 from app.runner_registry import RunnerRegistry
 from app.security import AuthError, AuthService
 from app.sessions import SessionStore
+from app.static_cache import index_response
 from app.uploads import UploadStore
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -194,11 +195,28 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     if STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        app.mount(
+            "/static",
+            StaticFiles(directory=str(STATIC_DIR)),
+            name="static",
+        )
+
+        @app.middleware("http")
+        async def _static_cache_policy(request: Request, call_next):
+            """Attach cache policy to /static responses (StaticFiles bypasses routes)."""
+            response = await call_next(request)
+            if request.url.path.startswith("/static/"):
+                response.headers.setdefault(
+                    "Cache-Control",
+                    "public, max-age=31536000, immutable"
+                    if request.url.query.startswith("v=")
+                    else "no-cache",
+                )
+            return response
 
         @app.get("/")
         async def index() -> FileResponse:
-            return FileResponse(STATIC_DIR / "index.html")
+            return index_response(STATIC_DIR)
 
     return app
 
