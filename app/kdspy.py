@@ -4,23 +4,30 @@ The owner has a legitimate lifetime KDSpy Pro license. Resurrección loads the
 actual unpacked extension into Chromium — it never fakes KDSpy data or scrapes
 an imagined API. This module:
 
-- validates the owner-supplied unpacked extension directory (manifest.json),
+- accepts the extension from the owner as a ZIP upload or a multi-file upload
+  (mobile file pickers cannot send folders), installing it atomically into the
+  unpacked extension directory,
+- validates the installed directory (manifest.json),
 - records extension state/version metadata durably,
 - produces the Chromium launch arguments required to load it,
 - exposes hooks used by the live browser manager to verify the extension's
   service worker / background page actually started.
 
-The extension directory is expected at $KDSPY_EXTENSION_PATH (default:
-$DATA_DIR/extensions/kdspy). The owner drops their unpacked KDSpy Pro build
-there; `validate_installation` checks it before any browser launch.
+The extension directory is $KDSPY_EXTENSION_PATH (default:
+$DATA_DIR/extensions/kdspy). A browser restart is required after install so
+Chromium picks the extension up at launch.
 """
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+
+import app.kdspy as _self_mod
 
 from app.browser_store import (
     EXT_FAILED,
@@ -32,6 +39,24 @@ from app.browser_store import (
 from app.config import Config
 
 KDSPY_EXTENSION_NAME = "kdspy"
+
+# Upper bound for an extension bundle — extensions are small; anything larger
+# is wrong (or hostile).
+MAX_EXTENSION_BYTES = 64 * 1024 * 1024
+
+# File types an extension may contain. Blocks scripts/archives-in-archives.
+_EXTENSION_FILE_SUFFIXES = {
+    ".js", ".mjs", ".json", ".html", ".htm", ".css", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".otf",
+    ".map", ".txt", ".md", ".xml", ".csv", ".lic", "",
+}
+
+class KDSpyError(Exception):
+    pass
+
+
+class ExtensionInstallError(KDSpyError):
+    pass
 
 
 class KDSpyError(Exception):
@@ -97,6 +122,157 @@ class KDSpyManager:
 
     def is_configured(self) -> bool:
         return self.extension_path.is_dir()
+
+    # ---------------------------------------------------------------- install
+    def install_from_zip(self, data: bytes) -> ExtensionManifestInfo:
+        """Atomically install an uploaded ZIP (chrome web-store export style)."""
+        if not data:
+            raise ExtensionInstallError("empty upload")
+        if len(data) > MAX_EXTENSION_BYTES:
+            raise ExtensionInstallError("upload too large (max 64 MB)")
+        try:
+            zf = zipfile.ZipFile(__import__("io").BytesIO(data))
+        except zipfile.BadZipFile as exc:
+            raise ExtensionInstallError("not a valid ZIP file") from exc
+        with zf:
+            names = zf.namelist()
+            if not names:
+                raise ExtensionInstallError("ZIP is empty")
+            # Locate manifest.json at root or one level deep (export wrappers).
+            manifest_name = self._pick_manifest(names)
+            if manifest_name is None:
+                raise ExtensionInstallError("manifest.json not found in ZIP")
+            self._check_zip_entries(zf, names)
+            staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            try:
+                root = Path(manifest_name).parent
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    p = Path(info.filename)
+                    rel = p.relative_to(root) if root != Path(".") else p
+                    target = staging / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(info))
+                # Validate BEFORE swapping in — a broken upload never clobbers a
+                # working install.
+                info_obj = _parse_manifest(staging / "manifest.json")
+                min_ver = self.config.kdspy_expected_min_version
+                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
+                    raise ExtensionInstallError(
+                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
+                    )
+                self._swap_in(staging)
+            except ExtensionInstallError:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            except KDSpyError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(str(exc)) from exc
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(f"install failed: {exc}") from exc
+        return self.validate_installation_after_install()
+
+    def install_from_files(self, files: list[tuple[str, BinaryIO]]) -> ExtensionManifestInfo:
+        """Install from a multi-file upload (folder picked file-by-file)."""
+        if not files:
+            raise ExtensionInstallError("no files uploaded")
+        total = 0
+        staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        try:
+            seen_manifest = False
+            for rel_name, fh in files:
+                rel_name = (rel_name or "").replace("\\", "/").lstrip("/")
+                if not rel_name or ".." in Path(rel_name).parts:
+                    raise ExtensionInstallError(f"unsafe path in upload: {rel_name!r}")
+                suffix = Path(rel_name).suffix.lower()
+                if suffix not in _EXTENSION_FILE_SUFFIXES:
+                    raise ExtensionInstallError(f"file type not allowed in extension: {rel_name!r}")
+                target = staging / rel_name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as out:
+                    while True:
+                        chunk = fh.read(1024 * 256)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_EXTENSION_BYTES:
+                            raise ExtensionInstallError("upload too large (max 64 MB)")
+                        out.write(chunk)
+                if Path(rel_name).name == "manifest.json":
+                    seen_manifest = True
+            if not seen_manifest:
+                raise ExtensionInstallError("manifest.json missing from upload")
+            info_obj = _parse_manifest(staging / "manifest.json")
+            min_ver = self.config.kdspy_expected_min_version
+            if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
+                raise ExtensionInstallError(
+                    f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
+                )
+            self._swap_in(staging)
+        except ExtensionInstallError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except KDSpyError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ExtensionInstallError(str(exc)) from exc
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ExtensionInstallError(f"install failed: {exc}") from exc
+        return self.validate_installation_after_install()
+
+    def _pick_manifest(self, names: list[str]) -> str | None:
+        roots = [n for n in names if Path(n).name == "manifest.json" and not n.startswith("__MACOSX")]
+        if not roots:
+            return None
+        shallowest = min(roots, key=lambda n: len(Path(n).parts))
+        if len(Path(shallowest).parts) > 2:
+            return None  # nested too deep — ambiguous bundle
+        return shallowest
+
+    def _check_zip_entries(self, zf: zipfile.ZipFile, names: list[str]) -> None:
+        """Zip-slip, depth, and file-type defense before any byte is written."""
+        base = self.extension_path.resolve()
+        for n in names:
+            p = Path(n)
+            if n.startswith("/") or ".." in p.parts:
+                raise ExtensionInstallError(f"unsafe path in ZIP: {n!r}")
+            if n.startswith("__MACOSX"):
+                continue
+            if p.suffix.lower() not in _EXTENSION_FILE_SUFFIXES:
+                raise ExtensionInstallError(f"file type not allowed in extension: {n!r}")
+            if len(p.parts) > 6:
+                raise ExtensionInstallError(f"entry nested too deep: {n!r}")
+            resolved = (base / p).resolve()
+            if base not in resolved.parents and resolved != base:
+                raise ExtensionInstallError(f"path escapes extension directory: {n!r}")
+
+    def _swap_in(self, staging: Path) -> None:
+        """Atomically move the staged dir into place (old install kept as .bak)."""
+        parent = self.extension_path.parent
+        backup = parent / f".kdspy-bak-{self.extension_path.name}"
+        if backup.exists():
+            shutil.rmtree(backup)
+        if self.extension_path.exists():
+            self.extension_path.rename(backup)
+        staging.rename(self.extension_path)
+        shutil.rmtree(backup, ignore_errors=True)
+
+    def validate_installation_after_install(self) -> ExtensionManifestInfo:
+        """Re-validate on-disk state and refresh the durable record."""
+        self.validate_installation()
+        return self.inspect_local()
+
+    def remove(self) -> None:
+        if self.extension_path.exists():
+            shutil.rmtree(self.extension_path)
 
     def inspect_local(self) -> ExtensionManifestInfo:
         """Parse and validate the on-disk extension (no browser required)."""

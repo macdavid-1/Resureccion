@@ -249,12 +249,20 @@ class BrowserManager:
         self._context = None
 
     # ------------------------------------------------------------------ pages
-    async def new_page(self) -> Any:
-        """Open a tracked page in the shared context (bounded pool)."""
+    async def new_page(self, *, interactive: bool = False) -> Any:
+        """Open a tracked page in the shared context (bounded pool).
+
+        `interactive=True` marks the page as owner-controlled (sign-in/setup);
+        protected pages are never chosen as eviction victims when the research
+        page pool needs space.
+        """
         ctx = await self._ensure_context()
-        # Respect the 2-core budget: keep at most browser_max_open_pages live.
-        while len(ctx.pages) >= self.config.browser_max_open_pages:
-            victim = ctx.pages[0]
+        # Respect the 2-core budget: keep at most browser_max_open_pages live,
+        # but never evict a page the owner is actively using.
+        def _evictable() -> list[Any]:
+            return [p for p in ctx.pages if not getattr(p, "_resurreccion_protected", False)]
+        while len(_evictable()) >= self.config.browser_max_open_pages:
+            victim = _evictable()[0]
             try:
                 await victim.close()
             except Exception:
@@ -262,9 +270,11 @@ class BrowserManager:
             else:
                 break
             # If closing silently failed and pages didn't shrink, avoid a spin.
-            if len(ctx.pages) >= self.config.browser_max_open_pages:
+            if len(_evictable()) >= self.config.browser_max_open_pages:
                 break
         page = await ctx.new_page()
+        if interactive:
+            page._resurreccion_protected = True
         page.set_default_timeout(self.config.browser_default_timeout_seconds * 1000)
         self._touch()
         return page
@@ -330,7 +340,7 @@ class BrowserManager:
         try:
             if not self.is_running or not self._context:
                 return None
-            pages = list(self._context.pages)
+            pages = [p for p in self._context.pages if not getattr(p, "_resurreccion_protected", False)]
             if not pages:
                 return None
             data = await pages[-1].screenshot(type="png", full_page=False)

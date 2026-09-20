@@ -199,16 +199,38 @@
           <h1>Settings</h1>
         </div>
         <div class="panel">
-          <div class="set-row">
-            <div><div class="set-k">Amazon authentication</div>
-              <div class="set-d" id="set-amazon-state">Checking…</div></div>
-            <span class="chip" id="set-amazon-chip">—</span>
+          <div class="set-row set-col">
+            <div>
+              <div class="set-k">Amazon authentication</div>
+              <div class="set-d" id="set-amazon-state">Checking…</div>
+            </div>
+            <div class="row" style="align-items:center; gap:8px">
+              <span class="chip" id="set-amazon-chip">—</span>
+              <button class="btn small" id="set-amazon-open">Sign in</button>
+            </div>
           </div>
-          <div class="set-row">
-            <div><div class="set-k">KDSpy Pro extension</div>
-              <div class="set-d" id="set-kdspy-state">Checking…</div></div>
-            <span class="chip" id="set-kdspy-chip">—</span>
+          <div class="set-row set-col">
+            <div>
+              <div class="set-k">KDSpy Pro extension</div>
+              <div class="set-d" id="set-kdspy-state">Checking…</div>
+            </div>
+            <div class="row" style="align-items:center; gap:8px">
+              <span class="chip" id="set-kdspy-chip">—</span>
+              <button class="btn small" id="set-kdspy-open">Install</button>
+            </div>
           </div>
+          <div class="set-row" hidden id="kdspy-upload-row">
+            <div style="flex:1">
+              <div class="set-d">Upload the unpacked extension as a <strong>.zip</strong>, or select all files in its folder.</div>
+              <div class="row mt8" style="gap:8px">
+                <button class="btn small" id="kdspy-pick-zip">Choose ZIP</button>
+                <button class="btn small" id="kdspy-pick-files">Choose folder files</button>
+              </div>
+              <div class="muted mono" id="kdspy-upload-status" style="font-size:0.72rem; margin-top:8px"></div>
+            </div>
+          </div>
+          <input type="file" id="kdspy-zip-input" accept=".zip,application/zip" class="hidden">
+          <input type="file" id="kdspy-files-input" multiple class="hidden">
           <div class="set-row">
             <div><div class="set-k">Marketplaces configured</div>
               <div class="set-d">Available to the research agent</div></div>
@@ -260,6 +282,33 @@
 
 <div id="toast" role="status"></div>
 <div id="modal-root"></div>
+
+<!-- Full-screen interactive browser (owner-controlled sign-in / setup) -->
+<div id="rbrowser" class="rbrowser hidden">
+  <header class="rbrowser-bar">
+    <button id="rb-back" class="btn small ghost">✕ Close</button>
+    <div class="rb-url mono" id="rb-url">—</div>
+    <span class="chip running" id="rb-timer"><span class="dot"></span><span id="rb-timer-t">—</span></span>
+  </header>
+  <div class="rb-stage" id="rb-stage">
+    <div class="rb-frame-wrap" id="rb-frame-wrap">
+      <img id="rb-frame" alt="Remote browser">
+      <div class="rb-off" id="rb-off">Starting remote browser…</div>
+    </div>
+    <div class="rb-hint">Tap the page to click · keyboard opens for text fields</div>
+  </div>
+  <div class="rb-input-bar">
+    <input id="rb-text" type="text" autocomplete="off" placeholder="Type text, press ➤ then keys if needed">
+    <button id="rb-send" class="btn small primary">➤</button>
+    <button id="rb-key" class="btn small">⌨</button>
+  </div>
+  <div class="rb-key-row">
+    <button class="btn small" data-key="Enter">Enter</button>
+    <button class="btn small" data-key="Tab">Tab</button>
+    <button class="btn small" data-key="Escape">Esc</button>
+    <button class="btn small" data-key="Control+a">Select all</button>
+  </div>
+</div>
 <script src="/static/app.js"></script>
 </body>
 </html>

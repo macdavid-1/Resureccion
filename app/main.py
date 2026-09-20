@@ -27,6 +27,7 @@ from app.config import get_config
 from app.db import init_db
 from app.events import EventLog
 from app.exports import ExportManager
+from app.interactive import InteractiveSessionManager
 from app.jobs import JobOrchestrator
 from app.kdspy import KDSpyManager
 from app.methodology import Methodology
@@ -102,6 +103,9 @@ def create_app() -> FastAPI:
         app.state.browser_manager = BrowserManager(config, app.state.kdspy, app.state.browser_evidence)
         app.state.amazon_auth = AmazonAuthManager(
             config, app.state.browser_manager, app.state.browser_auth, app.state.login_windows
+        )
+        app.state.interactive = InteractiveSessionManager(
+            config, app.state.browser_manager, app.state.login_windows
         )
         app.state.kdspy.validate_installation()  # record pre-launch state
         app.state.login_windows.expire_stale()

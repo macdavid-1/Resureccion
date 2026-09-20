@@ -715,6 +715,146 @@
     finally { btn.disabled = false; }
   }
 
+  // ---------- interactive remote browser (sign-in / KDSpy setup) ----------
+  const rb = {
+    session: null, timer: null, pollTimer: null, busy: false,
+  };
+
+  function rbShow(session) {
+    rb.session = session;
+    $("#rbrowser").classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+    $("#rb-url").textContent = session?.url || "—";
+    if (!rb.timer) rb.timer = setInterval(rbTick, 1200);
+    rbTick();
+  }
+
+  function rbHide() {
+    rb.session = null;
+    $("#rbrowser").classList.add("hidden");
+    document.body.style.overflow = "";
+    clearInterval(rb.timer); rb.timer = null;
+    clearInterval(rb.pollTimer); rb.pollTimer = null;
+  }
+
+  async function rbTick() {
+    if (!rb.session || rb.busy) return;
+    rb.busy = true;
+    try {
+      const res = await fetch("/api/browser/interactive/frame", { headers: authHeaders() });
+      if (res.ok) {
+        const { frame } = await res.json();
+        const img = $("#rb-frame");
+        img.src = "data:image/jpeg;base64," + frame;
+        img.classList.remove("hidden");
+        $("#rb-off").classList.add("hidden");
+      } else {
+        $("#rb-frame").classList.add("hidden");
+        $("#rb-off").classList.remove("hidden");
+        $("#rb-off").textContent = res.status === 404 ? "Remote browser is off." : "Reconnecting…";
+      }
+      // Refresh TTL + URL from state endpoint (cheap, no image).
+      const st = await fetch("/api/browser/interactive/state", { headers: authHeaders() }).then((r) => r.json()).catch(() => null);
+      if (st?.session) {
+        rb.session = st.session;
+        $("#rb-url").textContent = st.session.url || "—";
+        const secs = st.session.seconds_remaining ?? 0;
+        $("#rb-timer-t").textContent = fmtElapsed(secs) + " left";
+        if (secs <= 0) { toast("Interactive session expired"); rbDone(); }
+      } else {
+        rbDone();
+      }
+    } catch {} finally { rb.busy = false; }
+  }
+
+  async function rbAct(action, args) {
+    if (!rb.session) return;
+    try {
+      const data = await api("/api/browser/interactive/action", {
+        method: "POST", body: JSON.stringify({ action, args }),
+      });
+      rb.session = data.session;
+      $("#rb-url").textContent = data.session.url || "—";
+      rbTick();
+    } catch (e) {
+      toast(e.message);
+      if (String(e.message).includes("expired") || String(e.message).includes("no open")) rbDone();
+    }
+  }
+
+  async function rbDone() {
+    if (!rb.session) { rbHide(); return; }
+    const id = rb.session.id;
+    rbHide();
+    try { await api("/api/browser/interactive/complete", { method: "POST", body: JSON.stringify({ outcome: "completed" }) }); } catch {}
+    void id;
+    refreshSettings();
+  }
+
+  function rbBind() {
+    $("#rb-back").addEventListener("click", rbDone);
+    // Tap-to-click on the live frame (scales phone coordinates → viewport).
+    const img = $("#rb-frame");
+    let lastTouch = 0;
+    const doClick = (clientX, clientY) => {
+      const r = img.getBoundingClientRect();
+      const nw = 1440, nh = Math.round(1440 * (img.naturalHeight || 900) / (img.naturalWidth || 1440));
+      const x = Math.round((clientX - r.left) * (nw / r.width));
+      const y = Math.round((clientY - r.top) * (nh / r.height));
+      rbAct("click", { x, y });
+    };
+    img.addEventListener("click", (e) => {
+      const now = Date.now();
+      if (now - lastTouch < 30) return;
+      lastTouch = now;
+      doClick(e.clientX, e.clientY);
+    });
+    img.addEventListener("touchend", (e) => {
+      const t = e.changedTouches[0];
+      if (!t) return;
+      e.preventDefault();
+      doClick(t.clientX, t.clientY);
+    }, { passive: false });
+    // Scroll with two-finger drag is unreliable; provide wheel-equivalent buttons.
+    $("#rb-send").addEventListener("click", () => {
+      const v = $("#rb-text").value;
+      if (!v) return;
+      rbAct("type", { text: v });
+      $("#rb-text").value = "";
+    });
+    $("#rb-text").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); $("#rb-send").click(); }
+    });
+    $("#rb-key").addEventListener("click", () => {
+      const v = prompt("Key to send (e.g. Enter, Tab, Backspace, a, 1):");
+      if (v) rbAct("key", { key: v });
+    });
+    $$("#rbrowser .rb-key-row button").forEach((b) =>
+      b.addEventListener("click", () => rbAct("key", { key: b.dataset.key })));
+    // Vertical swipe on the frame scrolls the page.
+    let touchY = null;
+    img.addEventListener("touchstart", (e) => { touchY = e.touches[0].clientY; }, { passive: true });
+    img.addEventListener("touchmove", (e) => {
+      if (touchY === null || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      const dy = touchY - y;
+      if (Math.abs(dy) > 48) {
+        rbAct("scroll", { dy: Math.round(dy * 2) });
+        touchY = y;
+      }
+    }, { passive: true });
+    img.addEventListener("touchend", () => { touchY = null; }, { passive: true });
+  }
+
+  async function openInteractive(purpose, marketplace) {
+    try {
+      const data = await api("/api/browser/interactive/start", {
+        method: "POST", body: JSON.stringify({ purpose, marketplace: marketplace || "us" }),
+      });
+      rbShow(data.session);
+    } catch (e) { toast(e.message); }
+  }
+
   // ---------- settings ----------
   async function refreshSettings() {
     try {
@@ -729,16 +869,24 @@
         c.className = `chip ${ok ? "completed" : warn ? "paused" : ""}`;
       };
       if (az) {
+        const ok = az.auth?.status === "confirmed";
         $("#set-amazon-state").textContent =
-          az.auth?.status === "confirmed" ? "Signed in — persistent profile active" :
-          az.auth?.status ? `Status: ${az.auth.status}` : "Not configured";
-        setChip("#set-amazon-chip", az.auth?.status === "confirmed", !!az.auth?.status && az.auth.status !== "confirmed");
+          ok ? "Signed in — persistent profile active" :
+          az.auth?.status ? `Status: ${az.auth.status}` : "Not signed in yet";
+        setChip("#set-amazon-chip", ok, !!az.auth?.status && !ok);
+        $("#set-amazon-open").textContent = ok ? "Re-sign in" : "Sign in";
       }
       if (kd) {
-        const ok = kd.extension?.status === "ready" || kd.state?.status === "ready";
-        const present = kd.extension?.present ?? kd.present ?? false;
-        $("#set-kdspy-state").textContent = ok ? "Installed and validated" : present ? "Present — needs validation" : "Extension directory not found";
-        setChip("#set-kdspy-chip", ok, present && !ok);
+        const st = kd.extension?.status;
+        const ok = st === "validated" || st === "installed";
+        $("#set-kdspy-state").textContent =
+          st === "validated" ? `Loaded in browser${kd.extension.version ? ` · v${kd.extension.version}` : ""}` :
+          st === "installed" ? "Installed — loads on next browser launch" :
+          st === "failed" ? `Problem: ${kd.extension.detail?.error || kd.extension.detail?.reason || "invalid extension"}` :
+          "Extension directory not found";
+        setChip("#set-kdspy-chip", ok, !!st && !ok);
+        $("#set-kdspy-open").textContent = ok ? "Update" : "Install";
+        $("#kdspy-upload-row").hidden = false;
       }
       if (mk) {
         $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
@@ -748,6 +896,66 @@
       const m = await api("/api/methodology");
       $("#set-version").textContent = `${m.title || "9-phase methodology"} · Resurrección`;
     } catch {}
+  }
+
+  function bindKdspyUpload() {
+    $("#set-kdspy-open").addEventListener("click", () => {
+      const row = $("#kdspy-upload-row");
+      row.hidden = !row.hidden;
+    });
+    $("#set-amazon-open").addEventListener("click", () => openInteractive("amazon_signin", "us"));
+    $("#kdspy-pick-zip").addEventListener("click", () => $("#kdspy-zip-input").click());
+    $("#kdspy-pick-files").addEventListener("click", () => $("#kdspy-files-input").click());
+    const status = (msg) => { $("#kdspy-upload-status").textContent = msg; };
+
+    async function finishInstall(label) {
+      status(label + " installed. Relaunching browser…");
+      await refreshSettings();
+      status(label + " installed.");
+      toast("KDSpy installed — opening setup browser");
+      openInteractive("kdspy_setup");
+    }
+
+    $("#kdspy-zip-input").addEventListener("change", async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      status(`Uploading ${f.name}…`);
+      const fd = new FormData();
+      fd.append("file", f);
+      try {
+        const res = await fetch("/api/browser/extensions/kdspy/install", {
+          method: "POST", headers: authHeaders(), body: fd,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        await finishInstall(`KDSpy ${data.manifest?.version || ""}`.trim());
+      } catch (err) { status(""); toast(err.message); }
+      finally { e.target.value = ""; }
+    });
+
+    $("#kdspy-files-input").addEventListener("change", async (e) => {
+      const files = Array.from(e.target.files || []);
+      if (!files.length) return;
+      status(`Uploading ${files.length} files…`);
+      const fd = new FormData();
+      let paths = "";
+      for (const f of files) {
+        fd.append("files", f);
+        // webkitdirectory-relative path when available, else bare name.
+        const rel = f.webkitRelativePath || f.name;
+        paths += rel + "\n";
+      }
+      fd.append("paths", paths);
+      try {
+        const res = await fetch("/api/browser/extensions/kdspy/install-files", {
+          method: "POST", headers: authHeaders(), body: fd,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        await finishInstall(`KDSpy ${data.manifest?.version || ""}`.trim());
+      } catch (err) { status(""); toast(err.message); }
+      finally { e.target.value = ""; }
+    });
   }
 
   // ---------- login ----------
@@ -778,6 +986,8 @@
     $$("#tabbar button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
     $("#lv-toggle").addEventListener("click", toggleLiveView);
     $("#tb-record").addEventListener("click", toggleRecording);
+    rbBind();
+    bindKdspyUpload();
   }
 
   async function init() {

@@ -100,7 +100,7 @@ Space setup checklist:
 1. **SDK:** Docker (`sdk: docker`, `app_port: 7860` — already in this README's frontmatter).
 2. **Persistent storage:** enable a persistent bucket in the Space settings; the image sets `DATA_DIR=/data`, which is where the bucket mounts. Everything durable (SQLite DB, artifacts, recordings, PDFs, uploads, browser profile with Amazon/KDSpy auth) lives under it.
 3. **Secrets** (Space → Settings → Variables and secrets): `OWNER_PASSWORD_HASH`, `AUTH_SECRET`, `MODEL_API_KEY`, and recommended `BROWSER_LOGIN_SECRET`. Generate the hash with `python -m app.scripts.set_password`. Full list: `ENV_VARS.md`.
-4. **KDSpy Pro:** upload the unpacked extension into `/data/extensions/kdspy` (via the app's extension API or a one-time file copy) — `KDSPY_EXTENSION_PATH` defaults there.
+4. **KDSpy Pro:** upload the unpacked extension directly from the app — Settings → KDSpy Pro → Install (ZIP or folder files). No shell access needed.
 
 Chromium runs with `--no-sandbox` in the container (auto-detected; forced via
 `BROWSER_NO_SANDBOX=true` in the image) because Spaces containers run without
@@ -127,6 +127,27 @@ python -m app.scripts.set_password
 
 prints `OWNER_PASSWORD_HASH=...` — set it (and `AUTH_SECRET`) in the Space's environment settings.
 
+## One-time account & extension setup (from your phone)
+
+Everything the research browser needs is configured from Settings — no server
+shell required, on the preview or on the deployed Space:
+
+1. **Amazon sign-in.** Settings → Amazon authentication → **Sign in**. A
+   full-screen remote browser opens (the server's real Chromium, streaming
+   live frames to your phone). Tap to click, use the text bar and key buttons
+   to fill the login form, complete captcha/OTP, then Close. Cookies persist
+   in the shared browser profile (`$DATA_DIR/browser_profiles/kdspy`), so
+   every future research run is already signed in. The same flow is used
+   again only if Amazon expires the session.
+2. **KDSpy Pro install.** Settings → KDSpy Pro → **Install**. Upload the
+   unpacked extension as a ZIP (Chrome web-store export) or select the folder
+   files. It is validated, installed atomically into
+   `$DATA_DIR/extensions/kdspy`, and the browser relaunches. The setup browser
+   then opens for KDSpy license activation — same persistent profile, so
+   Amazon stays signed in while KDSpy activates.
+3. Amazon and KDSpy state are shown as status chips in Settings; the research
+   agent pauses safely and waits if a marketplace wall is ever hit mid-run.
+
 ## Browser infrastructure (Stage 2)
 
 - ONE persistent Chromium (Playwright `launch_persistent_context`) shared by
@@ -135,10 +156,11 @@ prints `OWNER_PASSWORD_HASH=...` — set it (and `AUTH_SECRET`) in the Space's e
 - KDSpy Pro loads as a real unpacked extension (`--load-extension`); the
   manager validates its manifest, records version/state, and verifies the
   MV3 service worker after launch. KDSpy data is never faked.
-- Amazon auth: one-shot supervised login window (owner session + login
-  secret), live auth-state detection (signed-in / login_required / captcha /
-  OTP / signed-out), regional-redirect detection, and Amazon-only cookie
-  import. The agent pauses safely when manual intervention is needed.
+- Amazon auth: owner-driven interactive sign-in over the persistent profile
+  (live frame streaming + whitelisted tap/type/key/scroll/navigate controls),
+  live auth-state detection (signed-in / login_required / captcha / OTP /
+  signed-out), regional-redirect detection, and Amazon-only cookie import.
+  The agent pauses safely when manual intervention is needed.
 - Marketplaces: 18 Amazon domains abstracted; sessions obey explicit owner
   lists or auto-select ~4-5 by relevance (language hints + core markets).
 - Evidence: structured extraction (rank/ASIN/title/price/rating/reviews/BSR,

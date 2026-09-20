@@ -85,7 +85,7 @@ itself, never silently.
 | `KDSPY_EXTENSION_PATH` | no | `$DATA_DIR/extensions/kdspy` | Owner uploads the **unpacked KDSpy Pro** extension here |
 | `KDSPY_MIN_VERSION` | no | — | Optional minimum version enforcement |
 | `KDSPY_EXTENSION_ID` | no | — | Optional known extension id |
-| `BROWSER_LOGIN_WINDOW_SECONDS` | no | `900` | One-shot manual login window TTL |
+| `BROWSER_LOGIN_WINDOW_SECONDS` | no | `900` | Interactive browser session TTL (Amazon sign-in / KDSpy setup from the phone). Hard-capped at 2700s |
 | `BROWSER_LOGIN_SECRET` | recommended | — | Shared secret required to open a manual login window (defense in depth on top of owner auth) |
 
 Playwright + Chromium must be installed on the server:

@@ -408,8 +408,54 @@ details.sect > .sect-body { padding: 2px 14px 14px; border-top: 1px solid var(--
   padding: 13px 14px; border-bottom: 1px solid var(--line);
 }
 .set-row:last-child { border-bottom: none; }
+.set-row.set-col { flex-direction: column; align-items: stretch; gap: 8px; }
 .set-k { font-size: 0.88rem; }
 .set-d { font-size: 0.74rem; color: var(--text-3); margin-top: 2px; line-height: 1.4; }
+
+/* ---------- interactive remote browser overlay ---------- */
+.rbrowser {
+  position: fixed; inset: 0; z-index: 90;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+}
+.rbrowser.hidden { display: none; }
+.rbrowser-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top));
+  border-bottom: 1px solid var(--line); background: var(--bg-panel);
+}
+.rb-url {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-2); font-size: 0.72rem;
+}
+.rb-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.rb-frame-wrap {
+  position: relative; flex: 1; min-height: 0;
+  display: grid; place-items: center; background: #05060a; overflow: hidden;
+}
+.rb-frame-wrap img { width: 100%; height: auto; max-height: 100%; object-fit: contain; touch-action: none; }
+.rb-off {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  color: var(--text-3); font-size: 0.84rem; text-align: center; padding: 20px;
+}
+.rb-hint {
+  padding: 6px 12px; text-align: center;
+  font-size: 0.66rem; color: var(--text-3); letter-spacing: 0.06em;
+  border-top: 1px solid var(--line); background: var(--bg-raise);
+}
+.rb-input-bar {
+  display: flex; gap: 8px; padding: 10px 12px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line); background: var(--bg-panel);
+}
+.rb-input-bar input { flex: 1; }
+.rb-key-row {
+  display: flex; gap: 8px; padding: 0 12px 12px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  background: var(--bg-panel); border-top: 1px solid var(--line);
+}
+.rb-key-row button { flex: 1; min-height: 44px; font-size: 0.76rem; }
+.rb-key-row { margin-top: -1px; }
 
 /* toast */
 #toast {
