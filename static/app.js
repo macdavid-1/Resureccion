@@ -968,12 +968,74 @@
       if (mk) {
         $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
       }
+      // Device relay status (phone IP egress).
+      try {
+        const rl = await api("/api/relay/status");
+        const r = rl.relay || {};
+        const chip = $("#set-relay-chip");
+        if (r.enabled && r.device_connected) {
+          chip.textContent = "paired";
+          chip.className = "chip completed";
+          $("#set-relay-state").textContent = "Active — research exits through your device's IP";
+          $("#set-relay-enable").textContent = "Disable";
+        } else if (r.enabled) {
+          chip.textContent = "waiting";
+          chip.className = "chip paused";
+          $("#set-relay-state").textContent = "Enabled — start the client on your phone/home device to pair";
+          $("#set-relay-enable").textContent = "Disable";
+        } else {
+          chip.textContent = "off";
+          chip.className = "chip";
+          $("#set-relay-state").textContent = "Off — browser uses the configured proxy or direct egress";
+          $("#set-relay-enable").textContent = "Enable";
+        }
+        $("#relay-help-row").hidden = false;
+      } catch {}
     } catch {}
     try {
       const m = await api("/api/methodology");
       $("#set-version").textContent = `${m.title || "9-phase methodology"} · Resurrección`;
     } catch {}
   }
+
+  function bindRelayControls() {
+    $("#set-relay-enable").addEventListener("click", async () => {
+      const btn = $("#set-relay-enable");
+      const enabling = btn.textContent.trim().toLowerCase() !== "disable";
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> …';
+      try {
+        await api(enabling ? "/api/relay/enable" : "/api/relay/disable", { method: "POST" });
+        toast(enabling ? "Relay enabled — start the client on your device" : "Relay disabled");
+      } catch (e) { toast(e.message); }
+      btn.disabled = false;
+      btn.textContent = enabling ? "Disable" : "Enable";
+      refreshSettings();
+    });
+    $("#set-relay-test").addEventListener("click", async () => {
+      const out = $("#set-relay-test-out");
+      const btn = $("#set-relay-test");
+      btn.disabled = true;
+      out.hidden = false;
+      out.textContent = "Testing egress…";
+      try {
+        const res = await api("/api/relay/test-egress", { method: "POST" });
+        const ip = res.egress_ip || "unknown";
+        out.textContent = `Sites see: ${ip} · via ${res.path || "?"}${res.device_connected ? " · device paired" : " · device offline"}`;
+      } catch (e) { out.textContent = `Test failed: ${e.message}`; }
+      btn.disabled = false;
+    });
+    $("#set-relay-token-btn").addEventListener("click", async () => {
+      const out = $("#set-relay-token-out");
+      if (!out.hidden) { out.hidden = true; return; }
+      try {
+        const res = await api("/api/relay/token");
+        out.hidden = false;
+        out.textContent = `Token: ${res.token}`;
+      } catch (e) { toast(e.message); }
+    });
+  }
+  bindRelayControls();
 
   function bindKdspyUpload() {
     const installStatus = $("#kdspy-upload-status");

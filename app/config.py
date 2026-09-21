@@ -99,6 +99,28 @@ class Config:
         # Accepts host:port, or user:pass@host:port (preferred via env so the
         # secret lives outside the codebase).
         self.browser_proxy = os.environ.get("BROWSER_PROXY", "").strip()
+        # --- owner-device egress relay ("phone IP" mode) ---------------------
+        # Every browser request exits through the owner's own device (mobile
+        # carrier / home IP) instead of the server's datacenter IP. See
+        # app/relay.py. Optional: without a paired device the browser falls
+        # back to BROWSER_PROXY, then direct egress (if allowed).
+        self.relay_enabled = os.environ.get("RELAY_ENABLED", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        # Egress preference when the device is offline:
+        #   phone_first  — device → BROWSER_PROXY → direct
+        #   phone_only   — device only; requests fail while it is away
+        #   direct_only  — never use the device (relay parked)
+        self.relay_mode = os.environ.get("RELAY_MODE", "phone_first").strip().lower()
+        # Offline fallback: allow direct server egress when neither the
+        # device nor BROWSER_PROXY is available. Disabling makes the browser
+        # strictly device-or-proxy-only (no datacenter-IP requests at all).
+        self.relay_allow_direct = os.environ.get("RELAY_ALLOW_DIRECT", "true").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        # Explicit relay bearer token; when unset, one is generated once and
+        # stored atomically under DATA_DIR (never committed anywhere).
+        self.relay_token = os.environ.get("RELAY_TOKEN", "").strip()
         # Interactive (owner-driven) sessions open pages at a phone-class
         # viewport: the owner taps the live stream from a phone, so a 1:1
         # page scale keeps every control full-size and taps land exactly.

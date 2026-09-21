@@ -239,6 +239,27 @@
           </div>
           <input type="file" id="kdspy-zip-input" accept=".zip,application/zip" class="hidden">
           <input type="file" id="kdspy-files-input" multiple class="hidden">
+          <div class="set-row set-col">
+            <div>
+              <div class="set-k">Device relay <span class="muted">· phone IP</span></div>
+              <div class="set-d" id="set-relay-state">Checking…</div>
+              <div class="muted mono" id="set-relay-test-out" style="font-size:0.72rem; margin-top:6px" hidden></div>
+              <div class="muted mono" id="set-relay-token-out" style="font-size:0.72rem; margin-top:6px; word-break:break-all" hidden></div>
+            </div>
+            <div class="row" style="align-items:center; gap:8px">
+              <span class="chip" id="set-relay-chip">—</span>
+              <button class="btn small ghost" id="set-relay-token-btn">Token</button>
+              <button class="btn small ghost" id="set-relay-test">Test egress</button>
+              <button class="btn small" id="set-relay-enable">Enable</button>
+            </div>
+          </div>
+          <div class="set-row" hidden id="relay-help-row">
+            <div style="flex:1">
+              <div class="set-d">Route all research traffic through your own device so sites see your phone's carrier/home IP instead of the server's datacenter IP — the reliable way past CAPTCHAs and bot walls. Run the one-file client (<span class="mono">scripts/relay_client.py</span>) on your phone (Termux) or any always-on home device:</div>
+              <div class="muted mono" style="font-size:0.72rem; margin-top:8px; word-break:break-all">python relay_client.py --server &lt;this server URL&gt; --token &lt;token&gt;</div>
+              <div class="muted" style="font-size:0.72rem; margin-top:6px">The device dials out — no port forwarding. If it goes offline, research continues through your configured proxy (or direct), and switches back automatically. Tracker/ad hosts are blocked before any request touches your device's network.</div>
+            </div>
+          </div>
           <div class="set-row">
             <div><div class="set-k">Marketplaces configured</div>
               <div class="set-d">Available to the research agent</div></div>

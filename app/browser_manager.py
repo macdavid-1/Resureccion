@@ -35,6 +35,7 @@ from app.kdspy import KDSpyManager
 from app.marketplace import Marketplace, get_marketplace
 from app.redact import scrub_url
 from app import stealth
+from app import privacy
 
 try:  # pragma: no cover - import guard
     from playwright.async_api import (
@@ -92,10 +93,12 @@ class BrowserManager:
         config: Config,
         kdspy: KDSpyManager,
         evidence: BrowserEvidenceStore,
+        relay: Any = None,
     ) -> None:
         self.config = config
         self.kdspy = kdspy
         self.evidence = evidence
+        self.relay = relay
         self.profile_dir = config.browser_profiles_dir / "kdspy"
         self._playwright: Any = None
         self._context: Any = None
@@ -154,15 +157,24 @@ class BrowserManager:
             self.profile_dir.mkdir(parents=True, exist_ok=True)
             args = [
                 "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
                 "--disable-dev-shm-usage",
             ]
-            # Optional owner-configured outbound proxy (residential/quality
-            # exit) — the supported way to avoid datacenter-IP distrust from
-            # anti-bot systems such as reCAPTCHA.
-            if self.config.browser_proxy:
+            # Egress source, in order of preference: the owner-device relay
+            # shim (phone IP mode) → owner-configured external proxy →
+            # direct. When the relay shim is running it is the single egress
+            # point: it serves the device first and falls back itself.
+            relay = getattr(self, "relay", None)
+            relay_addr = f"127.0.0.1:{relay.shim.port}" if (relay and relay.enabled and relay.shim and relay.shim.port) else None
+            if relay_addr:
+                args.append(f"--proxy-server=http={relay_addr};https={relay_addr}")
+            elif self.config.browser_proxy:
                 args.append(f"--proxy-server={self.config.browser_proxy}")
+            # Privacy hardening: tracker/ad hosts are refused at the egress
+            # shim (app/privacy.py); WebRTC can never bypass the proxy over
+            # UDP; Chromium background services stay silent; DNT/GPC are
+            # declared on every request. Apply whenever the browser launches
+            # so the protections do not depend on relay mode.
+            args.extend(privacy.relay_launch_args(args))
             # Containers run as root without user namespaces; Chromium needs
             # --no-sandbox there (auto-detected, BROWSER_NO_SANDBOX overrides).
             if self.config.browser_no_sandbox:
@@ -198,6 +210,9 @@ class BrowserManager:
                 # for EVERY page in this context, installed once at the context
                 # level so sign-in pages AND research pages both benefit.
                 stealth.apply(self._context)
+                # Declare the owner's privacy preference on every request and
+                # page (DNT/Sec-GPC headers, navigator.globalPrivacyControl).
+                privacy.apply_context_privacy(self._context)
             except Exception as exc:
                 self._launch_error = str(exc)
                 await self._teardown_context()

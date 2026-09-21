@@ -152,6 +152,26 @@ shell required, on the preview or on the deployed Space:
    manual fallback.)
 3. Amazon and KDSpy state are shown as status chips in Settings; the research
    agent pauses safely and waits if a marketplace wall is ever hit mid-run.
+4. **Device relay — your phone's IP (optional but recommended).** Settings →
+   Device Relay → **Enable**, copy the token, then run the one-file client on
+   your phone (Termux: `pkg install python; pip install nothing — stdlib only`)
+   or any always-on home device:
+
+   ```bash
+   python relay_client.py --server https://<your-space>.hf.space --token <token>
+   termux-wake-lock   # keep the phone alive for long runs
+   ```
+
+   The device dials OUT to the server (works on carrier networks, no port
+   forwarding) and shuttles the research browser's TCP bytes, so Amazon,
+   KDSpy and CAPTCHA systems see your mobile/home IP instead of a datacenter
+   address. TLS stays end-to-end; the relay carries only opaque encrypted
+   bytes. Privacy is enforced server-side: tracker/ad hosts are blocked
+   before any request touches your device's network, WebRTC cannot bypass
+   the proxy, and DNT/GPC preferences are declared. If the device goes
+   offline mid-run, egress falls back to `BROWSER_PROXY`, then direct —
+   research never stalls — and switches back automatically when the device
+   returns. Verify the live exit IP anytime with **Test egress**.
 
 ## Browser infrastructure (Stage 2)
 

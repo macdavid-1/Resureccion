@@ -76,6 +76,10 @@ itself, never silently.
 | `BROWSER_NO_SANDBOX` | no | auto | Launch Chromium with `--no-sandbox`. Auto-detected: on when running as root or inside a container (HF Spaces/Docker), off locally. Set explicitly to `true`/`false` to override. |
 | `BROWSER_EXTRA_ARGS` | no | — | Space/comma-separated extra Chromium launch args (deploy-specific tuning) |
 | `BROWSER_PROXY` | no | — | Outbound proxy for the research browser, e.g. `user:pass@host:port`. Strongly recommended on cloud hosts: reCAPTCHA/Amazon silently refuse CAPTCHA challenges from datacenter IPs (including HF Spaces); a residential proxy exit is the supported fix |
+| `RELAY_ENABLED` | no | `false` | Start the owner-device egress relay at boot (Settings → Device Relay can also toggle it at runtime) |
+| `RELAY_MODE` | no | `phone_first` | Egress order when the device is offline: `phone_first` (device → proxy → direct), `phone_only` (device only), `direct_only` (never use the device) |
+| `RELAY_ALLOW_DIRECT` | no | `true` | When `false`, direct server egress is never used — browser traffic is strictly device-or-proxy only |
+| `RELAY_TOKEN` | no | — | Explicit relay bearer token; when unset a strong token is generated once and stored under `DATA_DIR/relay_token` (owner-only permissions, never committed) |
 | `BROWSER_IDLE_SHUTDOWN_SECONDS` | no | `300` | Auto-stop Chromium after idle to free the 2 cores |
 | `BROWSER_DEFAULT_TIMEOUT_SECONDS` | no | `45` | Playwright default action timeout |
 | `BROWSER_NAV_TIMEOUT_SECONDS` | no | `60` | Navigation timeout |

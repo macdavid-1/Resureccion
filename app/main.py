@@ -32,6 +32,7 @@ from app.jobs import JobOrchestrator
 from app.kdspy import KDSpyManager
 from app.methodology import Methodology
 from app.recovery import CheckpointStore, ErrorStateStore, RecoveryManager
+from app.relay import RelayHub
 from app.recording import SessionRecorder
 from app.reports import ReportStore
 from app.research_data import (
@@ -45,6 +46,7 @@ from app.routes import auth as auth_routes
 from app.routes import browser as browser_routes
 from app.routes import misc as misc_routes
 from app.routes import monitoring as monitoring_routes
+from app.routes import relay as relay_routes
 from app.routes import sessions as session_routes
 from app.trace import ActivityTrace
 from app.runner_registry import RunnerRegistry
@@ -111,6 +113,15 @@ def create_app() -> FastAPI:
         app.state.kdspy.validate_installation()  # record pre-launch state
         app.state.login_windows.expire_stale()
 
+        # --- owner-device egress relay ("phone IP" mode) ---------------------
+        app.state.relay = RelayHub(config)
+        if config.relay_enabled:
+            try:
+                relay_status = await app.state.relay.start()
+                print(f"[relay] active — shim at {relay_status.get('shim')}", flush=True)
+            except Exception as exc:
+                print(f"[relay] start failed: {exc}", flush=True)
+
         # --- research executor (methodology + model + browser actions) ------
         app.state.methodology = Methodology(config)
         app.state.trace = ActivityTrace(db)
@@ -175,6 +186,11 @@ def create_app() -> FastAPI:
         except Exception as exc:
             print(f"[recording] boot recovery error: {exc}", flush=True)
         yield
+        try:
+            if getattr(app.state, "relay", None):
+                await app.state.relay.stop()
+        except Exception:
+            pass
         await app.state.browser_manager.shutdown()
         db.close()
 
@@ -185,6 +201,7 @@ def create_app() -> FastAPI:
     app.include_router(misc_routes.router)
     app.include_router(browser_routes.router)
     app.include_router(monitoring_routes.router)
+    app.include_router(relay_routes.router)
 
     @app.exception_handler(AuthError)
     async def auth_error_handler(_: Request, exc: AuthError) -> JSONResponse:
