@@ -187,7 +187,8 @@ class InteractiveSessionManager:
         this, the owner taps the button, the stream keeps showing the old
         page, and the login form sits invisible in a hidden tab. Every popup
         becomes a switchable tab, auto-focuses, and joins the session so
-        complete() closes it too.
+        complete() closes it too. Popups get the same phone emulation so every
+        tab the owner sees stays 1:1 tappable.
         """
         def _on_popup(popup: Any) -> None:
             if session.status != "open":
@@ -195,6 +196,11 @@ class InteractiveSessionManager:
             if popup not in session.pages:
                 session.pages.append(popup)
                 session.active = len(session.pages) - 1  # auto-focus the new tab
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.browser.apply_mobile_emulation(popup))
+                except Exception:
+                    pass
                 self._watch_popups(session, popup)
         try:
             page.on("popup", _on_popup)

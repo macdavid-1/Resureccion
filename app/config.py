@@ -99,6 +99,19 @@ class Config:
         # Accepts host:port, or user:pass@host:port (preferred via env so the
         # secret lives outside the codebase).
         self.browser_proxy = os.environ.get("BROWSER_PROXY", "").strip()
+        # Interactive (owner-driven) sessions open pages at a phone-class
+        # viewport: the owner taps the live stream from a phone, so a 1:1
+        # page scale keeps every control full-size and taps land exactly.
+        # Research pages keep the wide desktop viewport for KDSpy panels.
+        self.browser_interactive_viewport_w = _int_env("BROWSER_INTERACTIVE_VIEWPORT_W", 390)
+        self.browser_interactive_viewport_h = _int_env("BROWSER_INTERACTIVE_VIEWPORT_H", 844)
+        # Mobile Chrome UA for owner-driven pages. Empty = keep the desktop UA
+        # (not recommended: mobile UA is what makes sites serve touch layouts).
+        self.browser_interactive_user_agent = os.environ.get(
+            "BROWSER_INTERACTIVE_USER_AGENT",
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+        ).strip()
         self.browser_downloads_dir = self.data_dir / "browser_downloads"
 
         # KDSpy Pro extension: unpacked extension directory (owner-supplied).

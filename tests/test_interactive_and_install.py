@@ -92,6 +92,9 @@ class FakeBrowser:
     async def close_page(self, page: Any) -> None:
         page.closed = True
 
+    async def apply_mobile_emulation(self, page: Any) -> None:
+        self.mobile_emulated = True
+
 
 class FakeWindows:
     def __init__(self) -> None:

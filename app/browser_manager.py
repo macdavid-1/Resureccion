@@ -273,7 +273,8 @@ class BrowserManager:
 
         `interactive=True` marks the page as owner-controlled (sign-in/setup);
         protected pages are never chosen as eviction victims when the research
-        page pool needs space.
+        page pool needs space. Interactive pages open at a phone-class viewport
+        so the owner's taps map 1:1 and every control stays full-size.
         """
         ctx = await self._ensure_context()
         # Respect the 2-core budget: keep at most browser_max_open_pages live,
@@ -294,9 +295,69 @@ class BrowserManager:
         page = await ctx.new_page()
         if interactive:
             page._resurreccion_protected = True
+            # Owner-driven pages emulate a REAL PHONE (viewport, touch, mobile
+            # UA, meta-viewport handling) — the shared context stays desktop
+            # for research pages. This is what makes the whole screen
+            # accurately responsive: the owner taps a 1:1 page where every
+            # control is full-size and sites serve their touch layouts.
+            try:
+                # Playwright-managed viewport survives cross-document
+                # navigations; set it first so layout is always phone-class.
+                await page.set_viewport_size({
+                    "width": self.config.browser_interactive_viewport_w,
+                    "height": self.config.browser_interactive_viewport_h,
+                })
+                await self._emulate_mobile(page)
+            except Exception:
+                pass  # page may already be closing; desktop viewport is a safe fallback
         page.set_default_timeout(self.config.browser_default_timeout_seconds * 1000)
         self._touch()
         return page
+
+    async def apply_mobile_emulation(self, page: Any) -> None:
+        """Public wrapper: make one existing page emulate a phone.
+
+        Used for popup tabs the site opens after the session started
+        (kdspy.com's Login form opens in a new tab) so EVERY tab the owner
+        sees stays 1:1 tappable.
+        """
+        try:
+            await page.set_viewport_size({
+                "width": self.config.browser_interactive_viewport_w,
+                "height": self.config.browser_interactive_viewport_h,
+            })
+        except Exception:
+            pass
+        await self._emulate_mobile(page)
+
+    async def _emulate_mobile(self, page: Any) -> None:
+        """Turn one page into a phone: mobile metrics, touch, mobile UA.
+
+        Uses a per-page CDP session so the shared research context is
+        untouched. Runs before first navigation, so every site (kdspy.com,
+        Amazon, WordPress login) sees a genuine mobile browser.
+        """
+        w = self.config.browser_interactive_viewport_w
+        h = self.config.browser_interactive_viewport_h
+        cdp = await page.context.new_cdp_session(page)
+        if self.config.browser_interactive_user_agent:
+            await cdp.send(
+                "Emulation.setUserAgentOverride",
+                {"userAgent": self.config.browser_interactive_user_agent},
+            )
+        await cdp.send(
+            "Emulation.setTouchEmulationEnabled",
+            {"enabled": True, "maxTouchPoints": 5},
+        )
+        await cdp.send(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": w,
+                "height": h,
+                "deviceScaleFactor": 1,
+                "mobile": True,
+            },
+        )
 
     async def open_marketplace(self, marketplace: Marketplace, path: str = "/") -> Any:
         """Navigate a fresh page to a marketplace home/search path."""
