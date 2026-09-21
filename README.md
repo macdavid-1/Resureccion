@@ -173,6 +173,28 @@ shell required, on the preview or on the deployed Space:
    research never stalls — and switches back automatically when the device
    returns. Verify the live exit IP anytime with **Test egress**.
 
+## Your own VPS as the egress proxy (recommended for offline hours)
+
+A dual-stack (IPv4 **and** IPv6) VPS is the cheapest always-on egress that
+reaches **all** hosts — including the IPv6-only Cloudflare challenge hosts
+that broke the Webshare gateway (502 on `brunhild.challenges.cloudflare.com`).
+
+1. **Before buying**, pre-check any candidate IP:
+   `python scripts/vps_ip_probe.py <candidate-ip>` — verifies IPv4+IPv6
+   reachability, classifies the ASN (datacenter vs ISP), and checks
+   blocklists. Buy only a `VIABLE` verdict.
+2. **On the VPS** (Ubuntu, as root): `sh scripts/vps_proxy_setup.sh` —
+   installs 3proxy, generates strong random credentials, locks UFW to
+   SSH + the proxy port, enables IPv6, blocks private-range pivoting, and
+   self-tests both address families. Prints a ready `BROWSER_PROXY` value.
+3. **In Resurrección**: Settings → Environment → `BROWSER_PROXY` → paste →
+   restart → **Test egress**. Egress order stays: phone relay → `BROWSER_PROXY`
+   → direct.
+
+Keep `scripts/vps_ip_probe.py <ip> --proxy "user:pass@host:port"` handy:
+it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
+(routing/IPv6) instead of conflating them.
+
 ## Browser infrastructure (Stage 2)
 
 - ONE persistent Chromium (Playwright `launch_persistent_context`) shared by
