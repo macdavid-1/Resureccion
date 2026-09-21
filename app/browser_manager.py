@@ -36,6 +36,7 @@ from app.marketplace import Marketplace, get_marketplace
 from app.redact import scrub_url
 from app import stealth
 from app import privacy
+from app.proxy_spec import playwright_proxy_kwarg
 
 try:  # pragma: no cover - import guard
     from playwright.async_api import (
@@ -168,7 +169,12 @@ class BrowserManager:
             if relay_addr:
                 args.append(f"--proxy-server=http={relay_addr};https={relay_addr}")
             elif self.config.browser_proxy:
-                args.append(f"--proxy-server={self.config.browser_proxy}")
+                # Owner-configured proxy (e.g. Webshare). Credentials, when
+                # present (user:pass@host:port), go through Playwright's
+                # native proxy auth — Chromium silently ignores credentials
+                # embedded in --proxy-server and every request would fail
+                # the proxy's 407 challenge.
+                args.append(f"--proxy-server={playwright_proxy_kwarg(self.config.browser_proxy)['server']}")
             # Privacy hardening: tracker/ad hosts are refused at the egress
             # shim (app/privacy.py); WebRTC can never bypass the proxy over
             # UDP; Chromium background services stay silent; DNT/GPC are
@@ -200,6 +206,13 @@ class BrowserManager:
                 launch_kwargs["channel"] = "chromium"
             if self.config.browser_user_agent:
                 launch_kwargs["user_agent"] = self.config.browser_user_agent
+            # Native proxy auth (only when the relay shim isn't the egress —
+            # the shim path has no external credentials). Playwright answers
+            # the proxy's 407 inside the browser process.
+            if not relay_addr and self.config.browser_proxy:
+                proxy_kw = playwright_proxy_kwarg(self.config.browser_proxy)
+                if proxy_kw:
+                    launch_kwargs["proxy"] = proxy_kw
             try:
                 self._playwright = await async_playwright().start()
                 self._context = await self._playwright.chromium.launch_persistent_context(
