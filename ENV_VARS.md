@@ -75,6 +75,7 @@ itself, never silently.
 | `BROWSER_CHANNEL` | no | `chromium` | Playwright channel; bundled chromium supports extensions headless |
 | `BROWSER_NO_SANDBOX` | no | auto | Launch Chromium with `--no-sandbox`. Auto-detected: on when running as root or inside a container (HF Spaces/Docker), off locally. Set explicitly to `true`/`false` to override. |
 | `BROWSER_EXTRA_ARGS` | no | — | Space/comma-separated extra Chromium launch args (deploy-specific tuning) |
+| `BROWSER_PROXY` | no | — | Outbound proxy for the research browser, e.g. `user:pass@host:port`. Strongly recommended on cloud hosts: reCAPTCHA/Amazon silently refuse CAPTCHA challenges from datacenter IPs (including HF Spaces); a residential proxy exit is the supported fix |
 | `BROWSER_IDLE_SHUTDOWN_SECONDS` | no | `300` | Auto-stop Chromium after idle to free the 2 cores |
 | `BROWSER_DEFAULT_TIMEOUT_SECONDS` | no | `45` | Playwright default action timeout |
 | `BROWSER_NAV_TIMEOUT_SECONDS` | no | `60` | Navigation timeout |

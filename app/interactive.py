@@ -298,22 +298,10 @@ class InteractiveSessionManager:
         return s
 
     # -------------------------------------------------------------------- end
-    async def _click_snapped(self, page: Any, x: int, y: int) -> None:
-        """Tap-to-click with fat-finger tolerance.
-
-        The owner taps a 1440px-wide page rendered on a ~390px phone screen
-        (≈3.7x compression, ±10px finger accuracy ≈ ±37 page px). A raw
-        pixel click misses small targets constantly. So: resolve the element
-        under the tapped point, and when it sits inside something genuinely
-        interactive (a/button/input/label/…), click the CENTER of that
-        element instead — the whole control becomes the target. Plain text
-        taps stay pixel-exact.
-        """
-        snapped: dict[str, Any] | None = None
-        try:
-            snapped = await page.evaluate(
-                """([x, y]) => {
-                    const INTERACTIVE = 'a, button, [role=button], input, select, textarea, label, summary, [onclick], [jsaction]';
+    # Shared JS used both in the top page and inside child frames to resolve
+    # the element under a tapped point. Kept frame-agnostic on purpose.
+    _SNAP_JS = """([x, y]) => {
+                    const INTERACTIVE = 'a, button, [role=button], [role=checkbox], [role=switch], [role=link], [role=menuitem], [role=tab], input, select, textarea, label, summary, [onclick], [jsaction]';
                     const pick = (el) => {
                         if (!el || !el.closest) return null;
                         const t = el.closest(INTERACTIVE);
@@ -323,8 +311,14 @@ class InteractiveSessionManager:
                         if (r.width > 700 || r.height > 400) return null; // container, not a control
                         return { interactive: true, x: r.left + r.width / 2, y: r.top + r.height / 2, area: r.width * r.height };
                     };
-                    const direct = pick(document.elementFromPoint(x, y));
-                    if (direct) return direct;
+                    const hit = document.elementFromPoint(x, y);
+                    const direct = pick(hit);
+                    if (direct) return { ...direct, hit: (hit && hit.tagName || '').toLowerCase() };
+                    // A tap on an IFRAME (CAPTCHA/embedded widgets) must NOT
+                    // be diverted to an overlay handler: frame descent below
+                    // resolves it inside the frame instead.
+                    const overFrame = hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME');
+                    if (overFrame) return { interactive: false, hit: 'iframe' };
                     // Fat-finger recovery: the phone renders a 1440px page at
                     // ~0.27x, so a 20px-tall link is ~5px on screen — taps a
                     // few pixels off land on dead space and feel ignored.
@@ -341,12 +335,31 @@ class InteractiveSessionManager:
                             const score = d + Math.sqrt(cand.area) / 8;
                             if (!best || score < best.score) best = { ...cand, score };
                         }
-                        if (best) return best;
+                        if (best) return { ...best, hit: (hit && hit.tagName || '').toLowerCase() };
                     }
-                    return { interactive: false };
-                }""",
-                [x, y],
-            )
+                    return { interactive: false, hit: (hit && hit.tagName || '').toLowerCase() };
+                }"""
+
+    async def _click_snapped(self, page: Any, x: int, y: int) -> None:
+        """Tap-to-click with fat-finger tolerance and iframe descent.
+
+        The owner taps a 1440px-wide page rendered on a ~390px phone screen
+        (≈3.7x compression, ±10px finger accuracy ≈ ±37 page px). A raw
+        pixel click misses small targets constantly. So: resolve the element
+        under the tapped point, and when it sits inside something genuinely
+        interactive (a/button/input/label/…), click the CENTER of that
+        element instead — the whole control becomes the target. Plain text
+        taps stay pixel-exact.
+
+        The resolver ALSO descends into child frames: CAPTCHA widgets (and
+        many payment/embedded forms) render their real checkbox inside a
+        cross-origin iframe, where the top document only sees the iframe
+        element. Tapping there is resolved inside the owning frame and
+        mapped back to page coordinates before the physical click.
+        """
+        snapped: dict[str, Any] | None = None
+        try:
+            snapped = await page.evaluate(self._SNAP_JS, [x, y])
         except Exception:
             snapped = None  # mid-navigation, CSP, about:blank — raw click
         if isinstance(snapped, dict) and snapped.get("interactive"):
@@ -354,8 +367,65 @@ class InteractiveSessionManager:
                 await page.mouse.click(float(snapped["x"]), float(snapped["y"]))
                 return
             except Exception:
-                pass  # fall through to the raw pixel click
+                pass  # fall through to frame descent / raw click
+        # IFrame descent: if the top-document hit is a frame element (or the
+        # point missed any control but sits over a frame), re-resolve inside
+        # that frame with frame-local coordinates and map the result back.
+        if isinstance(snapped, dict) and not snapped.get("interactive"):
+            frame_target = await self._frame_snap(page, x, y)
+            if frame_target is not None:
+                fx, fy = frame_target
+                try:
+                    await page.mouse.click(float(fx), float(fy))
+                    return
+                except Exception:
+                    pass
         await page.mouse.click(x, y)
+
+    async def _frame_snap(self, page: Any, x: int, y: int) -> tuple[float, float] | None:
+        """Resolve a tap inside a child iframe; returns PAGE coordinates.
+
+        For each child frame, get its bounding box in page coordinates and
+        test whether (x, y) falls inside it (with a small tolerance so taps
+        a few pixels off the frame edge still resolve — reCAPTCHA's box sits
+        tight against the widget border). Then run the same snap resolver
+        in the frame's own document and translate the found center back.
+
+        The frame resolver runs TWICE when the first pass finds no control:
+        reCAPTCHA's checkbox is a bare div inside a nested inner iframe, so
+        a miss here descends one level deeper rather than giving up.
+        """
+        try:
+            frames = [f for f in page.frames if f is not page.main_frame]
+        except Exception:
+            return None
+        for frame in frames:
+            try:
+                el = await frame.frame_element()
+                box = await el.bounding_box()
+            except Exception:
+                continue  # detached frame, detached element, CSP — skip
+            if not box:
+                continue
+            tol = 12
+            if not (box["x"] - tol <= x <= box["x"] + box["width"] + tol
+                    and box["y"] - tol <= y <= box["y"] + box["height"] + tol):
+                continue
+            inner_x = x - box["x"]
+            inner_y = y - box["y"]
+            try:
+                res = await frame.evaluate(self._SNAP_JS, [inner_x, inner_y])
+            except Exception:
+                res = None
+            if isinstance(res, dict) and res.get("interactive"):
+                return (box["x"] + float(res["x"]), box["y"] + float(res["y"]))
+            # No interactive element inside the frame — but the frame itself
+            # is the target (e.g. a bare checkbox canvas): click where the
+            # finger actually landed, inside the frame.
+            if (box["x"] <= x <= box["x"] + box["width"]
+                    and box["y"] <= y <= box["y"] + box["height"]):
+                return (float(x), float(y))
+        return None
 
     async def complete(self, *, outcome: str = "completed") -> InteractiveSession:
         s = self.current()

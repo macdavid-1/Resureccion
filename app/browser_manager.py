@@ -34,6 +34,7 @@ from app.config import Config
 from app.kdspy import KDSpyManager
 from app.marketplace import Marketplace, get_marketplace
 from app.redact import scrub_url
+from app import stealth
 
 try:  # pragma: no cover - import guard
     from playwright.async_api import (
@@ -157,6 +158,11 @@ class BrowserManager:
                 "--no-default-browser-check",
                 "--disable-dev-shm-usage",
             ]
+            # Optional owner-configured outbound proxy (residential/quality
+            # exit) — the supported way to avoid datacenter-IP distrust from
+            # anti-bot systems such as reCAPTCHA.
+            if self.config.browser_proxy:
+                args.append(f"--proxy-server={self.config.browser_proxy}")
             # Containers run as root without user namespaces; Chromium needs
             # --no-sandbox there (auto-detected, BROWSER_NO_SANDBOX overrides).
             if self.config.browser_no_sandbox:
@@ -188,6 +194,10 @@ class BrowserManager:
                     **launch_kwargs
                 )
                 self._context.on("crash", self._on_context_crash)
+                # Anti-automation-detection patches (navigator.webdriver etc.)
+                # for EVERY page in this context, installed once at the context
+                # level so sign-in pages AND research pages both benefit.
+                stealth.apply(self._context)
             except Exception as exc:
                 self._launch_error = str(exc)
                 await self._teardown_context()

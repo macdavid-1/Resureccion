@@ -92,6 +92,13 @@ class Config:
         self.browser_extra_args = [
             a for a in os.environ.get("BROWSER_EXTRA_ARGS", "").replace(",", " ").split() if a
         ]
+        # Outbound proxy for the research browser (Chromium --proxy-server).
+        # Cloud hosts (HF Spaces) run on datacenter IPs that anti-bot systems
+        # (reCAPTCHA, Amazon) silently distrust; a residential/quality proxy
+        # is the supported way for the owner to fix that. Optional.
+        # Accepts host:port, or user:pass@host:port (preferred via env so the
+        # secret lives outside the codebase).
+        self.browser_proxy = os.environ.get("BROWSER_PROXY", "").strip()
         self.browser_downloads_dir = self.data_dir / "browser_downloads"
 
         # KDSpy Pro extension: unpacked extension directory (owner-supplied).
