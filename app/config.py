@@ -68,6 +68,24 @@ class Config:
         # --- browser infrastructure -------------------------------------------
         # Persistent Chromium profiles live under DATA_DIR so they survive restarts.
         self.browser_profiles_dir = self.data_dir / "browser_profiles"
+        # Research browser engine:
+        #   "camoufox" — Firefox-based anti-detect engine (default): fingerprint
+        #     spoofing at the C++ layer (canvas/audio/fonts/WebGL/UA coherent),
+        #     no Chromium headless tells, cross-origin CAPTCHA iframes clickable.
+        #     Cannot load Chrome MV3 extensions (KDSpy) — use chromium for that.
+        #   "chromium" — Playwright Chromium: required for KDSpy Pro (MV3) and
+        #     CDP-based per-page mobile emulation.
+        engine_env = os.environ.get("BROWSER_ENGINE", "camoufox").strip().lower()
+        self.browser_engine = engine_env if engine_env in ("camoufox", "chromium") else "camoufox"
+        # Camoufox extras (see app/camoufox_engine.py):
+        self.camoufox_humanize = os.environ.get("CAMOUFOX_HUMANIZE", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        # Derive timezone/locale/geo from the egress IP (requires the geoip
+        # extra: pip install "camoufox[geoip]"; download at first launch).
+        self.camoufox_geoip = os.environ.get("CAMOUFOX_GEOIP", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
         self.browser_headless = os.environ.get("BROWSER_HEADLESS", "true").strip().lower() in (
             "1", "true", "yes", "on"
         )
@@ -145,6 +163,19 @@ class Config:
         # Chrome Web Store ID of KDSpy — pins which package the one-tap store
         # installer may ever accept (CRX3 key must hash to this ID).
         self.kdspy_webstore_id = os.environ.get("KDSPY_WEBSTORE_ID", "").strip()
+        # KDSpy Firefox add-on (owner-supplied XPI): the packaged Firefox build
+        # of KDSpy Pro, loadable natively by the camoufox engine. Kept beside
+        # the Chromium install so both engines can be driven from one place.
+        self.kdspy_firefox_path = Path(
+            os.environ.get("KDSPY_FIREFOX_PATH", str(self.data_dir / "extensions" / "kdspy-firefox"))
+        ).expanduser().resolve()
+        # One-tap Firefox add-on install: the owner-verified AMO download URL
+        # (addons.mozilla.org only). The camoufox engine's counterpart of
+        # KDSPY_WEBSTORE_ID for Chromium.
+        self.kdspy_amo_url = os.environ.get(
+            "KDSPY_AMO_URL",
+            "https://addons.mozilla.org/firefox/downloads/file/4802008/kdspy_v5-5.13.56.xpi",
+        ).strip()
 
         # Login window security: owner must be authenticated to Resurrección and
         # a shared secret must be presented to open the one-shot login window.

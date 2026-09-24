@@ -111,6 +111,7 @@ def create_app() -> FastAPI:
             config, app.state.browser_manager, app.state.login_windows
         )
         app.state.kdspy.validate_installation()  # record pre-launch state
+        app.state.kdspy.firefox_addon_state()  # record Firefox add-on pre-launch state
         app.state.login_windows.expire_stale()
 
         # --- owner-device egress relay ("phone IP" mode) ---------------------

@@ -42,7 +42,7 @@ app/
   marketplace.py      # Marketplace abstraction (18 Amazon domains, explicit/auto plan)
   redact.py           # Secret hygiene: credential-shaped keys never leave the server
   browser_store.py    # Durable auth-state / extension / login-window / evidence stores
-  kdspy.py            # KDSpy Pro extension validation + launch args
+  kdspy.py            # KDSpy Pro extension validation + launch args (Chromium MV3 + Firefox XPI)
   browser_manager.py  # Persistent Chromium via Playwright (lifecycle, pages, crashes)
   amazon_auth.py      # Amazon auth state detection + one-shot login window + cookie import
   evidence_capture.py # Structured, redacted page/evidence extraction + screenshots
@@ -60,7 +60,7 @@ scripts/
   set_password.py     # (app.scripts.set_password) owner hash generator
   boot_check.py
   browser_smoke.py    # live Chromium launch smoke test
-tests/
+  camoufox_smoke.py   # live check: Camoufox engine launches + spoofs identity
   ...
 data/                 # Persistent storage root (created at runtime)
 ```
@@ -197,12 +197,29 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
 
 ## Browser infrastructure (Stage 2)
 
-- ONE persistent Chromium (Playwright `launch_persistent_context`) shared by
-  all research; profile at `$DATA_DIR/browser_profiles/kdspy` survives
-  restarts, preserving Amazon + KDSpy authentication across runs.
-- KDSpy Pro loads as a real unpacked extension (`--load-extension`); the
-  manager validates its manifest, records version/state, and verifies the
-  MV3 service worker after launch. KDSpy data is never faked.
+- ONE persistent browser shared by all research (Playwright
+  `launch_persistent_context`); profile at `$DATA_DIR/browser_profiles/kdspy`
+  survives restarts, preserving Amazon authentication across runs.
+- **Engines** (`BROWSER_ENGINE`):
+  - `camoufox` (default) — anti-detect Firefox. Fingerprint consistency is
+    enforced by the browser binary itself (canvas/audio/fonts/WebGL/UA all
+    coherent, spoofed at the C++ layer), so the tap-refusal class of Chromium
+    headless tells disappears and cross-origin CAPTCHA iframes (Turnstile /
+    reCAPTCHA) are clickable (`disable_coop`). Each profile generates its
+    fingerprint once and caches it under `$DATA_DIR` — the identity is stable
+    across restarts, which is itself an anti-detection property.
+  - `chromium` — Playwright Chromium. Required for the KDSpy Pro **Chrome
+    MV3** build (`--load-extension`).
+- KDSpy Pro ships in two package formats, and the manager validates whichever
+  the active engine can load — KDSpy data is never faked:
+  - **Chrome MV3 build** (chromium engine): real unpacked extension via
+    `--load-extension`; manifest/version validated durably, MV3 service
+    worker verified after launch.
+  - **Firefox add-on (XPI)** (camoufox engine): installed from Settings →
+    KDSpy Firefox add-on → Upload XPI, validated with the same zip-slip /
+    manifest / version defenses, and loaded *natively* by Camoufox via its
+    `addons` launch option. This is the supported KDSpy path on the default
+    camoufox engine — no Chromium switch needed.
 - Amazon auth: owner-driven interactive sign-in over the persistent profile
   (live frame streaming + whitelisted tap/type/key/scroll/navigate controls),
   live auth-state detection (signed-in / login_required / captcha / OTP /

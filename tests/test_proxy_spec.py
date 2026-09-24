@@ -12,7 +12,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.proxy_spec import ProxySpecError, parse_proxy_spec, playwright_proxy_kwarg
+from app.proxy_spec import (
+    ProxySpecError,
+    parse_proxy_spec,
+    playwright_proxy_kwarg,
+    proxy_parts,
+    proxy_scheme,
+    proxy_server_url,
+)
 
 
 def test_plain_host_port() -> None:
@@ -76,6 +83,50 @@ def test_playwright_kwarg_server_has_no_credentials() -> None:
     assert "secretpass" not in kw["server"]
 
 
+# ----------------------------------------------------------------- socks5
+def test_socks5_scheme_preserved_in_server_url() -> None:
+    """A Cloudflare WARP bridge (socks5:// on the owner's VPS) must keep its
+    scheme through the browser launch path — forcing http:// would break it."""
+    assert proxy_server_url("socks5://user:pass@vps.example:1080") == "socks5://vps.example:1080"
+    kw = playwright_proxy_kwarg("socks5://user:pass@vps.example:1080")
+    assert kw == {
+        "server": "socks5://vps.example:1080",
+        "username": "user",
+        "password": "pass",
+    }
+    assert "user" not in kw["server"] and "pass" not in kw["server"]
+
+
+def test_socks5h_normalized_to_socks5_for_browsers() -> None:
+    """socks5h is a curl-ism (remote DNS); browsers express the same intent
+    natively, so normalize the scheme for the launch URL."""
+    assert proxy_scheme("socks5h://vps.example:1080") == "socks5"
+    assert proxy_server_url("socks5h://vps.example:1080") == "socks5://vps.example:1080"
+
+
+def test_default_scheme_is_http() -> None:
+    assert proxy_scheme("host.example:8080") == "http"
+    assert proxy_server_url("host.example:8080") == "http://host.example:8080"
+
+
+def test_unsupported_scheme_refused() -> None:
+    with pytest.raises(ProxySpecError):
+        proxy_scheme("ftp://host.example:21")
+
+
+def test_proxy_parts_exact_fields() -> None:
+    scheme, host, port, user, pw = proxy_parts("socks5://warp:s3cret@203.0.113.9:1080")
+    assert (scheme, host, port, user, pw) == ("socks5", "203.0.113.9", 1080, "warp", "s3cret")
+    # Default ports per family when omitted.
+    assert proxy_parts("socks5://vps.example")[1:3] == ("vps.example", 1080)
+    assert proxy_parts("host.example:3128")[1:3] == ("host.example", 3128)
+
+
+def test_proxy_parts_empty_raises() -> None:
+    with pytest.raises(ProxySpecError):
+        proxy_parts("")
+
+
 def test_browser_manager_uses_native_auth_with_credentials(monkeypatch, tmp_path) -> None:
     """Regression: launch args carry only the host:port; credentials ride in
     launch_kwargs['proxy']."""
@@ -117,6 +168,7 @@ def test_browser_manager_uses_native_auth_with_credentials(monkeypatch, tmp_path
 
     cfg = SimpleNamespace(
         browser_headless=True,
+        browser_engine="chromium",
         browser_no_sandbox=True,
         browser_extra_args=[],
         browser_locale="en-US",

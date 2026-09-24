@@ -956,6 +956,36 @@
         // primary action wording here.
         const kdBtn = $("#set-kdspy-open");
         if (!kdBtn.disabled) kdBtn.textContent = ok ? "Update" : "Install from Web Store";
+        // Firefox add-on (loads natively on the camoufox engine).
+        const fx = kd.firefox_addon || {};
+        const fxOk = fx.status === "validated" || fx.status === "installed";
+        $("#set-kdspy-fx-state").textContent =
+          fx.status === "validated" ? `Loaded in browser${fx.version ? ` · v${fx.version}` : ""}` :
+          fx.status === "installed" ? "Installed — loads on next browser launch" :
+          fx.status === "failed" ? `Problem: ${fx.detail?.error || fx.detail?.reason || "invalid add-on"}` :
+          "Not installed — upload the KDSpy XPI";
+        setChip("#set-kdspy-fx-chip", fxOk, !!fx.status && !fxOk);
+        // Engine note: on camoufox the Chromium MV3 build cannot load; the
+        // Firefox add-on is the supported path there.
+        const note = $("#set-kdspy-engine-note");
+        if (kd.engine === "camoufox" && !fxOk) {
+          note.hidden = false;
+          note.textContent = "Chromium MV3 build can't run on this engine — use the Firefox add-on below.";
+        } else if (kd.engine === "camoufox" && fxOk) {
+          note.hidden = false;
+          note.textContent = "Firefox add-on active for research — no Chromium needed.";
+        } else {
+          note.hidden = true;
+        }
+        // The primary install button follows the engine: camoufox fetches the
+        // Firefox add-on from Mozilla Add-ons (one tap, like the Web Store
+        // path on chromium); the sign-in browser opens after either.
+        kdBtn.dataset.engine = kd.engine || "camoufox";
+        if (kd.engine === "camoufox" && !fxOk && !kdBtn.textContent.startsWith("Install Firefox")) {
+          kdBtn.textContent = "Install Firefox Add-on";
+        } else if (kd.engine !== "camoufox" && kdBtn.textContent.startsWith("Install Firefox")) {
+          kdBtn.textContent = "Install from Web Store";
+        }
       }
       try {
         const sys = await api("/api/system");
@@ -1041,21 +1071,31 @@
     const installStatus = $("#kdspy-upload-status");
     const status = (msg) => { installStatus.textContent = msg; };
 
-    // Primary: one-tap install from the Chrome Web Store (no ZIP needed).
+    // Primary: one-tap install — engine-aware. On camoufox the Firefox
+    // add-on comes from Mozilla Add-ons; on chromium the MV3 build comes
+    // from the Chrome Web Store. Both then open the sign-in browser.
     $("#set-kdspy-open").addEventListener("click", async () => {
       const btn = $("#set-kdspy-open");
       const label = btn.textContent;
+      const onCamoufox = (btn.dataset.engine || "camoufox") === "camoufox";
+      const url = onCamoufox
+        ? "/api/browser/extensions/kdspy/install-amo"
+        : "/api/browser/extensions/kdspy/install-store";
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Fetching…';
-      status("Downloading KDSpy from the Chrome Web Store…");
+      status(onCamoufox
+        ? "Downloading KDSpy Firefox add-on from Mozilla Add-ons…"
+        : "Downloading KDSpy from the Chrome Web Store…");
       try {
-        const res = await fetch("/api/browser/extensions/kdspy/install-store", {
+        const res = await fetch(url, {
           method: "POST", headers: authHeaders(),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || res.statusText);
         status("");
-        await finishInstall(`KDSpy ${data.manifest?.version || ""}`.trim());
+        await finishInstall(onCamoufox
+          ? `KDSpy Firefox add-on ${data.manifest?.version || ""}`.trim()
+          : `KDSpy ${data.manifest?.version || ""}`.trim());
       } catch (err) {
         status("");
         toast(err.message);
@@ -1070,6 +1110,25 @@
     $("#set-amazon-open").addEventListener("click", () => openInteractive("amazon_signin", "us"));
     $("#kdspy-pick-zip").addEventListener("click", () => $("#kdspy-zip-input").click());
     $("#kdspy-pick-files").addEventListener("click", () => $("#kdspy-files-input").click());
+    $("#kdspy-pick-xpi").addEventListener("click", () => $("#kdspy-xpi-input").click());
+
+    // KDSpy Firefox add-on (XPI) — the engine-native path on camoufox.
+    $("#kdspy-xpi-input").addEventListener("change", async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      status(`Uploading ${f.name}…`);
+      const fd = new FormData();
+      fd.append("file", f);
+      try {
+        const res = await fetch("/api/browser/extensions/kdspy/install-xpi", {
+          method: "POST", headers: authHeaders(), body: fd,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        await finishInstall(`KDSpy Firefox add-on ${data.manifest?.version || ""}`.trim());
+      } catch (err) { status(""); toast(err.message); }
+      finally { e.target.value = ""; }
+    });
 
     async function finishInstall(label) {
       status(label + " installed. Relaunching browser…");

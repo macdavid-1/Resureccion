@@ -221,10 +221,21 @@
             <div>
               <div class="set-k">KDSpy Pro extension</div>
               <div class="set-d" id="set-kdspy-state">Checking…</div>
+              <div class="muted mono" id="set-kdspy-engine-note" style="font-size:0.72rem; margin-top:4px" hidden></div>
             </div>
             <div class="row" style="align-items:center; gap:8px">
               <span class="chip" id="set-kdspy-chip">—</span>
               <button class="btn small" id="set-kdspy-open">Install from Web Store</button>
+            </div>
+          </div>
+          <div class="set-row set-col" id="kdspy-firefox-row">
+            <div>
+              <div class="set-k">KDSpy Firefox add-on <span class="muted">· camoufox engine</span></div>
+              <div class="set-d" id="set-kdspy-fx-state">Checking…</div>
+            </div>
+            <div class="row" style="align-items:center; gap:8px">
+              <span class="chip" id="set-kdspy-fx-chip">—</span>
+              <button class="btn small" id="kdspy-pick-xpi">Upload XPI</button>
             </div>
           </div>
           <div class="set-row" hidden id="kdspy-upload-row">
@@ -239,6 +250,7 @@
           </div>
           <input type="file" id="kdspy-zip-input" accept=".zip,application/zip" class="hidden">
           <input type="file" id="kdspy-files-input" multiple class="hidden">
+          <input type="file" id="kdspy-xpi-input" accept=".xpi,.zip,application/zip" class="hidden">
           <div class="set-row set-col">
             <div>
               <div class="set-k">Device relay <span class="muted">· phone IP</span></div>

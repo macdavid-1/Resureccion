@@ -20,7 +20,8 @@ are tunneled opaquely (TLS stays end-to-end between Chromium and the site —
 the relay sees only encrypted bytes and destination hostnames).
 
 Fallbacks (per connection, in order): owner device → external proxy
-(``BROWSER_PROXY``, via CONNECT) → direct from the server (if allowed).
+(``BROWSER_PROXY`` — HTTP CONNECT or SOCKS5, per the spec's scheme) →
+direct from the server (if allowed).
 This keeps long research runs alive when the device sleeps, while using
 the device's IP whenever it is connected. The current egress is always
 visible in Settings, and an exit-IP test shows exactly what sites see.
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from app.privacy import blocked_check
+from app.proxy_spec import ProxySpecError, proxy_parts
 from app.timeutil import iso_now
 
 _CHUNK = 64 * 1024  # tunnel frame size (bytes before base64)
@@ -405,24 +407,49 @@ class RelayHub:
 # Fallback dialing
 # ---------------------------------------------------------------------------
 async def _dial_via_proxy(proxy: str, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """CONNECT through an external HTTP proxy (BROWSER_PROXY format)."""
-    userinfo = None
-    if "@" in proxy:
-        userinfo, proxy = proxy.rsplit("@", 1)
-    phost, pport = proxy, 80
-    if ":" in proxy:
-        phost, _, pport = proxy.rpartition(":")
-        pport = int(pport)
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(phost, pport), timeout=15)
+    """Tunnel through the external BROWSER_PROXY.
+
+    Scheme-aware: ``socks5://`` (e.g. a Cloudflare WARP bridge on the
+    owner's VPS) speaks the RFC 1928 handshake; everything else uses HTTP
+    CONNECT. Credentials come from the spec (never from anywhere else).
+    """
+    try:
+        scheme, phost, pport, username, password = proxy_parts(proxy)
+    except ProxySpecError as exc:
+        raise TunnelError(f"invalid BROWSER_PROXY: {exc}") from exc
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(phost, pport), timeout=15
+        )
+    except Exception as exc:
+        raise TunnelError(f"cannot reach proxy {phost}:{pport}: {exc}") from exc
+    if scheme in ("socks5", "socks5h"):
+        try:
+            await asyncio.wait_for(
+                _socks5_connect(reader, writer, host, int(port), username, password),
+                timeout=25,
+            )
+        except TunnelError:
+            writer.close()
+            raise
+        except Exception as exc:
+            writer.close()
+            raise TunnelError(f"SOCKS5 tunnel failed: {exc}") from exc
+        return reader, writer
+    # --- HTTP CONNECT -----------------------------------------------------
     lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
-    if userinfo:
+    if username:
         import base64 as b64mod
 
-        cred = b64mod.b64encode(userinfo.encode()).decode("ascii")
+        cred = b64mod.b64encode(f"{username}:{password or ''}".encode()).decode("ascii")
         lines.append(f"Proxy-Authorization: Basic {cred}")
     writer.write(("\r\n".join(lines) + "\r\n\r\n").encode())
     await writer.drain()
-    status_line = await asyncio.wait_for(reader.readline(), timeout=20)
+    try:
+        status_line = await asyncio.wait_for(reader.readline(), timeout=20)
+    except asyncio.TimeoutError as exc:
+        writer.close()
+        raise TunnelError("external proxy did not answer CONNECT in time") from exc
     if b" 200" not in status_line:
         writer.close()
         raise TunnelError(f"external proxy refused CONNECT: {status_line[:80]!r}")
@@ -432,6 +459,81 @@ async def _dial_via_proxy(proxy: str, host: str, port: int) -> tuple[asyncio.Str
         if line in (b"\r\n", b"\n", b""):
             break
     return reader, writer
+
+
+_SOCKS5_ERRORS = {
+    1: "general failure",
+    2: "connection not allowed by ruleset",
+    3: "network unreachable",
+    4: "host unreachable",
+    5: "connection refused",
+    6: "TTL expired",
+    7: "command not supported",
+    8: "address type not supported",
+}
+
+
+async def _socks5_connect(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    host: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+) -> None:
+    """RFC 1928 client handshake, then CONNECT host:port.
+
+    The hostname is sent as ATYP=domain so the proxy resolves DNS (the
+    privacy-preserving choice: the server never learns which hosts the
+    browser asked about when the bridge resolves them).
+    """
+    import asyncio as _asyncio
+
+    methods = b"\x02\x00" if username else b"\x00"
+    writer.write(b"\x05" + bytes([len(methods)]) + methods)
+    await writer.drain()
+    sel = await _asyncio.wait_for(reader.readexactly(2), timeout=15)
+    if sel[0] != 0x05:
+        raise TunnelError(f"not a SOCKS5 proxy (got version byte {sel[0]:#x})")
+    if sel[1] == 0x02:
+        if not username:
+            raise TunnelError("SOCKS5 proxy demands authentication but BROWSER_PROXY has no credentials")
+        u = username.encode("utf-8")
+        p = (password or "").encode("utf-8")
+        if len(u) > 255 or len(p) > 255:
+            raise TunnelError("SOCKS5 credentials too long (RFC 1928 caps at 255 bytes)")
+        writer.write(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        await writer.drain()
+        sub = await _asyncio.wait_for(reader.readexactly(2), timeout=15)
+        if sub[0] != 0x01 or sub[1] != 0x00:
+            raise TunnelError("SOCKS5 authentication failed (check user:pass)")
+    elif sel[1] != 0x00:
+        raise TunnelError("SOCKS5 proxy rejected the offered auth methods")
+    host_b = host.encode("utf-8")
+    if len(host_b) > 255:
+        raise TunnelError("target hostname too long for SOCKS5")
+    writer.write(
+        b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + int(port).to_bytes(2, "big")
+    )
+    await writer.drain()
+    resp = await _asyncio.wait_for(reader.readexactly(4), timeout=20)
+    if resp[0] != 0x05:
+        raise TunnelError("malformed SOCKS5 reply")
+    if resp[1] != 0x00:
+        raise TunnelError(
+            f"SOCKS5 CONNECT refused: {_SOCKS5_ERRORS.get(resp[1], f'code {resp[1]}')}"
+        )
+    atyp = resp[3]
+    if atyp == 0x01:
+        await _asyncio.wait_for(reader.readexactly(4), timeout=15)
+    elif atyp == 0x03:
+        n = (await _asyncio.wait_for(reader.readexactly(1), timeout=15))[0]
+        await _asyncio.wait_for(reader.readexactly(n), timeout=15)
+    elif atyp == 0x04:
+        await _asyncio.wait_for(reader.readexactly(16), timeout=15)
+    else:
+        raise TunnelError(f"unknown SOCKS5 address type {atyp:#x}")
+    await _asyncio.wait_for(reader.readexactly(2), timeout=15)  # bound port
 
 
 # ---------------------------------------------------------------------------

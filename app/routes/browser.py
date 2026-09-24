@@ -180,7 +180,12 @@ async def import_cookies(request: Request, body: "CookieImportRequest") -> dict:
 @router.get("/extensions/kdspy")
 async def kdspy_state(request: Request) -> dict:
     _auth(request)
-    return {"extension": _kdspy(request).state().to_dict()}
+    mgr = _kdspy(request)
+    return {
+        "extension": mgr.state().to_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        "engine": request.app.state.config.browser_engine,
+    }
 
 
 @router.post("/extensions/kdspy/validate")
@@ -215,6 +220,55 @@ async def kdspy_install_store(request: Request) -> dict:
         "manifest": info.to_safe_dict(),
         "extension": mgr.state().to_dict(),
         "note": "extension installed — opening the setup browser for license activation",
+    }
+
+
+@router.post("/extensions/kdspy/install-xpi")
+async def kdspy_install_xpi(request: Request, file: UploadFile = File(...)) -> dict:
+    """Install the KDSpy Firefox add-on (XPI) for the camoufox engine.
+
+    The engine loads extracted add-ons natively at launch; the browser is
+    restarted (when research is idle) so the new add-on is picked up.
+    """
+    _auth(request)
+    mgr = _kdspy(request)
+    data = await file.read()
+    try:
+        info = mgr.install_firefox_xpi(data)
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "source": "firefox_xpi",
+        "manifest": info.to_safe_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        "note": "Firefox add-on installed — loads on the camoufox engine at next launch",
+    }
+
+
+@router.post("/extensions/kdspy/install-amo")
+async def kdspy_install_amo(request: Request) -> dict:
+    """One-tap install: fetch the KDSpy Firefox add-on from Mozilla Add-ons.
+
+    Downloads the owner-verified XPI from addons.mozilla.org (URL pinned in
+    config), validates it with the same zip-slip / manifest / version
+    defenses as an upload, installs atomically, and relaunches the browser.
+    The UI then opens the setup browser for the kdspy.com license sign-in.
+    """
+    _auth(request)
+    mgr = _kdspy(request)
+    try:
+        info = await mgr.install_from_amo()
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "source": "mozilla_addons",
+        "manifest": info.to_safe_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        "note": "Firefox add-on installed — loads on the camoufox engine; sign in to kdspy.com next",
     }
 
 

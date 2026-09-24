@@ -4,6 +4,7 @@
 #   python3.11-slim  — FastAPI backend + research agent
 #   nodejs           — scripts/render_pdf.js sidecar (PDFKit, report → 6×9in PDF)
 #   playwright       — persistent Chromium with system deps + KDSpy extension support
+#   camoufox         — default research engine: anti-detect Firefox (BROWSER_ENGINE=camoufox)
 #
 # HF Spaces: the app MUST listen on 0.0.0.0:7860 and persistent storage is
 # mounted at /data (Space setting "Persistent storage", mapped via DATA_DIR=/data).
@@ -75,7 +76,8 @@ RUN pip install --no-cache-dir \
     "pillow>=10.0" \
     "imageio>=2.34" \
     "imageio-ffmpeg>=0.4.9" \
-    "playwright>=1.42"
+    "playwright>=1.42" \
+    "camoufox[geoip]>=0.5.6"
 
 # --- Chromium for Playwright (with system deps) -----------------------------
 RUN playwright install --with-deps chromium
@@ -97,6 +99,18 @@ RUN chmod +x run.sh
 RUN useradd --create-home --uid 1000 appuser \
     && mkdir -p /data \
     && chown -R appuser:appuser /data /app
+
+USER appuser
+
+# --- Camoufox browser download (default research engine) --------------------
+# Fetched as the RUNTIME user so the binary lands in the user's cache
+# ($HOME/.cache/camoufox) that the running app can read AND extend (Camoufox
+# writes a per-build fontconfig cache beside the download on first launch).
+RUN camoufox fetch
+
+USER root
+# Runtime files (app, scripts, static) are world-readable; /data is appuser's.
+RUN chmod -R a+rX /app
 
 USER appuser
 

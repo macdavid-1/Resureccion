@@ -1,13 +1,17 @@
 """Playwright persistent browser manager.
 
-Operates ONE real, persistent Chromium via Playwright for the whole app (the
-2-core/16GB environment cannot afford a browser per action). The browser:
+Operates ONE real, persistent browser via Playwright for the whole app (the
+2-core/16GB environment cannot afford a browser per action). The engine is
+selectable via BROWSER_ENGINE (default `camoufox`): Camoufox (anti-detect
+Firefox) for research, Chromium when Chrome extensions are needed. The browser:
 
 - uses a persistent user-data dir (`browser_profiles/kdspy`) so cookies,
   localStorage, and extension state survive restarts — this is how the
   owner's Amazon/KDSpy authentication is reused across research runs,
-- loads the KDSpy Pro extension (persistent context is required for
-  extensions; headless works via the bundled chromium channel),
+- loads the KDSpy Pro extension on the Chromium engine (persistent context is
+  required for extensions; headless works via the bundled chromium channel);
+  the KDSpy *Firefox add-on* (XPI) loads natively on the Camoufox engine via
+  its ``addons`` launch option, so KDSpy data is available on BOTH engines,
 - is launched lazily on first use and shut down after an idle period,
 - tracks crashes and restarts itself cleanly.
 
@@ -29,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app import camoufox_engine
 from app.browser_store import BrowserEvidenceStore
 from app.config import Config
 from app.kdspy import KDSpyManager
@@ -36,7 +41,7 @@ from app.marketplace import Marketplace, get_marketplace
 from app.redact import scrub_url
 from app import stealth
 from app import privacy
-from app.proxy_spec import playwright_proxy_kwarg
+from app.proxy_spec import playwright_proxy_kwarg, proxy_server_url
 
 try:  # pragma: no cover - import guard
     from playwright.async_api import (
@@ -71,6 +76,10 @@ class BrowserStatus:
     last_activity_at: str | None
     launch_error: str | None
     crash_count: int
+    engine: str
+    engine_active: str | None
+    engine_available: bool
+    engine_note: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +92,10 @@ class BrowserStatus:
             "last_activity_at": self.last_activity_at,
             "launch_error": self.launch_error,
             "crash_count": self.crash_count,
+            "engine": self.engine,
+            "engine_active": self.engine_active,
+            "engine_available": self.engine_available,
+            "engine_note": self.engine_note,
         }
 
 
@@ -103,6 +116,14 @@ class BrowserManager:
         self.profile_dir = config.browser_profiles_dir / "kdspy"
         self._playwright: Any = None
         self._context: Any = None
+        # Camoufox engine handle (the AsyncCamoufox context manager) when the
+        # Firefox-based engine is active; None on the Chromium engine.
+        self._camoufox: Any = None
+        # Which engine is actually running: None until first launch, then
+        # "camoufox" | "chromium". A camoufox→chromium fallback (camoufox
+        # requested but not installed) is reported via engine_note in status().
+        self._engine_kind: str | None = None
+        self._engine_note: str | None = None
         self._lock = asyncio.Lock()
         self._last_activity: float | None = None
         self._last_launched: float | None = None
@@ -140,6 +161,14 @@ class BrowserManager:
             last_activity_at=_iso_from(self._last_activity),
             launch_error=self._launch_error,
             crash_count=self._crash_count,
+            engine=self.config.browser_engine,
+            engine_active=self._engine_kind,
+            engine_available=(
+                camoufox_engine.CAMOUFOX_AVAILABLE
+                if self.config.browser_engine == "camoufox"
+                else PLAYWRIGHT_AVAILABLE
+            ),
+            engine_note=self._engine_note,
         )
 
     # --------------------------------------------------------------- lifecycle
@@ -156,87 +185,177 @@ class BrowserManager:
             if self._context is not None:
                 await self._teardown_context()
             self.profile_dir.mkdir(parents=True, exist_ok=True)
-            args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ]
             # Egress source, in order of preference: the owner-device relay
             # shim (phone IP mode) → owner-configured external proxy →
-            # direct. When the relay shim is running it is the single egress
-            # point: it serves the device first and falls back itself.
+            # direct. Both engines share this selection.
             relay = getattr(self, "relay", None)
-            relay_addr = f"127.0.0.1:{relay.shim.port}" if (relay and relay.enabled and relay.shim and relay.shim.port) else None
-            if relay_addr:
-                args.append(f"--proxy-server=http={relay_addr};https={relay_addr}")
-            elif self.config.browser_proxy:
-                # Owner-configured proxy (e.g. Webshare). Credentials, when
-                # present (user:pass@host:port), go through Playwright's
-                # native proxy auth — Chromium silently ignores credentials
-                # embedded in --proxy-server and every request would fail
-                # the proxy's 407 challenge.
-                args.append(f"--proxy-server={playwright_proxy_kwarg(self.config.browser_proxy)['server']}")
-            # Privacy hardening: tracker/ad hosts are refused at the egress
-            # shim (app/privacy.py); WebRTC can never bypass the proxy over
-            # UDP; Chromium background services stay silent; DNT/GPC are
-            # declared on every request. Apply whenever the browser launches
-            # so the protections do not depend on relay mode.
-            args.extend(privacy.relay_launch_args(args))
-            # Containers run as root without user namespaces; Chromium needs
-            # --no-sandbox there (auto-detected, BROWSER_NO_SANDBOX overrides).
-            if self.config.browser_no_sandbox:
-                args.append("--no-sandbox")
-            args.extend(self.config.browser_extra_args)
-            args.extend(self.kdspy.chromium_args())
-            launch_kwargs: dict[str, Any] = {
-                "user_data_dir": str(self.profile_dir),
-                "headless": self.config.browser_headless,
-                "args": args,
-                "locale": self.config.browser_locale,
-                "timezone_id": self.config.browser_timezone,
-                "viewport": {"width": 1440, "height": 900},
-                "accept_downloads": True,
-            }
-            # `channel` selects branded Chrome/Edge/MsEdge installs; the bundled
-            # Chromium must NOT receive a channel kwarg (it errors or resolves wrong).
-            if self.config.browser_channel and self.config.browser_channel.lower() not in ("chromium", ""):
-                launch_kwargs["channel"] = self.config.browser_channel
-            elif self.kdspy.chromium_args() and self.config.browser_headless:
-                # The old headless shell cannot run extensions at all; the
-                # "chromium" channel opts into new headless mode, which can.
-                launch_kwargs["channel"] = "chromium"
-            if self.config.browser_user_agent:
-                launch_kwargs["user_agent"] = self.config.browser_user_agent
-            # Native proxy auth (only when the relay shim isn't the egress —
-            # the shim path has no external credentials). Playwright answers
-            # the proxy's 407 inside the browser process.
-            if not relay_addr and self.config.browser_proxy:
-                proxy_kw = playwright_proxy_kwarg(self.config.browser_proxy)
-                if proxy_kw:
-                    launch_kwargs["proxy"] = proxy_kw
-            try:
-                self._playwright = await async_playwright().start()
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    **launch_kwargs
+            relay_addr = (
+                f"127.0.0.1:{relay.shim.port}"
+                if (relay and relay.enabled and relay.shim and relay.shim.port)
+                else None
+            )
+            requested = self.config.browser_engine
+            use_camoufox = requested == "camoufox" and camoufox_engine.CAMOUFOX_AVAILABLE
+            if requested == "camoufox" and not camoufox_engine.CAMOUFOX_AVAILABLE:
+                # Explicit config met a missing install: fall back rather than
+                # break the app, but say so loudly in status().
+                self._engine_note = (
+                    "BROWSER_ENGINE=camoufox but camoufox is not installed; fell "
+                    "back to chromium. Fix: pip install 'camoufox[geoip]' && camoufox fetch"
                 )
-                self._context.on("crash", self._on_context_crash)
-                # Anti-automation-detection patches (navigator.webdriver etc.)
-                # for EVERY page in this context, installed once at the context
-                # level so sign-in pages AND research pages both benefit.
-                stealth.apply(self._context)
-                # Declare the owner's privacy preference on every request and
-                # page (DNT/Sec-GPC headers, navigator.globalPrivacyControl).
-                privacy.apply_context_privacy(self._context)
+            else:
+                self._engine_note = None
+            try:
+                if use_camoufox:
+                    await self._launch_camoufox(relay_addr)
+                else:
+                    await self._launch_chromium(relay_addr)
             except Exception as exc:
                 self._launch_error = str(exc)
                 await self._teardown_context()
-                raise BrowserManagerError(f"Chromium launch failed: {exc}") from exc
+                raise BrowserManagerError(f"browser launch failed: {exc}") from exc
             self._launch_error = None
             self._last_launched = time.time()
             self._touch()
-            # Verify KDSpy service worker presence (best-effort, MV3).
-            await self._verify_kdspy_runtime()
+            if self._engine_kind == "camoufox":
+                self._validate_kdspy_on_camoufox()
+            else:
+                # Verify KDSpy service worker presence (best-effort, MV3).
+                await self._verify_kdspy_runtime()
             self._arm_idle_shutdown()
             return self.status()
+
+    async def _launch_chromium(self, relay_addr: str | None) -> None:
+        """Launch the persistent Chromium context (engine: chromium)."""
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ]
+        # Egress source, in order of preference: the owner-device relay
+        # shim (phone IP mode) → owner-configured external proxy →
+        # direct. When the relay shim is running it is the single egress
+        # point: it serves the device first and falls back itself.
+        relay_addr_local = relay_addr
+        if relay_addr_local:
+            args.append(f"--proxy-server=http={relay_addr_local};https={relay_addr_local}")
+        elif self.config.browser_proxy:
+            # Owner-configured proxy (e.g. Webshare, or a Cloudflare WARP
+            # SOCKS5 bridge on the owner's VPS). Credentials, when present
+            # (user:pass@host:port), go through Playwright's native proxy
+            # auth — Chromium silently ignores credentials embedded in
+            # --proxy-server and every request would fail the proxy's 407
+            # challenge. Scheme preserved: Chromium accepts socks5:// here
+            # (SOCKS credentials are a Chromium limitation, documented in
+            # ENV_VARS.md — the default camoufox engine applies them).
+            args.append(f"--proxy-server={proxy_server_url(self.config.browser_proxy)}")
+        # Privacy hardening: tracker/ad hosts are refused at the egress
+        # shim (app/privacy.py); WebRTC can never bypass the proxy over
+        # UDP; Chromium background services stay silent; DNT/GPC are
+        # declared on every request. Apply whenever the browser launches
+        # so the protections do not depend on relay mode.
+        args.extend(privacy.relay_launch_args(args))
+        # Containers run as root without user namespaces; Chromium needs
+        # --no-sandbox there (auto-detected, BROWSER_NO_SANDBOX overrides).
+        if self.config.browser_no_sandbox:
+            args.append("--no-sandbox")
+        args.extend(self.config.browser_extra_args)
+        args.extend(self.kdspy.chromium_args())
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(self.profile_dir),
+            "headless": self.config.browser_headless,
+            "args": args,
+            "locale": self.config.browser_locale,
+            "timezone_id": self.config.browser_timezone,
+            "viewport": {"width": 1440, "height": 900},
+            "accept_downloads": True,
+        }
+        # `channel` selects branded Chrome/Edge/MsEdge installs; the bundled
+        # Chromium must NOT receive a channel kwarg (it errors or resolves wrong).
+        if self.config.browser_channel and self.config.browser_channel.lower() not in ("chromium", ""):
+            launch_kwargs["channel"] = self.config.browser_channel
+        elif self.kdspy.chromium_args() and self.config.browser_headless:
+            # The old headless shell cannot run extensions at all; the
+            # "chromium" channel opts into new headless mode, which can.
+            launch_kwargs["channel"] = "chromium"
+        if self.config.browser_user_agent:
+            launch_kwargs["user_agent"] = self.config.browser_user_agent
+        # Native proxy auth (only when the relay shim isn't the egress —
+        # the shim path has no external credentials). Playwright answers
+        # the proxy's 407 inside the browser process.
+        if not relay_addr_local and self.config.browser_proxy:
+            proxy_kw = playwright_proxy_kwarg(self.config.browser_proxy)
+            if proxy_kw:
+                launch_kwargs["proxy"] = proxy_kw
+        try:
+            self._playwright = await async_playwright().start()
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                **launch_kwargs
+            )
+            self._context.on("crash", self._on_context_crash)
+            # Anti-automation-detection patches (navigator.webdriver etc.)
+            # for EVERY page in this context, installed once at the context
+            # level so sign-in pages AND research pages both benefit.
+            stealth.apply(self._context)
+            # Declare the owner's privacy preference on every request and
+            # page (DNT/Sec-GPC headers, navigator.globalPrivacyControl).
+            privacy.apply_context_privacy(self._context)
+            self._engine_kind = "chromium"
+        except Exception as exc:
+            self._launch_error = str(exc)
+            await self._teardown_context()
+            raise BrowserManagerError(f"Chromium launch failed: {exc}") from exc
+
+    async def _launch_camoufox(self, relay_addr: str | None) -> None:
+        """Launch the persistent Camoufox (anti-detect Firefox) context.
+
+        Camoufox builds the full launch option set (stable profile
+        fingerprint, Firefox privacy prefs, egress proxy) in
+        app/camoufox_engine.py; this only wires its lifecycle into the
+        manager's own. The AsyncCamoufox context manager owns the Playwright
+        driver, so teardown goes through its __aexit__ (see below).
+        """
+        kwargs = camoufox_engine.launch_kwargs(
+            self.config,
+            relay_addr=relay_addr,
+            addons=self.kdspy.firefox_addon_args(),
+        )
+        self._camoufox = camoufox_engine.AsyncCamoufox(**kwargs)
+        self._context = await self._camoufox.__aenter__()
+        self._context.on("crash", self._on_context_crash)
+        # DNT/GPC headers + page-side privacy signals are engine-independent
+        # (plain Playwright context APIs).
+        privacy.apply_context_privacy(self._context)
+        # NOTE: stealth.apply() is deliberately Chromium-only — Camoufox
+        # spoofs natively at the C++ layer and JS patches would only add
+        # inconsistency the engine cannot see.
+        self._engine_kind = "camoufox"
+
+    def _validate_kdspy_on_camoufox(self) -> None:
+        """Engine-aware KDSpy state after a camoufox launch.
+
+        The KDSpy Firefox add-on (XPI) loads natively on this engine, so an
+        installed add-on is validated and recorded. The Chromium MV3 build
+        cannot load here — that fact is recorded plainly (never as a
+        confusing "service worker not observed" failure).
+        """
+        if self.kdspy.firefox_addon_is_configured():
+            self.kdspy.firefox_addon_state()
+            self.kdspy.record_firefox_runtime_validated(
+                str(self.kdspy.firefox_addon_path)
+            )
+            self._kdspy_extension_id = "camoufox-addon"
+            if self.kdspy.is_configured():
+                self.kdspy.record_runtime_failure(
+                    "The Chromium MV3 KDSpy build cannot load on the camoufox engine; "
+                    "the KDSpy Firefox add-on is loaded instead"
+                )
+            return
+        if self.kdspy.is_configured():
+            self.kdspy.record_runtime_failure(
+                "KDSpy Pro (Chromium MV3) cannot load on the camoufox engine. Install "
+                "the KDSpy Firefox add-on (XPI) from Settings — it loads natively "
+                "here — or set BROWSER_ENGINE=chromium"
+            )
 
     async def _verify_kdspy_runtime(self) -> None:
         """Detect the KDSpy service worker / extension id once pages settle."""
@@ -278,6 +397,13 @@ class BrowserManager:
             except Exception:
                 pass
             self._context = None
+        if self._camoufox is not None:
+            # The Camoufox handle owns the Playwright driver when active.
+            try:
+                await self._camoufox.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._camoufox = None
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -335,7 +461,10 @@ class BrowserManager:
                     "width": self.config.browser_interactive_viewport_w,
                     "height": self.config.browser_interactive_viewport_h,
                 })
-                await self._emulate_mobile(page)
+                if self._engine_kind == "camoufox":
+                    camoufox_engine.apply_interactive_emulation(self.config, page)
+                else:
+                    await self._emulate_mobile(page)
             except Exception:
                 pass  # page may already be closing; desktop viewport is a safe fallback
         page.set_default_timeout(self.config.browser_default_timeout_seconds * 1000)
@@ -356,6 +485,10 @@ class BrowserManager:
             })
         except Exception:
             pass
+        if self._engine_kind == "camoufox":
+            # CDP does not exist on Firefox; use the engine-aware UA path.
+            camoufox_engine.apply_interactive_emulation(self.config, page)
+            return
         await self._emulate_mobile(page)
 
     async def _emulate_mobile(self, page: Any) -> None:
@@ -363,7 +496,9 @@ class BrowserManager:
 
         Uses a per-page CDP session so the shared research context is
         untouched. Runs before first navigation, so every site (kdspy.com,
-        Amazon, WordPress login) sees a genuine mobile browser.
+        Amazon, WordPress login) sees a genuine mobile browser. Chromium-only:
+        CDP does not exist on the Camoufox engine (that path applies a
+        Firefox-mobile UA via app/camoufox_engine.py instead).
         """
         w = self.config.browser_interactive_viewport_w
         h = self.config.browser_interactive_viewport_h

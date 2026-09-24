@@ -26,6 +26,7 @@ def config(tmp_path: Path) -> Config:
     cfg.browser_profiles_dir = cfg.data_dir / "browser_profiles"
     cfg.browser_downloads_dir = cfg.data_dir / "browser_downloads"
     cfg.kdspy_extension_path = cfg.data_dir / "extensions" / "kdspy"
+    cfg.kdspy_firefox_path = cfg.data_dir / "extensions" / "kdspy-firefox"
     cfg.owner_password_hash = None
     cfg.auth_secret = "test-secret"
     return cfg

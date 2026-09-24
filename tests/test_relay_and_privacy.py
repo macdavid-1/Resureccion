@@ -403,6 +403,142 @@ def test_relay_client_syntax() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SOCKS5 fallback dialing (Cloudflare WARP bridge form)
+# ---------------------------------------------------------------------------
+async def _fake_socks5_server(
+    server_port: int,
+    *,
+    require_auth: tuple[str, str] | None = None,
+    refuse_methods: bool = False,
+) -> None:
+    """Minimal RFC 1928 server: echo server behind CONNECT on 127.0.0.1."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            greeting = await reader.readexactly(2)
+            assert greeting[0] == 0x05
+            methods = await reader.readexactly(greeting[1])
+            if refuse_methods:
+                writer.write(b"\x05\xff")
+                await writer.drain()
+                return
+            if require_auth is not None:
+                if 0x02 not in methods:
+                    writer.write(b"\x05\xff")
+                    await writer.drain()
+                    return
+                writer.write(b"\x05\x02")
+                await writer.drain()
+                ver = (await reader.readexactly(1))[0]
+                ulen = (await reader.readexactly(1))[0]
+                uname = (await reader.readexactly(ulen)).decode()
+                plen = (await reader.readexactly(1))[0]
+                passwd = (await reader.readexactly(plen)).decode()
+                if ver != 0x01 or (uname, passwd) != require_auth:
+                    writer.write(b"\x01\x01")  # auth failure
+                    await writer.drain()
+                    return
+                writer.write(b"\x01\x00")
+                await writer.drain()
+            else:
+                if 0x00 not in methods:
+                    writer.write(b"\x05\xff")
+                    await writer.drain()
+                    return
+                writer.write(b"\x05\x00")
+                await writer.drain()
+            req = await reader.readexactly(4)
+            assert req[:3] == b"\x05\x01\x00"
+            atyp = req[3]
+            if atyp == 0x03:
+                n = (await reader.readexactly(1))[0]
+                host = (await reader.readexactly(n)).decode()
+            else:
+                host = "?"
+            port = int.from_bytes(await reader.readexactly(2), "big")
+            if host != "origin.test" or port != 443:
+                writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")  # conn refused
+                await writer.drain()
+                return
+            writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
+            await writer.drain()
+            # Echo server: whatever the client sends comes straight back.
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                writer.write(chunk)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", server_port)
+    await server.serve_forever()
+
+
+@pytest.mark.parametrize(
+    "spec,auth",
+    [
+        ("socks5://127.0.0.1:19191", None),
+        ("socks5://warpuser:warppass@127.0.0.1:19192", ("warpuser", "warppass")),
+        ("socks5h://127.0.0.1:19193", None),
+    ],
+)
+def test_socks5_dial_connects_and_pipes(spec: str, auth) -> None:
+    """The relay fallback speaks RFC 1928: handshake, auth (when configured),
+    CONNECT via domain ATYP, then raw bytes flow both ways."""
+    port = int(spec.rsplit(":", 1)[1])
+
+    async def run() -> None:
+        task = asyncio.create_task(_fake_socks5_server(port, require_auth=auth))
+        await asyncio.sleep(0.1)  # let the server bind
+        try:
+            reader, writer = await _dial_via_proxy(spec, "origin.test", 443)
+            writer.write(b"ping-through-warp")
+            await writer.drain()
+            data = await asyncio.wait_for(reader.readexactly(len(b"ping-through-warp")), timeout=5)
+            assert data == b"ping-through-warp"
+            writer.close()
+        finally:
+            task.cancel()
+
+    asyncio.run(run())
+
+
+def test_socks5_dial_auth_failure_raises() -> None:
+    async def run() -> None:
+        task = asyncio.create_task(
+            _fake_socks5_server(19194, require_auth=("warpuser", "warppass"))
+        )
+        await asyncio.sleep(0.1)
+        try:
+            with pytest.raises(TunnelError, match="authentication failed"):
+                await _dial_via_proxy("socks5://warpuser:WRONG@127.0.0.1:19194", "origin.test", 443)
+        finally:
+            task.cancel()
+
+    asyncio.run(run())
+
+
+def test_socks5_dial_method_refusal_raises() -> None:
+    async def run() -> None:
+        task = asyncio.create_task(_fake_socks5_server(19195, refuse_methods=True))
+        await asyncio.sleep(0.1)
+        try:
+            with pytest.raises(TunnelError, match="auth methods"):
+                await _dial_via_proxy("socks5://127.0.0.1:19195", "origin.test", 443)
+        finally:
+            task.cancel()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # Frontend wiring
 # ---------------------------------------------------------------------------
 def test_settings_panel_wired() -> None:
