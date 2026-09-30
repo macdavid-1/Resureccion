@@ -71,46 +71,42 @@ itself, never silently.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `BROWSER_ENGINE` | no | `camoufox` | Research browser engine. `camoufox` = anti-detect Firefox (fingerprint spoofing at the C++ layer — canvas/audio/fonts/WebGL/UA coherent, no Chromium headless tells, cross-origin CAPTCHA iframes clickable). `chromium` = Playwright Chromium; **required for KDSpy Pro** (Chrome MV3 extensions cannot load on Firefox) |
+| `BROWSER_ENGINE` | no | `camoufox` | Research browser engine. Resurrección runs **Camoufox only** (anti-detect Firefox: fingerprint spoofing at the C++ layer — canvas/audio/fonts/WebGL/UA coherent, no headless tells, cross-origin CAPTCHA iframes clickable). Any other value — including the retired `chromium` — is a hard boot error, never a silent fallback |
 | `CAMOUFOX_HUMANIZE` | no | `false` | Camoufox: humanized cursor movement on interactive pages (owner taps by hand, so usually off) |
 | `CAMOUFOX_GEOIP` | no | `false` | Camoufox: derive timezone/locale/geo from the egress IP so the spoof matches the exit network (downloads a GeoIP DB at first launch; needs the `geoip` extra, included in the Dockerfile) |
 | `BROWSER_HEADLESS` | no | `true` | Run the browser headless |
 | `BROWSER_CHANNEL` | no | `chromium` | Playwright channel (chromium engine only); bundled chromium supports extensions headless |
 | `BROWSER_NO_SANDBOX` | no | auto | Chromium engine: launch with `--no-sandbox`. Auto-detected: on when running as root or inside a container (HF Spaces/Docker), off locally. Set explicitly to `true`/`false` to override. |
 | `BROWSER_EXTRA_ARGS` | no | — | Chromium engine: space/comma-separated extra launch args (deploy-specific tuning) |
-| `BROWSER_PROXY` | no | — | Outbound proxy for the research browser: `user:pass@host:port`, or `socks5://user:pass@host:port` for a SOCKS5 exit (e.g. a Cloudflare WARP bridge on your own VPS). The scheme is preserved on both engines. Strongly recommended on cloud hosts: reCAPTCHA/Amazon silently refuse CAPTCHA challenges from datacenter IPs (including HF Spaces) |
+| `BROWSER_PROXY` | no | — | Outbound proxy for the research browser: `user:pass@host:port`, or `socks5://user:pass@host:port` for a SOCKS5 exit (your Cloudflare WARP bridge on your own VPS — the supported shape). The scheme is preserved. Strongly recommended on cloud hosts: reCAPTCHA/Amazon silently refuse CAPTCHA challenges from datacenter IPs (including HF Spaces). Validated functionally at launch (real handshake with credentials); a broken proxy is never wired into the browser |
 | `RELAY_ENABLED` | no | `false` | Start the owner-device egress relay at boot (Settings → Device Relay can also toggle it at runtime) |
 | `RELAY_MODE` | no | `phone_first` | Egress order when the device is offline: `phone_first` (device → proxy → direct), `phone_only` (device only), `direct_only` (never use the device) |
 | `RELAY_ALLOW_DIRECT` | no | `true` | When `false`, direct server egress is never used — browser traffic is strictly device-or-proxy only |
 | `RELAY_TOKEN` | no | — | Explicit relay bearer token; when unset a strong token is generated once and stored under `DATA_DIR/relay_token` (owner-only permissions, never committed) |
-| `BROWSER_IDLE_SHUTDOWN_SECONDS` | no | `300` | Auto-stop Chromium after idle to free the 2 cores |
+| `BROWSER_IDLE_SHUTDOWN_SECONDS` | no | `300` | Auto-stop the browser after idle to free the 2 cores |
 | `BROWSER_DEFAULT_TIMEOUT_SECONDS` | no | `45` | Playwright default action timeout |
 | `BROWSER_NAV_TIMEOUT_SECONDS` | no | `60` | Navigation timeout |
 | `BROWSER_MAX_OPEN_PAGES` | no | `4` | Page pool cap (2-core budget) |
 | `BROWSER_USER_AGENT` | no | — | Optional explicit UA override |
 | `BROWSER_LOCALE` | no | `en-US` | Browser locale |
 | `BROWSER_TIMEZONE` | no | `America/New_York` | Browser timezone |
-| `KDSPY_EXTENSION_PATH` | no | `$DATA_DIR/extensions/kdspy` | Unpacked KDSpy extension lives here (installed via Settings) |
 | `KDSPY_FIREFOX_PATH` | no | `$DATA_DIR/extensions/kdspy-firefox` | Extracted KDSpy Firefox add-on lives here (installed via Settings — one-tap from Mozilla Add-ons or manual XPI upload; loaded natively by the camoufox engine) |
 | `KDSPY_AMO_URL` | no | The verified KDSpy v5.13.56 download on addons.mozilla.org | One-tap Firefox add-on install source. Must be an `https://addons.mozilla.org/…​.xpi` URL (enforced in code); a version bump is just a new URL here |
 | `KDSPY_MIN_VERSION` | no | — | Optional minimum version enforcement |
-| `KDSPY_EXTENSION_ID` | no | — | Optional known extension id |
-| `KDSPY_WEBSTORE_ID` | no | `oocoibgfbhcplhnfdjldohepoeboiloo` | Pins the Chrome Web Store listing the one-tap installer may fetch |
 | `BROWSER_LOGIN_WINDOW_SECONDS` | no | `900` | Interactive browser session TTL (Amazon sign-in / KDSpy setup from the phone). Hard-capped at 2700s |
 | `BROWSER_LOGIN_SECRET` | recommended | — | Shared secret required to open a manual login window (defense in depth on top of owner auth) |
 
-**KDSpy Pro on the two engines:** the Chrome MV3 build requires
-`BROWSER_ENGINE=chromium` (`--load-extension`). The default camoufox engine
-instead loads the **KDSpy Firefox add-on** natively — one tap in Settings
-installs it straight from Mozilla Add-ons (or upload the XPI manually; `.xpi`
-or `.zip` both accepted), and the browser then opens for the kdspy.com
-sign-in so the owner's subscription applies to the persistent profile. Every
-research run gets the KDSpy panel without leaving the anti-detect engine.
-Settings shows which package the active engine can use.
+**KDSpy Pro:** the engine loads the **KDSpy Firefox add-on** natively —
+one tap in Settings installs it straight from Mozilla Add-ons (or upload the
+XPI manually; `.xpi` or `.zip` both accepted), and the browser then opens for
+the kdspy.com sign-in so the owner's subscription applies to the persistent
+profile. Every research run gets the KDSpy panel without leaving the
+anti-detect engine.
 
-**Egress with cloudflare-warp (your own VPS as the exit):** WARP needs root +
-a TUN device, so it cannot run inside an HF Space container — run it on the
-VPS and point `BROWSER_PROXY` at it. Two supported shapes:
+**Egress with cloudflare-warp (your own VPS as the exit — the supported
+shape):** WARP needs root + a TUN device, so it cannot run inside an HF Space
+container — run it on the VPS and point `BROWSER_PROXY` at it. Two supported
+shapes:
 
 1. `cloudflare-warp` on the VPS in proxy mode (`warp-cli mode proxy`, local
    SOCKS5 on :40000) behind an authenticated SOCKS5 front (3proxy from
@@ -119,6 +115,12 @@ VPS and point `BROWSER_PROXY` at it. Two supported shapes:
 2. Plain CONNECT proxy on the VPS without WARP (the default
    `scripts/vps_proxy_setup.sh` path) — `BROWSER_PROXY=user:pass@vps:port`.
 
+The launch gate now checks the proxy FUNCTIONALLY (a real CONNECT/SOCKS5
+handshake, credentials included) — a proxy whose credentials are wrong or
+whose egress is dead is never wired into the browser; the app demotes to
+direct egress (or refuses to launch with `RELAY_ALLOW_DIRECT=false`) and
+says exactly why in Settings → Browser egress.
+
 What WARP does and does not buy: it hides the HF Space IP and gives you a
 Cloudflare egress, and Cloudflare will not reject its own network —
 WARP → Cloudflare-fronted sites is fine. But a WARP exit is still a
@@ -126,15 +128,15 @@ Cloudflare datacenter IP: it does not carry residential trust with Amazon
 (not Cloudflare-fronted). Camoufox covers the fingerprint side; WARP covers
 the IP-hiding side.
 
-Both browser engines are installed by the provided `Dockerfile` — it is the
-reference deployment for Hugging Face Spaces (see the Deployment section in
-`README.md`). Chromium ships via Playwright; Camoufox is fetched at image
-build time (`camoufox fetch`, run as the runtime user).
+Both the browser binary and its dependencies are installed by the provided
+`Dockerfile` — it is the reference deployment for Hugging Face Spaces (see
+the Deployment section in `README.md`). Camoufox is fetched at image build
+time (`camoufox fetch`, run as the runtime user).
 
 ## Amazon / KDSpy authentication model
 
 - The owner opens a **one-shot login window** (owner session + `X-Login-Secret`
-  header required). The persistent Chromium profile
+  header required). The persistent Camoufox profile
   (`$DATA_DIR/browser_profiles/kdspy`) keeps cookies/localStorage so future
   research runs reuse the authenticated session without re-asking.
 - Raw Amazon cookies may alternatively be imported once via

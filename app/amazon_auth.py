@@ -23,6 +23,7 @@ diagnostics are stored (see BrowserAuthStore).
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -119,6 +120,16 @@ class AmazonAuthManager:
     def is_authenticated(self) -> bool:
         return self.current_state().status == AUTH_CONFIRMED
 
+    async def classify_live(self, page: Any, marketplace: Marketplace) -> AuthCheck:
+        """Classify an already-open page WITHOUT navigating (interactive use).
+
+        The interactive sign-in session calls this on its own tab so the
+        durable auth state flips the moment the marketplace page actually
+        shows signed-in chrome — the same DOM criteria as `check`, just on a
+        page the owner is driving.
+        """
+        return await self._classify_page(page, marketplace)
+
     # ---------------------------------------------------------- live checking
     async def check(self, marketplace: Marketplace) -> AuthCheck:
         """Navigate to the marketplace and classify the auth state from the
@@ -159,17 +170,56 @@ class AmazonAuthManager:
             detail["reason"] = "sign-in form presented"
             return AuthCheck(AUTH_LOGIN_REQUIRED, url, title, detail)
 
+        # Amazon's soft bot-wall (datacenter/flagged IPs): a page whose whole
+        # purpose is the "Continue shopping" validateCaptcha interstitial.
+        # It is neither signed-in nor sign-in-form evidence; classify it as a
+        # captcha state so the owner sees attention-needed instead of a bare
+        # "unknown" (probed: the wall carries form[action*=validateCaptcha]).
+        body_head = (await _safe_text(page))[:2000].lower()
+        if (
+            "validatecaptcha" in path.lower()
+            or await _has_selector(page, "form[action*='validateCaptcha']")
+            or "click the button below to continue shopping" in body_head
+        ):
+            detail["reason"] = "amazon bot-wall / validateCaptcha interstitial"
+            return AuthCheck(AUTH_CAPTCHA, url, title, detail)
+
         # On a normal marketplace page: look for signed-in indicators.
-        signed_in = await _has_selector(
-            page,
-            "#nav-link-accountList-nav-line-1, [data-nav-role='signin'] .nav-line-1-content, #nav-your-account",
-        )
-        if signed_in:
-            label = await _safe_text_of(page, "#nav-link-accountList-nav-line-1")
-            if label and "sign in" not in label.strip().lower():
+        # The account line reads (probed on live pages):
+        #   signed OUT → "Hello"   (desktop nav; the sign-in verb lives in a
+        #               separate tooltip, so "sign in" is NOT in this label)
+        #   signed OUT → "Hello, sign in" (tooltip/mobile variants)
+        #   signed IN  → "Hello, <Name>"
+        # Only a NAMED hello confirms. The old check ("sign in" not in label)
+        # mis-confirmed every signed-out "Hello" homepage.
+        label = (await _safe_text_of(page, "#nav-link-accountList-nav-line-1")).strip()
+        # (?!\s*sign...): the \s* must be INSIDE the lookahead, else the
+        # greedy \s* before it backtracks past the space and "Hello, sign in"
+        # slips through as a named hello.
+        hello_named = bool(re.match(r"hello\s*,\s*(?!\s*sign\s*in\b).+", label, re.I | re.S))
+        if hello_named or await _has_selector(page, "#nav-your-account"):
+            detail["account_label_present"] = True
+            if label:
+                detail["account_label"] = label[:40]
+            return AuthCheck(AUTH_CONFIRMED, url, title, detail)
+        # Mobile hamburger drawer (m-shop layouts): its first line is
+        # "Hello, sign in" when signed out, "Hello, <Name>" when in.
+        if not hello_named:
+            hmenu = (await _safe_text_of(page, "#hmenu-content")).strip()
+            m = re.match(r"hello\s*,\s*([^\n]+)", hmenu, re.I)
+            if m:
+                if "sign in" in m.group(1).strip().lower():
+                    detail["reason"] = "sign-in prompt visible (mobile drawer)"
+                    return AuthCheck(AUTH_LOGIN_REQUIRED, url, title, detail)
                 detail["account_label_present"] = True
+                detail["via"] = "mobile_drawer"
                 return AuthCheck(AUTH_CONFIRMED, url, title, detail)
-        if await _has_selector(page, "a[href*='/ap/signin'], #nav-signin-tooltip .nav-action-button"):
+        if (
+            label
+            or await _has_selector(page, "a[href*='/ap/signin']")
+            or await _has_selector(page, "#nav-signin-tooltip .nav-action-button")
+            or await _has_selector(page, "#nav-flyout-ya-signin")
+        ):
             detail["reason"] = "sign-in prompt visible on marketplace page"
             return AuthCheck(AUTH_LOGIN_REQUIRED, url, title, detail)
 

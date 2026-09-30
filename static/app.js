@@ -167,6 +167,8 @@
     state.traceAfter = 0;
     state.lastRefresh = 0;
     $("#ws-trace").innerHTML = "";
+    $("#owner-msg-input").value = "";
+    $("#owner-msg-hint").hidden = true;
     $("#start-pane").classList.add("hidden");
     $("#ws-pane").classList.remove("hidden");
     $("#research-empty").classList.add("hidden");
@@ -224,6 +226,53 @@
     if (!["completed", "cancelled"].includes(s.status)) btns.push(`<button class="btn small danger" data-act="cancel">Cancel</button>`);
     el.innerHTML = btns.join("");
     el.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => sessionAction(b.dataset.act)));
+  }
+
+  // ---------- owner → agent messages ----------
+  function appendTraceLocal(id, kind, text) {
+    const feed = $("#ws-trace");
+    if (!feed || state.ws.trace.has(id)) return;
+    state.ws.trace.set(id, { id, created_at: new Date().toISOString(), kind, text });
+    const div = document.createElement("div");
+    div.className = `trace-item ${esc(kind)}`;
+    div.innerHTML = `<div class="trace-t">${esc(fmtClock(new Date().toISOString()))}</div>
+      <div class="trace-x"><span class="k">${esc(kind)}</span>${esc(text)}</div>`;
+    feed.appendChild(div);
+    $("#ws-trace-empty").hidden = true;
+    if (nearBottom(feed.parentElement)) feed.parentElement.scrollTop = feed.parentElement.scrollHeight;
+  }
+
+  async function sendOwnerMessage() {
+    const input = $("#owner-msg-input");
+    const text = (input.value || "").trim();
+    const hint = $("#owner-msg-hint");
+    if (!text || !state.current) return;
+    const btn = $("#owner-msg-send");
+    btn.disabled = true; input.disabled = true;
+    try {
+      const { message } = await api(`/api/sessions/${state.current.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      input.value = "";
+      hint.hidden = false;
+      hint.textContent = `Sent — the agent reads it on its next iteration and keeps it for the rest of the session.`;
+      appendTraceLocal(`local-${message.id}`, "owner", `You → agent: ${message.text}`);
+      toast("Note delivered to the agent");
+    } catch (e) {
+      hint.hidden = false;
+      hint.textContent = e.message;
+    } finally {
+      btn.disabled = false; input.disabled = false;
+      input.focus();
+    }
+  }
+
+  function bindOwnerMessages() {
+    $("#owner-msg-send").addEventListener("click", sendOwnerMessage);
+    $("#owner-msg-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendOwnerMessage(); }
+    });
   }
 
   async function sessionAction(act) {
@@ -731,14 +780,20 @@
 
   // ---------- interactive remote browser (sign-in / KDSpy setup) ----------
   const rb = {
-    session: null, timer: null, pollTimer: null, busy: false,
+    session: null, timer: null, pollTimer: null, busy: false, signedInNotified: false,
   };
+
+  const RB_HINT_DEFAULT = "Tap the page to click · keyboard opens for text fields";
 
   function rbShow(session) {
     rb.session = session;
+    rb.signedInNotified = false;
     $("#rbrowser").classList.remove("hidden");
     document.body.style.overflow = "hidden";
     $("#rb-url").textContent = session?.url || "—";
+    $("#rb-hint").textContent = session?.purpose === "amazon_signin"
+      ? "Signing in… detected automatically when done"
+      : RB_HINT_DEFAULT;
     renderRbTabs();
     if (!rb.timer) rb.timer = setInterval(rbTick, 1200);
     rbTick();
@@ -803,6 +858,29 @@
         const secs = st.session.seconds_remaining ?? 0;
         $("#rb-timer-t").textContent = fmtElapsed(secs) + " left";
         if (secs <= 0) { toast("Interactive session expired"); rbDone(); }
+        // Live sign-in progress: while an Amazon sign-in runs, say what the
+        // page is doing; the moment the server sees the marketplace page
+        // (durable state flips to confirmed) confirm it — before the owner
+        // closes the overlay, not only on the next Settings refresh.
+        if (st.session.purpose === "amazon_signin") {
+          try {
+            // Durable status vocabulary: the auth store persists "authenticated"
+            // (AUTH_CONFIRMED) — compare against that, never "confirmed".
+            const az = await api("/api/browser/auth/amazon");
+            if (az.auth?.status === "authenticated") {
+              if (!rb.signedInNotified) {
+                rb.signedInNotified = true;
+                $("#rb-hint").textContent = "✓ Signed in — session saved. You can close now.";
+                toast("Amazon signed in — saved to the persistent profile");
+              }
+            } else {
+              $("#rb-hint").textContent = "Signing in… complete the steps above (captcha/OTP if asked). Detected automatically when done.";
+            }
+          } catch {}
+        } else {
+          // Non-signin purposes always show the plain usage hint.
+          $("#rb-hint").textContent = RB_HINT_DEFAULT;
+        }
       } else {
         rbDone();
       }
@@ -841,8 +919,8 @@
     if (!rb.session) { rbHide(); return; }
     const id = rb.session.id;
     rbHide();
-    try { await api("/api/browser/interactive/complete", { method: "POST", body: JSON.stringify({ outcome: "completed" }) }); } catch {}
     void id;
+    try { await api("/api/browser/interactive/complete", { method: "POST", body: JSON.stringify({ outcome: "completed" }) }); } catch {}
     refreshSettings();
   }
 
@@ -935,7 +1013,7 @@
         c.className = `chip ${ok ? "completed" : warn ? "paused" : ""}`;
       };
       if (az) {
-        const ok = az.auth?.status === "confirmed";
+        const ok = az.auth?.status === "authenticated";
         $("#set-amazon-state").textContent =
           ok ? "Signed in — persistent profile active" :
           az.auth?.status ? `Status: ${az.auth.status}` : "Not signed in yet";
@@ -998,6 +1076,32 @@
       if (mk) {
         $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
       }
+      // Browser egress mode (relay → proxy → direct), incl. health-gate fallbacks.
+      try {
+        const bs = await api("/api/browser/status");
+        const b = bs.status || {};
+        const chip = $("#set-egress-chip");
+        const state = $("#set-egress-state");
+        const note = $("#set-egress-note");
+        const mode = b.egress_mode || "direct";
+        const labels = {
+          relay: "device relay — your phone's IP",
+          proxy: "configured proxy",
+          direct: "server direct egress",
+        };
+        // Degraded = we wanted proxy/relay but fell back to direct (note says
+        // why: "unusable", "unreachable", "went away mid-session").
+        const degraded = mode === "direct" && !!(b.egress_note || "");
+        chip.textContent = mode;
+        chip.className = "chip " + (degraded ? "paused" : mode === "relay" ? "completed" : "");
+        state.textContent = labels[mode] || mode;
+        if (b.egress_note) {
+          note.hidden = false;
+          note.textContent = b.egress_note;
+        } else {
+          note.hidden = true;
+        }
+      } catch {}
       // Device relay status (phone IP egress).
       try {
         const rl = await api("/api/relay/status");
@@ -1210,6 +1314,7 @@
     $("#tb-record").addEventListener("click", toggleRecording);
     rbBind();
     bindKdspyUpload();
+    bindOwnerMessages();
   }
 
   async function init() {

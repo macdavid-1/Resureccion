@@ -2,9 +2,9 @@
 
 The interactive layer is what lets the owner sign in to Amazon and set up
 KDSpy from a phone against the server's persistent profile. These tests use
-fakes for the browser (no real Chromium) and verify the durable guarantees:
-single session, TTL enforcement, whitelisted actions, atomic extension
-install, and zip-slip/type defense.
+fakes for the browser (no real browser launch) and verify the durable
+guarantees: single session, TTL enforcement, whitelisted actions, atomic
+add-on install, and zip-slip/type defense.
 """
 from __future__ import annotations
 
@@ -168,6 +168,29 @@ async def test_start_opens_amazon_page_on_persistent_profile(manager: Interactiv
 
 
 @pytest.mark.asyncio
+async def test_start_labels_navigation_failure_accurately(manager: InteractiveSessionManager) -> None:
+    """A navigation failure during start must NOT be mislabeled
+    "browser launch failed" (the launch succeeded; the goto failed).
+
+    The mislabel sent the owner hunting for a launch bug while the real
+    problem was egress (NS_ERROR_PROXY_CONNECTION_REFUSED)."""
+    from app.browser_manager import BrowserManagerError
+
+    async def navigate_fails(self, page: Any, url: str) -> None:
+        raise BrowserManagerError(
+            f"navigation failed: Page.goto: NS_ERROR_PROXY_CONNECTION_REFUSED "
+            f"while opening {url}"
+        )
+
+    manager.browser.navigate = navigate_fails.__get__(manager.browser)
+
+    with pytest.raises(InteractiveError, match="page open failed") as ei:
+        await manager.start(purpose="kdspy_setup")
+    assert "browser launch failed" not in str(ei.value)
+    assert "publishingaltitude" in str(ei.value)
+
+
+@pytest.mark.asyncio
 async def test_start_is_idempotent_while_open(manager: InteractiveSessionManager) -> None:
     s1 = await manager.start(purpose="amazon_signin", marketplace="us")
     s2 = await manager.start(purpose="kdspy_setup")
@@ -316,14 +339,14 @@ MANIFEST = b'{"name": "KDSpy Pro", "version": "4.2.0", "manifest_version": 3, "b
 def test_zip_install_roundtrip(kdspy: KDSpyManager) -> None:
     data = _zip_bytes({
         "manifest.json": MANIFEST,
-        "sw.js": b"self.oninstall=()=>{}",
+        "background.js": b"// bg",
         "icons/icon.png": b"\x89PNG",
     })
     info = kdspy.install_from_zip(data)
     assert info.name == "KDSpy Pro"
     assert info.version == "4.2.0"
-    assert (kdspy.extension_path / "manifest.json").is_file()
-    assert (kdspy.extension_path / "icons" / "icon.png").is_file()
+    assert (kdspy.firefox_addon_path / "manifest.json").is_file()
+    assert (kdspy.firefox_addon_path / "icons" / "icon.png").is_file()
     state = kdspy.state()
     assert state.status == "installed"
 
@@ -331,13 +354,13 @@ def test_zip_install_roundtrip(kdspy: KDSpyManager) -> None:
 def test_zip_install_wrapped_export_folder(kdspy: KDSpyManager) -> None:
     data = _zip_bytes({
         "kdspy-pro-export/manifest.json": MANIFEST,
-        "kdspy-pro-export/sw.js": b"",
+        "kdspy-pro-export/background.js": b"",
     })
     info = kdspy.install_from_zip(data)
     assert info.version == "4.2.0"
-    assert (kdspy.extension_path / "manifest.json").is_file()
+    assert (kdspy.firefox_addon_path / "manifest.json").is_file()
     # Wrapper folder must be flattened, not nested.
-    assert not (kdspy.extension_path / "kdspy-pro-export").exists()
+    assert not (kdspy.firefox_addon_path / "kdspy-pro-export").exists()
 
 
 def test_zip_install_rejects_non_zip(kdspy: KDSpyManager) -> None:
@@ -358,8 +381,8 @@ def test_zip_install_rejects_zip_slip(kdspy: KDSpyManager) -> None:
     })
     with pytest.raises(ExtensionInstallError, match="unsafe|allowed"):
         kdspy.install_from_zip(data)
-    # Nothing escaped the extension dir.
-    assert not (kdspy.extension_path.parent.parent / "escape.js").exists()
+    # Nothing escaped the add-on dir.
+    assert not (kdspy.firefox_addon_path.parent.parent / "escape.js").exists()
 
 
 def test_zip_install_rejects_dangerous_file_types(kdspy: KDSpyManager) -> None:
@@ -369,14 +392,14 @@ def test_zip_install_rejects_dangerous_file_types(kdspy: KDSpyManager) -> None:
 
 
 def test_zip_install_preserves_old_install_on_failure(kdspy: KDSpyManager) -> None:
-    good = _zip_bytes({"manifest.json": MANIFEST, "sw.js": b"v1"})
+    good = _zip_bytes({"manifest.json": MANIFEST, "background.js": b"v1"})
     kdspy.install_from_zip(good)
-    marker = (kdspy.extension_path / "sw.js").read_bytes()
+    marker = (kdspy.firefox_addon_path / "background.js").read_bytes()
     bad = _zip_bytes({"manifest.json": b"not json"})
     with pytest.raises(ExtensionInstallError):
         kdspy.install_from_zip(bad)
     # Old install survived intact.
-    assert (kdspy.extension_path / "sw.js").read_bytes() == marker
+    assert (kdspy.firefox_addon_path / "background.js").read_bytes() == marker
 
 
 def test_zip_install_rejects_bad_manifest(kdspy: KDSpyManager) -> None:
@@ -388,11 +411,11 @@ def test_zip_install_rejects_bad_manifest(kdspy: KDSpyManager) -> None:
 def test_files_install_flat(kdspy: KDSpyManager) -> None:
     files = [
         ("manifest.json", io.BytesIO(MANIFEST)),
-        ("sw.js", io.BytesIO(b"")),
+        ("background.js", io.BytesIO(b"")),
     ]
     info = kdspy.install_from_files(files)
     assert info.version == "4.2.0"
-    assert (kdspy.extension_path / "sw.js").is_file()
+    assert (kdspy.firefox_addon_path / "background.js").is_file()
 
 
 def test_files_install_rejects_unsafe_path(kdspy: KDSpyManager) -> None:
@@ -406,18 +429,19 @@ def test_files_install_requires_manifest(kdspy: KDSpyManager) -> None:
 
 
 def test_update_flow_replaces_previous_version(kdspy: KDSpyManager) -> None:
-    v1 = _zip_bytes({"manifest.json": MANIFEST, "sw.js": b"v1"})
+    v1 = _zip_bytes({"manifest.json": MANIFEST, "background.js": b"v1"})
     kdspy.install_from_zip(v1)
     manifest_v2 = MANIFEST.replace(b"4.2.0", b"4.3.1")
-    v2 = _zip_bytes({"manifest.json": manifest_v2, "sw.js": b"v2"})
+    v2 = _zip_bytes({"manifest.json": manifest_v2, "background.js": b"v2"})
     info = kdspy.install_from_zip(v2)
     assert info.version == "4.3.1"
-    assert (kdspy.extension_path / "sw.js").read_bytes() == b"v2"
-    assert not list(kdspy.extension_path.parent.glob(".kdspy-bak-*"))
+    assert (kdspy.firefox_addon_path / "background.js").read_bytes() == b"v2"
+    # The atomic swap leaves no backup/staging dirs behind.
+    assert not list(kdspy.firefox_addon_path.parent.glob(".kdspy-firefox-*"))
 
 
 def test_remove(kdspy: KDSpyManager) -> None:
     kdspy.install_from_zip(_zip_bytes({"manifest.json": MANIFEST}))
-    assert kdspy.is_configured()
+    assert kdspy.firefox_addon_is_configured()
     kdspy.remove()
-    assert not kdspy.is_configured()
+    assert not kdspy.firefox_addon_is_configured()

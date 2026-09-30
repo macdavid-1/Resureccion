@@ -19,7 +19,7 @@ from typing import Any, Iterator
 
 from app.config import Config, get_config
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -387,6 +387,19 @@ CREATE TABLE IF NOT EXISTS integrity_assessments (
     meta TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_ia_session ON integrity_assessments(session_id, kind, created_at);
+
+-- Owner→agent mid-research messages. Durable delivery: the runner consumes
+-- pending rows exactly once (delivery marker committed with the read) and
+-- the text then stays permanently in the session's owner-guidance journal,
+-- re-included in every later model prompt — no line of context is lost.
+CREATE TABLE IF NOT EXISTS owner_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id),
+    created_at TEXT NOT NULL,
+    text TEXT NOT NULL,
+    delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ownermsg_session ON owner_messages(session_id, id);
 """
 
 

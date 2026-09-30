@@ -66,17 +66,18 @@ class Config:
         self.app_title = os.environ.get("APP_TITLE", "Resurreccion").strip()
 
         # --- browser infrastructure -------------------------------------------
-        # Persistent Chromium profiles live under DATA_DIR so they survive restarts.
+        # Persistent browser profiles live under DATA_DIR so they survive
+        # restarts. There is exactly ONE engine: Camoufox (anti-detect
+        # Firefox). BROWSER_ENGINE exists for deployment clarity; asking for
+        # anything else is a hard boot error, never a silent fallback.
         self.browser_profiles_dir = self.data_dir / "browser_profiles"
-        # Research browser engine:
-        #   "camoufox" — Firefox-based anti-detect engine (default): fingerprint
-        #     spoofing at the C++ layer (canvas/audio/fonts/WebGL/UA coherent),
-        #     no Chromium headless tells, cross-origin CAPTCHA iframes clickable.
-        #     Cannot load Chrome MV3 extensions (KDSpy) — use chromium for that.
-        #   "chromium" — Playwright Chromium: required for KDSpy Pro (MV3) and
-        #     CDP-based per-page mobile emulation.
         engine_env = os.environ.get("BROWSER_ENGINE", "camoufox").strip().lower()
-        self.browser_engine = engine_env if engine_env in ("camoufox", "chromium") else "camoufox"
+        if engine_env and engine_env != "camoufox":
+            raise RuntimeError(
+                f"BROWSER_ENGINE={engine_env!r} is not supported. Resurrección "
+                "runs Camoufox only — remove BROWSER_ENGINE or set it to camoufox"
+            )
+        self.browser_engine = "camoufox"
         # Camoufox extras (see app/camoufox_engine.py):
         self.camoufox_humanize = os.environ.get("CAMOUFOX_HUMANIZE", "").strip().lower() in (
             "1", "true", "yes", "on"
@@ -89,7 +90,6 @@ class Config:
         self.browser_headless = os.environ.get("BROWSER_HEADLESS", "true").strip().lower() in (
             "1", "true", "yes", "on"
         )
-        self.browser_channel = os.environ.get("BROWSER_CHANNEL", "chromium").strip()
         self.browser_idle_shutdown_seconds = _int_env("BROWSER_IDLE_SHUTDOWN_SECONDS", 300)
         self.browser_default_timeout_seconds = _int_env("BROWSER_DEFAULT_TIMEOUT_SECONDS", 45)
         self.browser_navigation_timeout_seconds = _int_env("BROWSER_NAV_TIMEOUT_SECONDS", 60)
@@ -97,23 +97,11 @@ class Config:
         self.browser_user_agent = os.environ.get("BROWSER_USER_AGENT", "").strip()
         self.browser_locale = os.environ.get("BROWSER_LOCALE", "en-US").strip()
         self.browser_timezone = os.environ.get("BROWSER_TIMEZONE", "America/New_York").strip()
-        # Containers (Hugging Face Spaces, Docker) run Chromium as root without
-        # user namespaces — Chromium refuses to start without --no-sandbox there.
-        # Default: auto-detect (root or container); overridable via env.
-        container_detected = os.geteuid() == 0 if hasattr(os, "geteuid") else False
-        if not container_detected and Path("/.dockerenv").exists():
-            container_detected = True
-        self.browser_no_sandbox = os.environ.get(
-            "BROWSER_NO_SANDBOX", "true" if container_detected else "false"
-        ).strip().lower() in ("1", "true", "yes", "on")
-        # Space/comma separated extra Chromium args for deploy-specific tuning.
-        self.browser_extra_args = [
-            a for a in os.environ.get("BROWSER_EXTRA_ARGS", "").replace(",", " ").split() if a
-        ]
-        # Outbound proxy for the research browser (Chromium --proxy-server).
-        # Cloud hosts (HF Spaces) run on datacenter IPs that anti-bot systems
-        # (reCAPTCHA, Amazon) silently distrust; a residential/quality proxy
-        # is the supported way for the owner to fix that. Optional.
+        # Outbound proxy for the research browser. Cloud hosts (HF Spaces) run
+        # on datacenter IPs that anti-bot systems (reCAPTCHA, Amazon) silently
+        # distrust; the supported shape is the owner's own Cloudflare WARP
+        # bridge on a VPS (scripts/vps_proxy_setup.sh) exposed as SOCKS5 or a
+        # plain CONNECT proxy. Optional.
         # Accepts host:port, or user:pass@host:port (preferred via env so the
         # secret lives outside the codebase).
         self.browser_proxy = os.environ.get("BROWSER_PROXY", "").strip()
@@ -145,33 +133,24 @@ class Config:
         # Research pages keep the wide desktop viewport for KDSpy panels.
         self.browser_interactive_viewport_w = _int_env("BROWSER_INTERACTIVE_VIEWPORT_W", 390)
         self.browser_interactive_viewport_h = _int_env("BROWSER_INTERACTIVE_VIEWPORT_H", 844)
-        # Mobile Chrome UA for owner-driven pages. Empty = keep the desktop UA
-        # (not recommended: mobile UA is what makes sites serve touch layouts).
+        # Mobile UA for owner-driven pages — Firefox-shaped by construction:
+        # a Chrome UA would contradict the Camoufox engine itself. An explicit
+        # Firefox UA passes through unchanged; anything else is ignored in
+        # favor of the coherent Firefox-mobile default.
         self.browser_interactive_user_agent = os.environ.get(
             "BROWSER_INTERACTIVE_USER_AGENT",
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Android 13; Mobile; rv:130.0) Gecko/130.0 Firefox/130.0",
         ).strip()
         self.browser_downloads_dir = self.data_dir / "browser_downloads"
 
-        # KDSpy Pro extension: unpacked extension directory (owner-supplied).
-        self.kdspy_extension_path = Path(
-            os.environ.get("KDSPY_EXTENSION_PATH", str(self.data_dir / "extensions" / "kdspy"))
-        ).expanduser().resolve()
+        # KDSpy Pro: the Firefox add-on (the ONLY KDSpy package — loaded
+        # natively by the Camoufox engine).
         self.kdspy_expected_min_version = os.environ.get("KDSPY_MIN_VERSION", "").strip()
-        self.kdspy_extension_id = os.environ.get("KDSPY_EXTENSION_ID", "").strip()
-        # Chrome Web Store ID of KDSpy — pins which package the one-tap store
-        # installer may ever accept (CRX3 key must hash to this ID).
-        self.kdspy_webstore_id = os.environ.get("KDSPY_WEBSTORE_ID", "").strip()
-        # KDSpy Firefox add-on (owner-supplied XPI): the packaged Firefox build
-        # of KDSpy Pro, loadable natively by the camoufox engine. Kept beside
-        # the Chromium install so both engines can be driven from one place.
         self.kdspy_firefox_path = Path(
             os.environ.get("KDSPY_FIREFOX_PATH", str(self.data_dir / "extensions" / "kdspy-firefox"))
         ).expanduser().resolve()
         # One-tap Firefox add-on install: the owner-verified AMO download URL
-        # (addons.mozilla.org only). The camoufox engine's counterpart of
-        # KDSPY_WEBSTORE_ID for Chromium.
+        # (addons.mozilla.org only). A version bump is just a new URL here.
         self.kdspy_amo_url = os.environ.get(
             "KDSPY_AMO_URL",
             "https://addons.mozilla.org/firefox/downloads/file/4802008/kdspy_v5-5.13.56.xpi",

@@ -72,6 +72,7 @@ class RunnerRegistry:
             assessments=getattr(st, "integrity", None),
             trace=getattr(st, "trace", None),
             supervisor=getattr(st, "autonomy", None),
+            owner_messages=getattr(st, "owner_messages", None),
         )
 
     # ------------------------------------------------------------------ spawn

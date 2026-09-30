@@ -48,7 +48,7 @@ async def status(request: Request) -> dict:
 
 
 async def _maybe_restart_browser(request: Request) -> bool:
-    """Relaunch Chromium so it picks up (or drops) the relay shim as its
+    """Relaunch the browser so it picks up (or drops) the relay shim as its
     proxy. Never yanks the browser out from under a running research page —
     the new egress applies on the next launch instead. Returns whether a
     restart actually happened."""

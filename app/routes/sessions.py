@@ -17,6 +17,10 @@ def _auth(request: Request) -> None:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
+class SendMessageRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000, description="Guidance the model must see")
+
+
 class CreateSessionRequest(BaseModel):
     mode: str = Field(description="prompt | keywords | auto")
     prompt: str = ""
@@ -179,6 +183,44 @@ async def cancel_session(session_id: str, request: Request) -> dict:
             status_code=404 if "not found" in str(exc) else 400, detail=str(exc)
         ) from exc
     return {"session": s.to_dict()}
+
+
+@router.post("/{session_id}/messages")
+async def send_message(session_id: str, body: SendMessageRequest, request: Request) -> dict:
+    """Owner→agent mid-research message.
+
+    Durable and non-interrupting: the note is persisted immediately and the
+    live runner (if any) sees it on its next iteration via the prompt;
+    research never pauses or restarts. Once consumed it stays in the
+    session's guidance journal for every later model call — no context loss.
+    """
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message text must not be empty")
+    try:
+        m = st.owner_messages.post(session_id, text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    st.events.append(
+        session_id, level="info", actor="owner", action="owner_message_sent",
+        detail={"id": m.id, "text": m.text[:300]},
+    )
+    return {"message": m.to_dict()}
+
+
+@router.get("/{session_id}/messages")
+async def list_messages(session_id: str, request: Request) -> dict:
+    """The durable owner-guidance journal (delivered + pending)."""
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    msgs = st.owner_messages.journal(session_id)
+    return {"messages": [m.to_dict() for m in msgs]}
 
 
 @router.get("/{session_id}/jobs")

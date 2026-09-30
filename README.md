@@ -42,8 +42,8 @@ app/
   marketplace.py      # Marketplace abstraction (18 Amazon domains, explicit/auto plan)
   redact.py           # Secret hygiene: credential-shaped keys never leave the server
   browser_store.py    # Durable auth-state / extension / login-window / evidence stores
-  kdspy.py            # KDSpy Pro extension validation + launch args (Chromium MV3 + Firefox XPI)
-  browser_manager.py  # Persistent Chromium via Playwright (lifecycle, pages, crashes)
+  kdspy.py            # KDSpy Pro Firefox add-on validation + camoufox launch args
+  browser_manager.py  # Persistent Camoufox (anti-detect Firefox) via Playwright (lifecycle, pages, crashes)
   amazon_auth.py      # Amazon auth state detection + one-shot login window + cookie import
   evidence_capture.py # Structured, redacted page/evidence extraction + screenshots
   routes/
@@ -59,7 +59,7 @@ static/
 scripts/
   set_password.py     # (app.scripts.set_password) owner hash generator
   boot_check.py
-  browser_smoke.py    # live Chromium launch smoke test
+  browser_smoke.py    # live browser launch smoke test
   camoufox_smoke.py   # live check: Camoufox engine launches + spoofs identity
   ...
 data/                 # Persistent storage root (created at runtime)
@@ -74,9 +74,9 @@ $DATA_DIR/
   uploads/<session_id>/...
   exports/<session_id>/...
   reports/<session_id>/...
-  browser_profiles/kdspy/   # PERSISTENT Chromium profile: cookies, localStorage, KDSpy state
+  browser_profiles/kdspy/   # PERSISTENT Camoufox profile: cookies, localStorage, KDSpy add-on state
   browser_downloads/
-  extensions/kdspy/         # owner-supplied unpacked KDSpy Pro extension
+  extensions/kdspy-firefox/ # KDSpy Pro Firefox add-on (one-tap AMO install or XPI upload)
 ```
 
 Everything under `$DATA_DIR` must be mapped to Hugging Face Spaces persistent storage. `DATA_DIR=/data` is the expected value in the Space.
@@ -100,11 +100,10 @@ Space setup checklist:
 1. **SDK:** Docker (`sdk: docker`, `app_port: 7860` — already in this README's frontmatter).
 2. **Persistent storage:** enable a persistent bucket in the Space settings; the image sets `DATA_DIR=/data`, which is where the bucket mounts. Everything durable (SQLite DB, artifacts, recordings, PDFs, uploads, browser profile with Amazon/KDSpy auth) lives under it.
 3. **Secrets** (Space → Settings → Variables and secrets): `OWNER_PASSWORD_HASH`, `AUTH_SECRET`, `MODEL_API_KEY`, and recommended `BROWSER_LOGIN_SECRET`. Generate the hash with `python -m app.scripts.set_password`. Full list: `ENV_VARS.md`.
-4. **KDSpy Pro:** upload the unpacked extension directly from the app — Settings → KDSpy Pro → Install (ZIP or folder files). No shell access needed.
+4. **KDSpy Pro:** one-tap install from Mozilla Add-ons — Settings → KDSpy Firefox add-on → Install from AMO (or upload the XPI). No shell access needed.
 
-Chromium runs with `--no-sandbox` in the container (auto-detected; forced via
-`BROWSER_NO_SANDBOX=true` in the image) because Spaces containers run without
-user namespaces. Locally, sandboxing stays on.
+The browser runs without the Chromium sandbox flag entirely (Firefox/Camoufox
+does not use it; containers run without user namespaces).
 
 Environment variables (see `app/config.py` for the full list):
 
@@ -133,7 +132,7 @@ Everything the research browser needs is configured from Settings — no server
 shell required, on the preview or on the deployed Space:
 
 1. **Amazon sign-in.** Settings → Amazon authentication → **Sign in**. A
-   full-screen remote browser opens (the server's real Chromium, streaming
+   full-screen remote browser opens (the server's real Camoufox, streaming
    live frames to your phone). Tap to click, use the text bar and key buttons
    to fill the login form, complete captcha/OTP, then Close. Cookies persist
    in the shared browser profile (`$DATA_DIR/browser_profiles/kdspy`), so
@@ -177,7 +176,8 @@ shell required, on the preview or on the deployed Space:
 
 A dual-stack (IPv4 **and** IPv6) VPS is the cheapest always-on egress that
 reaches **all** hosts — including the IPv6-only Cloudflare challenge hosts
-that broke the Webshare gateway (502 on `brunhild.challenges.cloudflare.com`).
+that some commercial proxy gateways fail (502 on
+`brunhild.challenges.cloudflare.com`).
 
 1. **Before buying**, pre-check any candidate IP:
    `python scripts/vps_ip_probe.py <candidate-ip>` — verifies IPv4+IPv6
@@ -200,26 +200,18 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
 - ONE persistent browser shared by all research (Playwright
   `launch_persistent_context`); profile at `$DATA_DIR/browser_profiles/kdspy`
   survives restarts, preserving Amazon authentication across runs.
-- **Engines** (`BROWSER_ENGINE`):
-  - `camoufox` (default) — anti-detect Firefox. Fingerprint consistency is
-    enforced by the browser binary itself (canvas/audio/fonts/WebGL/UA all
-    coherent, spoofed at the C++ layer), so the tap-refusal class of Chromium
-    headless tells disappears and cross-origin CAPTCHA iframes (Turnstile /
-    reCAPTCHA) are clickable (`disable_coop`). Each profile generates its
-    fingerprint once and caches it under `$DATA_DIR` — the identity is stable
-    across restarts, which is itself an anti-detection property.
-  - `chromium` — Playwright Chromium. Required for the KDSpy Pro **Chrome
-    MV3** build (`--load-extension`).
-- KDSpy Pro ships in two package formats, and the manager validates whichever
-  the active engine can load — KDSpy data is never faked:
-  - **Chrome MV3 build** (chromium engine): real unpacked extension via
-    `--load-extension`; manifest/version validated durably, MV3 service
-    worker verified after launch.
-  - **Firefox add-on (XPI)** (camoufox engine): installed from Settings →
-    KDSpy Firefox add-on → Upload XPI, validated with the same zip-slip /
-    manifest / version defenses, and loaded *natively* by Camoufox via its
-    `addons` launch option. This is the supported KDSpy path on the default
-    camoufox engine — no Chromium switch needed.
+- **Engine** (fixed): Camoufox — anti-detect Firefox. Fingerprint consistency
+  is enforced by the browser binary itself (canvas/audio/fonts/WebGL/UA all
+  coherent, spoofed at the C++ layer), so the tap-refusal class of Chromium
+  headless tells disappears and cross-origin CAPTCHA iframes (Turnstile /
+  reCAPTCHA) are clickable (`disable_coop`). The profile generates its
+  fingerprint once and caches it under `$DATA_DIR` — the identity is stable
+  across restarts, which is itself an anti-detection property.
+- KDSpy Pro ships as the **Firefox add-on (XPI)**, loaded *natively* by
+  Camoufox via its `addons` launch option — KDSpy data is never faked:
+  installed from Settings → KDSpy Firefox add-on (one tap from Mozilla
+  Add-ons, or upload the `.xpi`/`.zip`), validated with the same zip-slip /
+  manifest / version defenses, and durable state records the install.
 - Amazon auth: owner-driven interactive sign-in over the persistent profile
   (live frame streaming + whitelisted tap/type/key/scroll/navigate controls),
   live auth-state detection (signed-in / login_required / captcha / OTP /

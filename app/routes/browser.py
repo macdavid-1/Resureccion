@@ -199,30 +199,6 @@ async def kdspy_validate(request: Request) -> dict:
     return {"extension": state.to_dict()}
 
 
-@router.post("/extensions/kdspy/install-store")
-async def kdspy_install_store(request: Request) -> dict:
-    """One-tap install: fetch KDSpy directly from the Chrome Web Store.
-
-    Downloads the official CRX from Google's CDN (the endpoint Chrome itself
-    uses for public items), verifies it cryptographically against the pinned
-    store ID, installs atomically, and relaunches the browser. No ZIP needed.
-    """
-    _auth(request)
-    mgr = _kdspy(request)
-    try:
-        info = await mgr.install_from_webstore()
-    except ExtensionInstallError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    await _maybe_restart_browser(request)
-    return {
-        "installed": True,
-        "source": "chrome_web_store",
-        "manifest": info.to_safe_dict(),
-        "extension": mgr.state().to_dict(),
-        "note": "extension installed — opening the setup browser for license activation",
-    }
-
-
 @router.post("/extensions/kdspy/install-xpi")
 async def kdspy_install_xpi(request: Request, file: UploadFile = File(...)) -> dict:
     """Install the KDSpy Firefox add-on (XPI) for the camoufox engine.
@@ -347,9 +323,9 @@ async def kdspy_remove(request: Request) -> dict:
 
 
 async def _maybe_restart_browser(request: Request) -> None:
-    """Relaunch the shared Chromium so a newly installed/removed extension is
-    picked up. Only restarts when no research page is open (never yank the
-    browser out from under a running session)."""
+    """Relaunch the shared Camoufox browser so a newly installed/removed
+    Firefox add-on is picked up. Only restarts when no research page is open
+    (never yank the browser out from under a running session)."""
     mgr: BrowserManager = _browser(request)
     interactive: InteractiveSessionManager = _interactive(request)
     if interactive.is_research_busy():

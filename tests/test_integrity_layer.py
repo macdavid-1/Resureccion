@@ -192,6 +192,13 @@ class TestKdpRisk:
 
 
 # ------------------------------------------------------- verification engine
+def _recent_iso() -> str:
+    """Fresh timestamp (evidence must be <7 days old to pass staleness)."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+
 def _evidence(n: int, marketplace: str = "us") -> list[dict]:
     return [
         {
@@ -201,7 +208,7 @@ def _evidence(n: int, marketplace: str = "us") -> list[dict]:
             "title": "search results",
             "url": f"https://www.amazon.com/s?k=grief&page={i}",
             "data": {"results": [{"asin": f"A{i}", "review_count": 40 + i}]},
-            "captured_at": "2026-09-18T00:00:00+00:00",
+            "captured_at": _recent_iso(),
         }
         for i in range(n)
     ]
@@ -356,7 +363,7 @@ class TestCandidateFilters:
                 "data": {"results": [
                     {"asin": f"A{i}-{j}", "review_count": 30} for j in range(2)
                 ]},
-                "captured_at": "2026-09-18T00:00:00+00:00",
+                "captured_at": _recent_iso(),
             })
         for i in range(3):
             ev.append({
@@ -364,7 +371,7 @@ class TestCandidateFilters:
                 "title": "reviews", "url": f"https://amazon.com/product-reviews/A{i}",
                 "data": {"asin": f"A{i}", "reviews": [
                     {"rating": 2, "text": "no structure"} for _ in range(3)]},
-                "captured_at": "2026-09-18T00:00:00+00:00",
+                "captured_at": _recent_iso(),
             })
         claims = _supported_claims(db, session_id, cand.id, ["ev0", "ev1"])
         rep = self._engine(db).evaluate(session_id, cand, evidence_records=ev, claims=claims,

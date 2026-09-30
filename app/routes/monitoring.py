@@ -71,12 +71,18 @@ def _snapshot(request: Request, session_id: str, after_trace: int) -> dict:
         errors = []
     last_cp = st.checkpoints.latest(session_id)
     job = st.autonomy.current_job(session_id) if hasattr(st, "autonomy") else None
+    owner_msgs: list[dict] = []
+    try:
+        owner_msgs = [m.to_dict() for m in st.owner_messages.journal(session_id, limit=20)]
+    except Exception:
+        owner_msgs = []
     return {
         "session": session.to_dict(),
         "counts": counts,
         "agent": agent.to_dict() if agent else None,
         "browser": browser.to_dict() if browser else None,
         "job": job.to_dict() if job else None,
+        "owner_messages": owner_msgs,
         "trace": [e.to_dict() for e in entries],
         "last_checkpoint": last_cp.to_dict() if last_cp else None,
         "recent_errors": [

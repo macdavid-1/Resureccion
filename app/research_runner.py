@@ -36,6 +36,7 @@ from app.filters import CandidateFilterEngine
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
 from app.marketplace import Marketplace, resolve_plan, select_auto
+from app.owner_messages import OwnerMessageStore
 from app.methodology import (
     P1_DISCOVERY,
     PHASE_ORDER,
@@ -72,6 +73,7 @@ from app.trace import (
     KIND_BROWSER,
     KIND_CANDIDATE,
     KIND_DISCOVERY,
+    KIND_OWNER,
     KIND_PHASE,
     KIND_PIVOT,
     KIND_REPORT,
@@ -113,6 +115,7 @@ class ResearchRunner:
         events: EventLog,
         errors: ErrorStateStore,
         checkpoints: CheckpointStore,
+        owner_messages: OwnerMessageStore | None = None,
         candidates: CandidateStore,
         evidence: EvidenceStore,
         observations: ObservationStore,
@@ -136,6 +139,8 @@ class ResearchRunner:
         self.events = events
         self.errors = errors
         self.checkpoints = checkpoints
+        # Owner→agent mid-research messages (durable, exactly-once delivery).
+        self.owner_messages = owner_messages or OwnerMessageStore(db)
         self.candidates = candidates
         self.evidence = evidence
         self.observations = observations
@@ -159,6 +164,8 @@ class ResearchRunner:
         self.trace = trace or ActivityTrace(db)
         self.supervisor = supervisor
         self._pause_requested = False
+        self._owner_note_lines: list[str] = []
+        self._owner_notes_loaded_for: str | None = None
         self._timings: dict[str, TimingTracker] = {}
         self.executor = executor or ActionExecutor(
             config,
@@ -168,6 +175,49 @@ class ResearchRunner:
             events,
         )
         self._cancelled = False
+
+    # ------------------------------------------------- owner message channel
+    def _take_owner_messages(self, session_id: str) -> None:
+        """Absorb any owner messages sent while research runs.
+
+        Non-interrupting by design: the runner never pauses or waits; it
+        simply picks up whatever the owner typed whenever it next builds a
+        prompt (each iteration, and once at session start). Messages are
+        consumed exactly-once (delivery marker committed with the read) and
+        then live permanently in `self._owner_note_lines`, which is re-sent
+        in EVERY subsequent prompt — zero context loss, even across a
+        crash/resume (the journal is durable in the DB).
+        """
+        try:
+            pending = self.owner_messages.consume_pending(session_id)
+        except Exception:
+            return  # messaging must never break research
+        for m in pending:
+            line = f"(owner, {m.created_at}) {m.text}"
+            if line not in self._owner_note_lines:
+                self._owner_note_lines.append(line)
+            self.events.append(
+                session_id, level="info", actor="owner", action="owner_message_received",
+                detail={"id": m.id, "text": m.text[:300]},
+            )
+            self.trace.record(
+                session_id, KIND_OWNER,
+                f"Owner message received: {m.text[:160]}",
+            )
+
+    def _owner_note_lines_for(self, session_id: str) -> list[str]:
+        """Full durable owner-guidance journal for the prompt. Rehydrated
+        from the DB on (re)start so a resumed session keeps every note."""
+        if self._owner_notes_loaded_for != session_id:
+            self._owner_notes_loaded_for = session_id
+            try:
+                self._owner_note_lines = [
+                    f"(owner, {m.created_at}) {m.text}"
+                    for m in self.owner_messages.journal(session_id)
+                ]
+            except Exception:
+                self._owner_note_lines = []
+        return list(self._owner_note_lines)
 
     # ------------------------------------------------------------------ cancel
     def cancel(self) -> None:
@@ -197,6 +247,9 @@ class ResearchRunner:
             # exists; a fresh session needs it created before transitioning.
             self.agent.initialize(session_id)
             self.agent.transition(session_id, "planning", substate="methodology_start")
+            # Rehydrate any owner guidance sent before/between runs so the
+            # model's very first prompt already carries it.
+            self._take_owner_messages(session_id)
             self.events.append(
                 session_id, level="info", actor="agent", action="research_started",
                 detail={"mode": session.mode, "methodology_phases": list(PHASE_ORDER)},
@@ -358,6 +411,11 @@ class ResearchRunner:
             timing.session_elapsed_seconds = time.monotonic() - session_started
             timing.attempts_since_progress = stall
 
+            # --- owner message pickup (non-interrupting) -----------------
+            # Checked on EVERY iteration, before the prompt is built: whatever
+            # the owner typed lands in this iteration's context. Never pauses,
+            # never stops, never reorders the methodology.
+            self._take_owner_messages(session_id)
             # --- one model iteration -------------------------------------
             # Vision ground truth: fetch the newest browser screenshot before
             # building the prompt (the prompt notes whether one is attached).
@@ -379,6 +437,7 @@ class ResearchRunner:
                     "as part of the brief" if self._has_images(session_id) else ""
                 ),
                 screenshot_attached=screenshot_png is not None,
+                owner_messages=self._owner_note_lines_for(session_id),
             )
             model_calls += 1
             self.agent.advance_iteration(session_id)

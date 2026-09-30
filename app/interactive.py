@@ -25,11 +25,22 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import urlparse
 
+from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
 from app.browser_manager import BrowserManager, BrowserManagerError
-from app.browser_store import LoginWindowStore, WINDOW_CANCELLED, WINDOW_COMPLETED, WINDOW_EXPIRED, WINDOW_OPEN
+from app.browser_store import (
+    AUTH_CONFIRMED,
+    AUTH_LOGIN_REQUIRED,
+    AUTH_UNKNOWN,
+    LoginWindowStore,
+    WINDOW_CANCELLED,
+    WINDOW_COMPLETED,
+    WINDOW_EXPIRED,
+    WINDOW_OPEN,
+)
 from app.config import Config
-from app.marketplace import Marketplace, get_marketplace
+from app.marketplace import Marketplace, get_marketplace, marketplace_from_url
 from app.redact import scrub_url
 
 # Hard cap on one interactive session, independent of config: sign-in flows
@@ -46,6 +57,27 @@ ACTION_LIMITS: dict[str, dict[str, int]] = {
     "navigate": {"url": 2000},
     "switch_tab": {"index": 8},
 }
+
+
+# Where the KDSpy subscription sign-in actually happens: the WishList Member
+# portal on publishingaltitude.com (allowlisted in app/privacy.py). Opening
+# kdspy.com's landing page instead wastes the interactive session on
+# marketing content; /member/ is the owner-verified login entry point
+# (WordPress/wlfrom bounces only add a hop that can break under egress churn).
+KDSPY_LOGIN_URL = "https://www.publishingaltitude.com/member/"
+
+# Amazon's real sign-in form (the classic openid identifier_select flow).
+# Opening the homepage first costs a tap and can land on region variants;
+# this URL is the canonical form on every marketplace.
+AMAZON_SIGNIN_URL = (
+    "https://www.amazon.com/ap/signin"
+    "?openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_custrec_signin"
+    "&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
+    "&openid.assoc_handle=usflex"
+    "&openid.mode=checkid_setup"
+    "&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
+    "&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+)
 
 
 class InteractiveError(Exception):
@@ -112,6 +144,19 @@ class InteractiveSessionManager:
         self._on_frame = on_frame
         self._session: InteractiveSession | None = None
         self._lock = asyncio.Lock()
+        self._last_detect_at = 0.0
+        # Optional AmazonAuthManager (wired by main.py): lets the session
+        # itself flip the durable Amazon auth state the moment the sign-in
+        # visibly succeeds, without the owner having to tap anything.
+        self.amazon_auth: AmazonAuthManager | None = None
+        # In-flight watcher task, keyed by nothing (single session) — replaced
+        # each fire so a slow classify never queues up behind frames.
+        self._detect_task: asyncio.Task | None = None
+        # Last status this watcher persisted. The watcher re-classifies every
+        # throttle tick while the owner is mid-flow; identical statuses are
+        # NOT rewritten to the DB (a 1Hz SQLite upsert for minutes of typing
+        # would be pure churn).
+        self._last_written_auth_status: str | None = None
 
     # ------------------------------------------------------------------ state
     def current(self) -> InteractiveSession | None:
@@ -166,7 +211,15 @@ class InteractiveSessionManager:
             try:
                 page = await self._open_page(mkt, purpose)
             except BrowserManagerError as exc:
-                raise InteractiveError(f"browser launch failed: {exc}") from exc
+                # Label accurately: launch vs. navigation failures hit the
+                # owner with completely different remedies (egress/proxy
+                # state vs. page/url state). The old blanket "browser launch
+                # failed" label sent every navigation failure to a
+                # nonexistent launch bug.
+                msg = str(exc)
+                if msg.startswith("navigation failed") or msg.startswith("navigation timeout"):
+                    raise InteractiveError(f"page open failed: {msg}") from exc
+                raise InteractiveError(f"browser launch failed: {msg}") from exc
             session.pages = [page]
             session.active = 0
             self._watch_popups(session, page)
@@ -179,6 +232,103 @@ class InteractiveSessionManager:
             # Durable record for the owner UI.
             self.windows.create("interactive", "kdspy", ttl)
             return session
+
+    # ------------------------------------------------------- sign-in detection
+    # URL patterns that mean "the owner is still inside the sign-in flow".
+    # Used only to AVOID spurious DOM classification while the page sits on
+    # signin/captcha/OTP forms — the signed-in verdict itself comes from the
+    # real DOM classifier (AmazonAuthManager.classify_live), never from URLs.
+    _AMAZON_SIGNIN_MARKS = ("/ap/signin", "/ap/cvf", "/ap/mfa", "/signin", "/gp/sign-in")
+
+    # DOM classification costs a page evaluation; on a 2-core box we throttle
+    # it to once per second per session.
+    _DETECT_INTERVAL_SECONDS = 1.0
+
+    def _detect_amazon_signin(self, session: "InteractiveSession") -> None:
+        """Guard + throttle for the async sign-in watcher (see _watch_amazon_signin)."""
+        if self.amazon_auth is None or session.purpose != "amazon_signin":
+            return
+        now = time.monotonic()
+        if now - self._last_detect_at < self._DETECT_INTERVAL_SECONDS:
+            return
+        self._last_detect_at = now
+        # Fire-and-forget: a slow classify must never delay frame streaming.
+        if self._detect_task is not None and not self._detect_task.done():
+            return  # a classification is already running
+        self._detect_task = asyncio.get_running_loop().create_task(
+            self._watch_amazon_signin(session)
+        )
+
+    def _persist_auth_status(self, auth: AmazonAuthManager, status: str, url: str) -> None:
+        """Write the durable auth status, but only when it actually changed.
+
+        The watcher classifies up to once a second; the durable store is for
+        state, not telemetry. A repeated identical status is skipped — EXCEPT
+        confirmed, which is always (re)written so the completion moment and
+        its URL evidence land durably even if an earlier write raced.
+        """
+        if status == self._last_written_auth_status and status != AUTH_CONFIRMED:
+            return
+        self._last_written_auth_status = status
+        auth.auth_store.set(
+            ACCOUNT_AMAZON,
+            auth.profile,
+            status,
+            {"via": "interactive_signin", "url": scrub_url(url)},
+        )
+
+    async def _watch_amazon_signin(self, session: "InteractiveSession") -> None:
+        """Persist the durable Amazon auth state the moment it visibly changes.
+
+        The active page is classified with the SAME DOM criteria as the
+        standing auth check (AmazonAuthManager.classify_live: signed-in nav
+        chrome vs sign-in prompts vs captcha/OTP forms). While the page sits
+        on a sign-in/captcha/OTP URL the durable state only ever moves to
+        login_required; a confirmed state is never downgraded here (a normal
+        marketplace page viewed while already signed in must not read as
+        "signed out" just because its nav label didn't parse).
+
+        Failures never raise: detection is a background nicety and must not
+        disturb the interactive flow.
+        """
+        auth: AmazonAuthManager | None = self.amazon_auth
+        if auth is None or session.purpose != "amazon_signin":
+            return
+        page = session.page
+        if page is None:
+            return
+        try:
+            url = (getattr(page, "url", "") or "")
+            if not url or "amazon." not in urlparse(url).netloc.lower():
+                return
+            path = urlparse(url).path.lower()
+            if any(mark in path for mark in self._AMAZON_SIGNIN_MARKS):
+                # Still inside the sign-in/captcha/OTP flow — reflect that
+                # unless a confirmed state is already recorded.
+                if auth.current_state().status != AUTH_CONFIRMED:
+                    self._persist_auth_status(auth, AUTH_LOGIN_REQUIRED, url)
+                return
+            mkt = marketplace_from_url(url)
+            if mkt is None:
+                return
+            # Bounded: a hung page must never pin the watcher task forever
+            # (a pinned task would suppress all later detections).
+            check = await asyncio.wait_for(auth.classify_live(page, mkt), timeout=12.0)
+            if check.status == AUTH_CONFIRMED:
+                self._last_written_auth_status = None  # completion is always recorded
+                self._persist_auth_status(auth, AUTH_CONFIRMED, url)
+            elif (
+                auth.current_state().status == AUTH_CONFIRMED
+                and check.status in (AUTH_UNKNOWN, AUTH_LOGIN_REQUIRED)
+            ):
+                # Never downgrade a confirmed state on ambiguous evidence
+                # (nav label not parsed, marketplace home without account
+                # chrome). Confirmed until a real sign-in form is the page.
+                return
+            else:
+                self._persist_auth_status(auth, check.status, url)
+        except Exception:
+            pass  # detection must never break the interactive session
 
     def _watch_popups(self, session: InteractiveSession, page: Any) -> None:
         """Track tabs the site opens (target=_blank / window.open).
@@ -211,10 +361,13 @@ class InteractiveSessionManager:
         page = await self.browser.new_page(interactive=True)
         try:
             if purpose == "amazon_signin":
-                await self.browser.navigate(page, f"{mkt.base_url}/")
+                # The canonical /ap/signin form: no homepage detour, no
+                # reliance on the homepage's sign-in affordances.
+                await self.browser.navigate(page, AMAZON_SIGNIN_URL)
             elif purpose == "kdspy_setup":
-                # KDSpy activation happens on its own site; start neutral.
-                await self.browser.navigate(page, "https://www.kdspy.com/")
+                # The KDSpy subscription sign-in lives on the member portal —
+                # start there, not on the kdspy.com landing page.
+                await self.browser.navigate(page, KDSPY_LOGIN_URL)
         except Exception:
             # Never leave a half-navigated page behind: it would make the
             # next start believe research is busy.
@@ -227,6 +380,11 @@ class InteractiveSessionManager:
         s = self.current()
         if s is None or s.status != "open" or s._page is None:
             return None
+        # Every streamed frame is also a chance to notice the sign-in
+        # completed (the owner sees the chip flip without extra taps).
+        # Fire-and-forget ONLY: awaiting the classify here would make a slow
+        # page evaluation stall the frame stream itself.
+        self._detect_amazon_signin(s)
         try:
             return await s._page.screenshot(type="jpeg", quality=62)
         except Exception:
@@ -301,6 +459,11 @@ class InteractiveSessionManager:
             s.last_title = (await page.title()) or ""
         except Exception:
             pass
+        # Navigations (sign-in submit, OTP detour, marketplace redirect) are
+        # the other moment the auth state can flip. Fire-and-forget: the next
+        # frame poll (~1s later) surfaces the flip, and an action must never
+        # block on a page evaluation.
+        self._detect_amazon_signin(s)
         return s
 
     # -------------------------------------------------------------------- end

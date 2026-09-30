@@ -7,7 +7,7 @@
 #   Installs 3proxy (tiny, auditable CONNECT proxy), generates a strong
 #   random username+password, binds the proxy to BOTH IPv4 and IPv6 (so
 #   IPv6-only hosts like brunhild.challenges.cloudflare.com are reachable —
-#   the exact failure Webshare's gateway had), locks the firewall to SSH +
+#   the exact failure some commercial proxy gateways had), locks the firewall to SSH +
 #   the proxy port, enables IPv6 in sysctl, and installs a systemd service
 #   that survives reboots.
 #

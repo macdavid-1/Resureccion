@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <title>Resurrección</title>
-<link rel="stylesheet" href="/static/styles.css?v=5">
+<link rel="stylesheet" href="/static/styles.css?v=6">
 </head>
 <body>
 <div id="app">
@@ -142,6 +142,12 @@
             <div class="section" id="ws-trace-empty" hidden>
               <p class="muted" style="font-size:0.84rem; margin:0">Waiting for the agent to report activity…</p>
             </div>
+            <div class="owner-msg-bar">
+              <input id="owner-msg-input" type="text" maxlength="2000" autocomplete="off"
+                     placeholder="Type a note for the agent — it will read it without stopping">
+              <button id="owner-msg-send" class="btn small primary">Send</button>
+            </div>
+            <div class="owner-msg-hint muted" id="owner-msg-hint" hidden></div>
           </div>
 
           <div class="panel mt14">
@@ -272,6 +278,14 @@
               <div class="muted" style="font-size:0.72rem; margin-top:6px">The device dials out — no port forwarding. If it goes offline, research continues through your configured proxy (or direct), and switches back automatically. Tracker/ad hosts are blocked before any request touches your device's network.</div>
             </div>
           </div>
+          <div class="set-row set-col">
+            <div>
+              <div class="set-k">Browser egress</div>
+              <div class="set-d" id="set-egress-state">Checking…</div>
+              <div class="muted mono" id="set-egress-note" style="font-size:0.72rem; margin-top:4px" hidden></div>
+            </div>
+            <span class="chip" id="set-egress-chip">—</span>
+          </div>
           <div class="set-row">
             <div><div class="set-k">Marketplaces configured</div>
               <div class="set-d">Available to the research agent</div></div>
@@ -337,7 +351,7 @@
       <img id="rb-frame" alt="Remote browser">
       <div class="rb-off" id="rb-off">Starting remote browser…</div>
     </div>
-    <div class="rb-hint">Tap the page to click · keyboard opens for text fields</div>
+    <div class="rb-hint" id="rb-hint">Tap the page to click · keyboard opens for text fields</div>
   </div>
   <div class="rb-input-bar">
     <input id="rb-text" type="text" autocomplete="off" placeholder="Type text, press ➤ then keys if needed">
@@ -351,6 +365,6 @@
     <button class="btn small" data-key="Control+a">Select all</button>
   </div>
 </div>
-<script src="/static/app.js?v=5"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>

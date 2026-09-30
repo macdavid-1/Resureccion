@@ -73,6 +73,7 @@ def build_user_prompt(
     timing: PhaseTiming,
     images_note: str = "",
     screenshot_attached: bool = False,
+    owner_messages: list[str] | None = None,
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -117,6 +118,20 @@ def build_user_prompt(
     if prior_phase_outputs:
         parts.append(
             "\nPRIOR PHASE DECISIONS: " + _compact(prior_phase_outputs, limit=4000)
+        )
+
+    # --- owner messages (durable mid-research guidance) ---------------------
+    # Every note the owner has ever typed during this session, re-included on
+    # every iteration: delivery never interrupts the run and no line of
+    # context is ever lost. Messages marked [new] arrived since the last
+    # iteration and have just been consumed exactly-once.
+    if owner_messages:
+        rendered = [f"[new] {m}" if i == len(owner_messages) - 1 else m for i, m in enumerate(owner_messages)]
+        parts.append(
+            "\nOWNER GUIDANCE (direct messages from the session owner; they "
+            "remain authoritative for the rest of the research — follow any "
+            "new instruction in your next actions and analyses): "
+            + _compact(rendered, limit=2000)
         )
 
     # --- timing + anti-stall -------------------------------------------------

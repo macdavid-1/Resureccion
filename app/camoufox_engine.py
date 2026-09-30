@@ -1,21 +1,18 @@
 """Camoufox engine — a real Firefox with anti-detect spoofing at the C++ layer.
 
-Resurrección's research browser can run on two engines:
+Resurrección's research browser runs on exactly ONE engine:
 
-- ``chromium`` — Playwright's bundled Chromium. Required for Chrome MV3
-  extensions (KDSpy Pro) and supports CDP-based per-page mobile emulation.
 - ``camoufox`` — Camoufox (Firefox fork) via ``camoufox.async_api``. Fingerprint
   consistency (canvas/audio/fonts/WebGL/timezone/locale) is enforced natively by
-  the browser binary, so the anti-detect surface stops depending on JS patches
+  the browser binary, so the anti-detect surface never depends on JS patches
   and the whole "why was the tap refused" class of Chromium headless tells goes
   away. Cross-origin CAPTCHA iframes (Turnstile) are clickable thanks to the
   engine's ``disable_coop`` option.
 
 Everything specific to the Camoufox engine lives in this module so
-``app/browser_manager.py`` stays engine-agnostic: it asks this module for
-launch kwargs and applies them through ``camoufox.async_api.AsyncNewBrowser``.
-When camoufox is not installed, the module degrades to ``False`` and callers
-fall back to Chromium with a clear status reason.
+``app/browser_manager.py`` stays lifecycle-focused: it asks this module for
+launch kwargs and applies them through ``camoufox.async_api``. When camoufox
+is not installed there is no fallback — launch fails with a precise fix.
 """
 
 from __future__ import annotations
@@ -127,7 +124,8 @@ def firefox_ua(version: str = "130.0", platform: str = "windows") -> str:
 
 # --------------------------------------------------------------------------- prefs
 # Firefox prefs for the research browser. Same intents as app/privacy.py's
-# Chromium flags, expressed as about:config prefs (Chromium-only flags like
+# Firefox prefs for the research browser. Same intents the old Chromium flags
+# served, expressed as about:config prefs (Chromium-only flags like
 # --webrtc-ip-handling-policy do not exist in Firefox; media.peerconnection.*
 # covers the same leak vector).
 FIREFOX_USER_PREFS: dict[str, Any] = {
@@ -158,15 +156,35 @@ FIREFOX_USER_PREFS: dict[str, Any] = {
     # Long-run stability under the 2-core budget.
     "dom.ipc.processCount": 2,
     "browser.tabs.unloadOnLowMemory": True,
+    # Rate-limited proxies: a page load opens many tunnels at once, and the
+    # owner's CONNECT bridge answers bursts with HTTP 429 (probed: 30
+    # sequential CONNECTs → all 200, 60 parallel → 7× 429). Firefox maps a
+    # non-200 CONNECT reply to NS_ERROR_PROXY_CONNECTION_REFUSED, which made
+    # rich pages (Amazon sign-in = dozens of subresource hosts) fail while
+    # single navigations passed. These prefs cap how aggressively Firefox
+    # opens tunnels to ONE proxy host: fewer parallel CONNECTs, no burst, and
+    # pending requests queue politely instead of tripping the limit.
+    "network.http.max-persistent-connections-per-proxy": 4,
+    "network.http.max-connections-per-server": 6,
+    "network.http.request.max-start-delay": 10,
+    "network.http.spdy.enabled": False,
+    "network.http.http2.enabled": False,
+    "network.http.speculative-parallel-limit": 0,
+    "network.predictor.enabled": False,
+    "network.prefetch-next": False,
+    # Pace request OPENING (not just cap parallelism): without pacing, the
+    # first contentful paint still emits a sub-millisecond tunnel burst that
+    # a rate-limited bridge can 429. Pacing spreads those opens out.
+    "network.http.pacing.requests.enabled": True,
+    "network.http.pacing.requests.min-parallelism": 1,
 }
 
 
 def interactive_ua(config: Config) -> str:
     """Mobile UA for owner-driven interactive pages, Firefox-shaped.
 
-    The Chromium pipeline used a Chrome-on-Android UA for interactive pages.
-    Camoufox is Firefox — a Chrome UA would contradict the engine itself (an
-    instant tell). We keep the Android intent (sites serve their touch
+    The engine is Firefox — a Chrome UA would contradict the engine itself
+    (an instant tell). We keep the Android intent (sites serve their touch
     layouts) as a Firefox-mobile UA.
     """
     ua = config.browser_interactive_user_agent
@@ -243,15 +261,26 @@ def load_or_generate_fingerprint(config: Config) -> "Fingerprint":
     return fp
 
 
-def _proxy_kwargs(config: Config, relay_addr: str | None) -> dict[str, Any]:
-    """Egress selection shared with the Chromium path: relay shim → proxy.
+def _proxy_kwargs(
+    config: Config,
+    relay_addr: str | None,
+    egress_mode: str | None = None,
+) -> dict[str, Any]:
+    """Egress selection for the research browser: relay shim → proxy.
 
     The proxy spec's scheme is preserved (socks5:// for a Cloudflare WARP
-    bridge on a VPS, http:// for Webshare-style CONNECT proxies). Firefox
-    applies SOCKS5 username/password auth natively.
+    bridge on a VPS, http:// for a plain CONNECT proxy). Firefox applies
+    SOCKS5 username/password auth natively.
+
+    ``egress_mode`` is the launch-time health-gate verdict from
+    BrowserManager: when it is "direct" (a configured BROWSER_PROXY was
+    unreachable) the proxy must NOT be wired in — that is the
+    NS_ERROR_PROXY_CONNECTION_REFUSED failure mode.
     """
     if relay_addr:
         return {"proxy": {"server": f"http://{relay_addr}"}}
+    if egress_mode == "direct":
+        return {}
     if config.browser_proxy:
         server, username, password = parse_proxy_spec(config.browser_proxy)
         if server:
@@ -268,14 +297,15 @@ def launch_kwargs(
     *,
     relay_addr: str | None = None,
     addons: list[str] | None = None,
+    egress_mode: str | None = None,
 ) -> dict[str, Any]:
     """Playwright Firefox launch options for the Camoufox engine.
 
     Returns kwargs for ``camoufox.async_api.AsyncNewBrowser`` (which forwards
     to ``firefox.launch_persistent_context``): the stable profile fingerprint,
     Firefox privacy prefs, the egress setup (relay shim → owner proxy →
-    direct) that the Chromium path uses, and any Firefox add-ons (e.g. the
-    KDSpy Firefox add-on, which the engine loads natively).
+    direct), and any Firefox add-ons (e.g. the KDSpy Firefox add-on, which
+    the engine loads natively).
     """
     if not CAMOUFOX_AVAILABLE:
         raise RuntimeError("camoufox is not installed")
@@ -310,7 +340,7 @@ def launch_kwargs(
         # coherent with the exit network (a US IP with a Paris clock is a
         # classic tell). Requires the geoip extra; guarded by config.
         kwargs["geoip"] = True
-    kwargs.update(_proxy_kwargs(config, relay_addr))
+    kwargs.update(_proxy_kwargs(config, relay_addr, egress_mode))
 
     kwargs["fingerprint"] = load_or_generate_fingerprint(config)
     # Firefox add-ons (extracted dirs with a manifest.json): Camoufox loads
@@ -321,36 +351,56 @@ def launch_kwargs(
     return kwargs
 
 
-def apply_interactive_emulation(config: Config, page: Any) -> None:
-    """Owner-driven pages: Firefox-mobile UA so sites serve touch layouts.
+async def apply_interactive_emulation(config: Config, page: Any) -> None:
+    """Owner-driven pages: a mobile Firefox identity that holds at EVERY layer.
 
-    CDP does not exist on Firefox, so the Chromium per-page CDP path cannot be
-    used. The page-level lever that matters for the owner's tap experience is
-    the UA (sites serve their touch layouts); the 1:1 viewport itself is
-    engine-independent and stays in browser_manager (set_viewport_size).
+    CDP does not exist on Firefox, so a per-page CDP emulation path cannot be
+    used. Two coordinated overrides make Amazon (and other sites) serve their
+    genuine mobile layouts inside the 390px interactive viewport:
+
+    1. HTTP header rewrite (page.route + route.fallback): without it the
+       request headers keep the profile's DESKTOP UA while only the
+       JS-visible UA is mobile — sites that sniff the header server-side
+       (Amazon does) then serve a desktop layout into a phone-sized viewport.
+       That is exactly the "sign-in browser is too zoomed in" report: a
+       1440px page rendered at 390px. Per-page UA properties do NOT change
+       request headers on camoufox (verified by probe); a route rewrite does.
+       IMPORTANT — the rewrite MUST use ``route.fallback(headers=…)`` and
+       NEVER ``route.continue_(headers=…)``: on Firefox, continuing a
+       request with a modified headers dict reissues it through the
+       interception layer in a way that breaks the proxy CONNECT (every
+       navigation then dies with NS_ERROR_PROXY_CONNECTION_REFUSED —
+       reproduced deterministically, probed to the single-request level:
+       plain continue passes, fallback passes, ANY headers-dict continue
+       fails). fallback hands the request back to routing with the new
+       headers and keeps the tunnel intact.
+    2. navigator.userAgent init script: keeps the JS-visible identity mobile
+       and coherent with the rewritten headers.
+
+    Failures are non-fatal: the page keeps the profile-level spoofed UA.
     """
     ua = interactive_ua(config)
+
+    async def _mobile_ua_header(route: Any) -> None:
+        try:
+            headers = dict(route.request.headers)
+            headers["User-Agent"] = ua
+            await route.fallback(headers=headers)
+        except Exception:
+            try:
+                await route.fallback()
+            except Exception:
+                pass  # page navigated away mid-request
+
+    try:
+        await page.route("**/*", _mobile_ua_header)
+    except Exception:
+        pass  # page may already be closing; header spoof is best-effort
     script = (
         "(() => { try { Object.defineProperty(navigator, 'userAgent', "
         f"{{ get: () => {json.dumps(ua)}, configurable: true }}); }} catch (e) {{}} )();"
     )
     try:
-        coro = page.add_init_script(script)
-        if asyncio.iscoroutine(coro):
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                coro.close()
-                return
-            loop.create_task(_swallow(coro))
-    except Exception:
-        # add_init_script failing is non-fatal; the page just keeps the
-        # profile-level spoofed UA (still a plausible Firefox UA).
-        pass
-
-
-async def _swallow(coro: Any) -> None:
-    try:
-        await coro
+        await page.add_init_script(script)
     except Exception:
         pass

@@ -17,11 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.privacy import (
-    PRIVACY_CHROMIUM_ARGS,
-    is_blocked_host,
-    relay_launch_args,
-)
+from app.privacy import is_blocked_host
 from app.relay import RelayError, RelayHub, TunnelError, _dial_via_proxy
 from app.static_cache import render_index
 
@@ -56,23 +52,14 @@ def test_blocklist_handles_ports_and_case() -> None:
     assert is_blocked_host("www.googleadservices.com")
 
 
-def test_privacy_launch_args_present_and_deduped() -> None:
-    args = relay_launch_args(["--no-sandbox"])
-    joined = " ".join(args)
-    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in joined
-    assert "--disable-background-networking" in joined
-    # Applying twice never duplicates.
-    args2 = relay_launch_args(args)
-    assert len(args2) == 0
-    # And the canonical tuple is non-empty and unique.
-    assert len(PRIVACY_CHROMIUM_ARGS) == len(set(PRIVACY_CHROMIUM_ARGS))
+def test_engine_prefs_carry_the_privacy_hardening() -> None:
+    """The hardening that used to be Chromium launch flags lives in the
+    camoufox engine's Firefox prefs (WebRTC lockdown, telemetry off, DNT/GPC)."""
+    from app.camoufox_engine import FIREFOX_USER_PREFS
 
-
-def test_relay_launch_args_dedupes_partial_overlap() -> None:
-    first = relay_launch_args(None)
-    # Pre-seed one arg with different value → that one is re-added? No: the
-    # dedupe is exact-match, so a different flag value is treated as absent.
-    assert isinstance(first, list)
+    assert FIREFOX_USER_PREFS["media.peerconnection.enabled"] is False
+    assert FIREFOX_USER_PREFS["toolkit.telemetry.enabled"] is False
+    assert FIREFOX_USER_PREFS["privacy.globalprivacycontrol.enabled"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -40,16 +40,18 @@ def test_engine_config_default_is_camoufox(monkeypatch: pytest.MonkeyPatch) -> N
     assert c.browser_engine == "camoufox"
 
 
-def test_engine_config_accepts_chromium(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_engine_config_hard_refuses_chromium(monkeypatch: pytest.MonkeyPatch) -> None:
+    """There is exactly ONE engine: asking for anything else — including the
+    retired chromium engine — is a boot error, never a silent fallback."""
     monkeypatch.setenv("BROWSER_ENGINE", "chromium")
-    c = Config()
-    assert c.browser_engine == "chromium"
+    with pytest.raises(RuntimeError, match="Camoufox only"):
+        Config()
 
 
 def test_engine_config_rejects_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BROWSER_ENGINE", "webkit")
-    c = Config()
-    assert c.browser_engine == "camoufox"
+    with pytest.raises(RuntimeError, match="Camoufox only"):
+        Config()
 
 
 @requires_camoufox

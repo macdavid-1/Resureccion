@@ -1,21 +1,23 @@
-"""KDSpy Pro extension manager.
+"""KDSpy Pro Firefox add-on manager.
 
-The owner has a legitimate lifetime KDSpy Pro license. Resurrección loads the
-actual unpacked extension into Chromium — it never fakes KDSpy data or scrapes
-an imagined API. This module:
+The owner has a legitimate KDSpy Pro subscription. Resurrección loads the
+actual KDSpy Firefox add-on into the Camoufox engine — it never fakes KDSpy
+data or scrapes an imagined API. This module:
 
-- accepts the extension from the owner as a ZIP upload or a multi-file upload
-  (mobile file pickers cannot send folders), installing it atomically into the
-  unpacked extension directory,
-- validates the installed directory (manifest.json),
-- records extension state/version metadata durably,
-- produces the Chromium launch arguments required to load it,
-- exposes hooks used by the live browser manager to verify the extension's
-  service worker / background page actually started.
+- installs the add-on one-tap from Mozilla Add-ons (owner-verified AMO URL)
+  or accepts it from the owner as an XPI/ZIP upload or a multi-file upload
+  (mobile file pickers cannot send folders), always into the same extracted
+  add-on directory,
+- validates the installed directory (manifest.json) before any swap — a
+  broken upload never clobbers a working install,
+- records add-on state/version metadata durably,
+- produces the ``addons`` launch argument the Camoufox engine loads natively,
+- exposes hooks used by the browser manager to record the add-on as active
+  after a successful launch.
 
-The extension directory is $KDSPY_EXTENSION_PATH (default:
-$DATA_DIR/extensions/kdspy). A browser restart is required after install so
-Chromium picks the extension up at launch.
+The add-on directory is $KDSPY_FIREFOX_PATH (default:
+$DATA_DIR/extensions/kdspy-firefox). A browser restart is required after
+install so Camoufox picks the add-on up at launch.
 """
 from __future__ import annotations
 
@@ -36,23 +38,11 @@ from app.browser_store import (
 )
 from app.config import Config
 
-KDSPY_EXTENSION_NAME = "kdspy"
 KDSPY_FIREFOX_NAME = "kdspy-firefox"
 
 # KDSpy's Firefox add-on directory (app/camoufox_engine.py loads it into
-# Camoufox). Kept beside the Chromium unpacked extension directory.
+# Camoufox via its `addons` launch option).
 KDSPY_FIREFOX_DIRNAME = "kdspy-firefox"
-
-# The official Chrome Web Store product. A fetched package must declare this
-# name (case/punctuation-insensitive) — combined with fetching under the
-# pinned listing slug, a swapped/spoofed package cannot install.
-KDSPY_STORE_NAME = "kdspy"
-
-
-def _webstore_id_default() -> str:
-    from app.crx_store import KDSPY_WEBSTORE_ID_DEFAULT
-
-    return KDSPY_WEBSTORE_ID_DEFAULT
 
 # Upper bound for an extension bundle — extensions are small; anything larger
 # is wrong (or hostile).
@@ -70,6 +60,7 @@ _EXTENSION_FILE_SUFFIXES = {
     # Mozilla signed-add-on metadata (META-INF/):
     ".manifest", ".sig", ".mf", ".sf", ".rsa",
 }
+
 
 class KDSpyError(Exception):
     pass
@@ -124,7 +115,7 @@ def _parse_manifest(path: Path) -> ExtensionManifestInfo:
 
 
 class KDSpyManager:
-    """Validates and registers the KDSpy Pro unpacked extension."""
+    """Validates and registers the KDSpy Pro Firefox add-on."""
 
     def __init__(self, config: Config, store: ExtensionStore) -> None:
         self.config = config
@@ -145,256 +136,41 @@ class KDSpyManager:
             return []
         return [str(self.firefox_addon_path)]
 
+    # ---------------------------------------------------------------- install
     def install_firefox_xpi(self, data: bytes) -> ExtensionManifestInfo:
         """Install an owner-supplied KDSpy Firefox add-on (XPI/ZIP).
 
         The XPI is exactly a ZIP of the unpacked add-on (optionally one level
         deep), so it re-uses the identical zip-slip / file-type / manifest /
-        version defenses and atomic swap as the Chromium install paths, then
-        validates before swapping — a broken upload never clobbers a working
-        install. Camoufox (installed v0.5.6) loads the extracted dir natively
-        via its ``addons`` launch option.
+        version defenses and atomic swap as every other install source.
+        Camoufox loads the extracted dir natively via its ``addons`` launch
+        option.
         """
-        if not data:
-            raise ExtensionInstallError("empty upload")
-        if len(data) > MAX_EXTENSION_BYTES:
-            raise ExtensionInstallError("upload too large (max 64 MB)")
-        try:
-            zf = zipfile.ZipFile(__import__("io").BytesIO(data))
-        except zipfile.BadZipFile as exc:
-            raise ExtensionInstallError("not a valid XPI/ZIP file") from exc
-        with zf:
-            names = zf.namelist()
-            if not names:
-                raise ExtensionInstallError("XPI is empty")
-            manifest_name = self._pick_manifest(names)
-            if manifest_name is None:
-                raise ExtensionInstallError("manifest.json not found in XPI")
-            self._check_zip_entries_firefox(zf, names)
-            target_dir = self.firefox_addon_path
-            staging = target_dir.parent / f".{KDSPY_FIREFOX_DIRNAME}-staging"
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-            try:
-                root = Path(manifest_name).parent
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    p = Path(info.filename)
-                    rel = p.relative_to(root) if root != Path(".") else p
-                    target = staging / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(zf.read(info))
-                info_obj = _parse_manifest(staging / "manifest.json")
-                # Firefox add-ons are MV2 by convention; accept MV2/MV3 and
-                # still require a sane manifest (name/version/bg shape).
-                if info_obj.manifest_version not in (2, 3):
-                    raise ExtensionInstallError(
-                        f"unsupported manifest_version {info_obj.manifest_version} for a Firefox add-on"
-                    )
-                min_ver = self.config.kdspy_expected_min_version
-                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
-                    raise ExtensionInstallError(
-                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
-                    )
-                self._swap_in_firefox(staging)
-            except ExtensionInstallError:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-            except KDSpyError as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(str(exc)) from exc
-            except Exception as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(f"install failed: {exc}") from exc
-        return info_obj
+        return self._install_payload(data, source="firefox_xpi")
 
-    def _check_zip_entries_firefox(self, zf: zipfile.ZipFile, names: list[str]) -> None:
-        """Zip-slip defense against the Firefox add-on target dir."""
-        base = self.firefox_addon_path.resolve()
-        for n in names:
-            p = Path(n)
-            if n.startswith("/") or ".." in p.parts:
-                raise ExtensionInstallError(f"unsafe path in XPI: {n!r}")
-            if n.startswith("__MACOSX"):
-                continue
-            if p.suffix.lower() not in _EXTENSION_FILE_SUFFIXES:
-                raise ExtensionInstallError(f"file type not allowed in add-on: {n!r}")
-            if len(p.parts) > 6:
-                raise ExtensionInstallError(f"entry nested too deep: {n!r}")
-            resolved = (base / p).resolve()
-            if base not in resolved.parents and resolved != base:
-                raise ExtensionInstallError(f"path escapes add-on directory: {n!r}")
-
-    def _swap_in_firefox(self, staging: Path) -> None:
-        """Atomically move the staged add-on dir into place (old kept as .bak)."""
-        parent = self.firefox_addon_path.parent
-        backup = parent / f".{KDSPY_FIREFOX_DIRNAME}-bak"
-        if backup.exists():
-            shutil.rmtree(backup)
-        if self.firefox_addon_path.exists():
-            self.firefox_addon_path.rename(backup)
-        staging.rename(self.firefox_addon_path)
-        shutil.rmtree(backup, ignore_errors=True)
-
-    # ------------------------------------------------------------- inspection
-    @property
-    def extension_path(self) -> Path:
-        return self.config.kdspy_extension_path
-
-    def is_configured(self) -> bool:
-        return self.extension_path.is_dir()
-
-    # ---------------------------------------------------------------- install
     def install_from_zip(self, data: bytes) -> ExtensionManifestInfo:
-        """Atomically install an uploaded ZIP (chrome web-store export style)."""
-        if not data:
-            raise ExtensionInstallError("empty upload")
-        if len(data) > MAX_EXTENSION_BYTES:
-            raise ExtensionInstallError("upload too large (max 64 MB)")
-        try:
-            zf = zipfile.ZipFile(__import__("io").BytesIO(data))
-        except zipfile.BadZipFile as exc:
-            raise ExtensionInstallError("not a valid ZIP file") from exc
-        with zf:
-            names = zf.namelist()
-            if not names:
-                raise ExtensionInstallError("ZIP is empty")
-            # Locate manifest.json at root or one level deep (export wrappers).
-            manifest_name = self._pick_manifest(names)
-            if manifest_name is None:
-                raise ExtensionInstallError("manifest.json not found in ZIP")
-            self._check_zip_entries(zf, names)
-            staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-            try:
-                root = Path(manifest_name).parent
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    p = Path(info.filename)
-                    rel = p.relative_to(root) if root != Path(".") else p
-                    target = staging / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(zf.read(info))
-                # Validate BEFORE swapping in — a broken upload never clobbers a
-                # working install.
-                info_obj = _parse_manifest(staging / "manifest.json")
-                min_ver = self.config.kdspy_expected_min_version
-                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
-                    raise ExtensionInstallError(
-                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
-                    )
-                self._swap_in(staging)
-            except ExtensionInstallError:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-            except KDSpyError as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(str(exc)) from exc
-            except Exception as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(f"install failed: {exc}") from exc
-        return self.validate_installation_after_install()
+        """Install an uploaded ZIP into the Firefox add-on directory.
 
-    async def install_from_webstore(
-        self, *, fetch: "Callable[[], Awaitable[bytes]] | None" = None
-    ) -> ExtensionManifestInfo:
-        """One-tap install: fetch the official CRX from Google's CDN.
-
-        The package must be a CRX3 whose embedded public key hashes to the
-        pinned store ID; the unpacked ZIP then passes the identical zip-slip,
-        file-type, manifest, and version defenses as an owner upload before
-        the atomic swap. KDSpy is a free public store item — this fetches the
-        exact package Chrome itself installs, no license data involved.
+        Manual fallback with the same target and defenses as the XPI path
+        (kept for owners whose AMO access is restricted). The manifest is
+        validated before the swap; a package that is not a loadable Firefox
+        add-on is refused, never half-installed.
         """
-        import io as _io
-
-        from app.crx_store import CrxError, fetch_crx, verify_crx
-
-        ext_id = (
-            self.config.kdspy_webstore_id
-            or _webstore_id_default()
-        )
-        try:
-            if fetch is not None:
-                data = await fetch()
-            else:
-                data = await fetch_crx(ext_id)
-            crx = verify_crx(data, ext_id)
-        except CrxError as exc:
-            raise ExtensionInstallError(f"Web Store package rejected: {exc}") from exc
-        except Exception as exc:
-            raise ExtensionInstallError(
-                f"could not download the extension from the Chrome Web Store: {exc}"
-            ) from exc
-        try:
-            zf = zipfile.ZipFile(_io.BytesIO(crx.zip_bytes))
-            names = zf.namelist()
-            if not names:
-                raise ExtensionInstallError("package payload is empty")
-            manifest_name = self._pick_manifest(names)
-            if manifest_name is None:
-                raise ExtensionInstallError("manifest.json not found in package payload")
-            self._check_zip_entries(zf, names)
-            staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-            try:
-                root = Path(manifest_name).parent
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    p = Path(info.filename)
-                    rel = p.relative_to(root) if root != Path(".") else p
-                    target = staging / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(zf.read(info))
-                info_obj = _parse_manifest(staging / "manifest.json")
-                if _store_name_of(info_obj.name) != KDSPY_STORE_NAME:
-                    raise ExtensionInstallError(
-                        f"package declares {info_obj.name!r}, not the pinned "
-                        f"{KDSPY_STORE_NAME.title()} store listing — refused"
-                    )
-                min_ver = self.config.kdspy_expected_min_version
-                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
-                    raise ExtensionInstallError(
-                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
-                    )
-                self._swap_in(staging)
-            except ExtensionInstallError:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-            except KDSpyError as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(str(exc)) from exc
-            except Exception as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(f"install failed: {exc}") from exc
-        except zipfile.BadZipFile as exc:
-            raise ExtensionInstallError("package payload is not a valid ZIP") from exc
-        return self.validate_installation_after_install()
+        return self._install_payload(data, source="zip_upload")
 
     async def install_from_amo(
         self, *, fetch: "Callable[[], Awaitable[bytes]] | None" = None
     ) -> ExtensionManifestInfo:
         """One-tap install: fetch the KDSpy Firefox add-on from Mozilla Add-ons.
 
-        The camoufox engine's equivalent of ``install_from_webstore``: the
-        owner-verified AMO download URL is pinned in config
+        The owner-verified AMO download URL is pinned in config
         (``KDSPY_AMO_URL``), the XPI is fetched from addons.mozilla.org,
         and the package then passes the identical zip-slip, file-type,
         manifest, and version defenses as an owner upload before the atomic
         swap. AMO serves the exact package Firefox itself installs; the
-        browser is opened for the kdspy.com sign-in afterwards (subscription
+        browser is opened for the KDSpy sign-in afterwards (subscription
         activation), never for the download.
         """
-        import io as _io
-
         url = self.config.kdspy_amo_url
         if not url:
             raise ExtensionInstallError(
@@ -417,60 +193,20 @@ class KDSpyManager:
                 f"could not download the add-on from Mozilla Add-ons: {exc}"
             ) from exc
         try:
-            zf = zipfile.ZipFile(_io.BytesIO(data))
-            names = zf.namelist()
-            if not names:
-                raise ExtensionInstallError("XPI payload is empty")
-            manifest_name = self._pick_manifest(names)
-            if manifest_name is None:
-                raise ExtensionInstallError("manifest.json not found in XPI payload")
-            self._check_zip_entries_firefox(zf, names)
-            staging = self.firefox_addon_path.parent / f".{KDSPY_FIREFOX_DIRNAME}-staging"
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-            try:
-                root = Path(manifest_name).parent
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    p = Path(info.filename)
-                    rel = p.relative_to(root) if root != Path(".") else p
-                    target = staging / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(zf.read(info))
-                info_obj = _parse_manifest(staging / "manifest.json")
-                if info_obj.manifest_version not in (2, 3):
-                    raise ExtensionInstallError(
-                        f"unsupported manifest_version {info_obj.manifest_version} for a Firefox add-on"
-                    )
-                min_ver = self.config.kdspy_expected_min_version
-                if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
-                    raise ExtensionInstallError(
-                        f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
-                    )
-                self._swap_in_firefox(staging)
-            except ExtensionInstallError:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-            except KDSpyError as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(str(exc)) from exc
-            except Exception as exc:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise ExtensionInstallError(f"install failed: {exc}") from exc
+            return self._install_payload(data, source="mozilla_addons")
         except zipfile.BadZipFile as exc:
             raise ExtensionInstallError("XPI payload is not a valid ZIP") from exc
-        # Same contract as install_from_webstore: the parsed manifest of what
-        # is now on disk (durable state was recorded by firefox_addon_state).
-        return _parse_manifest(self.firefox_addon_path / "manifest.json")
 
     def install_from_files(self, files: list[tuple[str, BinaryIO]]) -> ExtensionManifestInfo:
-        """Install from a multi-file upload (folder picked file-by-file)."""
+        """Install from a multi-file upload (mobile folder pickers).
+
+        Extracted add-on folders, file-by-file — same staging, validation,
+        and atomic swap as the packaged paths.
+        """
         if not files:
             raise ExtensionInstallError("no files uploaded")
         total = 0
-        staging = self.extension_path.parent / f".kdspy-staging-{self.extension_path.name}"
+        staging = self._staging_dir()
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True)
@@ -482,7 +218,7 @@ class KDSpyManager:
                     raise ExtensionInstallError(f"unsafe path in upload: {rel_name!r}")
                 suffix = Path(rel_name).suffix.lower()
                 if suffix not in _EXTENSION_FILE_SUFFIXES:
-                    raise ExtensionInstallError(f"file type not allowed in extension: {rel_name!r}")
+                    raise ExtensionInstallError(f"file type not allowed in add-on: {rel_name!r}")
                 target = staging / rel_name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("wb") as out:
@@ -498,12 +234,7 @@ class KDSpyManager:
                     seen_manifest = True
             if not seen_manifest:
                 raise ExtensionInstallError("manifest.json missing from upload")
-            info_obj = _parse_manifest(staging / "manifest.json")
-            min_ver = self.config.kdspy_expected_min_version
-            if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
-                raise ExtensionInstallError(
-                    f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
-                )
+            info_obj = self._validate_staging(staging)
             self._swap_in(staging)
         except ExtensionInstallError:
             shutil.rmtree(staging, ignore_errors=True)
@@ -516,6 +247,76 @@ class KDSpyManager:
             raise ExtensionInstallError(f"install failed: {exc}") from exc
         return self.validate_installation_after_install()
 
+    # ------------------------------------------------------------ shared core
+    def _staging_dir(self) -> Path:
+        return self.firefox_addon_path.parent / f".{KDSPY_FIREFOX_DIRNAME}-staging"
+
+    def _install_payload(self, data: bytes, *, source: str) -> ExtensionManifestInfo:
+        """Validate an XPI/ZIP payload and atomically install it.
+
+        Every install source funnels through here so the defenses exist
+        exactly once: zip-slip, file-type, depth, manifest shape, minimum
+        version — validated on the STAGING copy before the atomic swap.
+        """
+        if not data:
+            raise ExtensionInstallError("empty upload")
+        if len(data) > MAX_EXTENSION_BYTES:
+            raise ExtensionInstallError("upload too large (max 64 MB)")
+        try:
+            zf = zipfile.ZipFile(__import__("io").BytesIO(data))
+        except zipfile.BadZipFile as exc:
+            raise ExtensionInstallError("not a valid XPI/ZIP file") from exc
+        with zf:
+            names = zf.namelist()
+            if not names:
+                raise ExtensionInstallError("XPI is empty")
+            manifest_name = self._pick_manifest(names)
+            if manifest_name is None:
+                raise ExtensionInstallError("manifest.json not found in XPI")
+            self._check_zip_entries_firefox(zf, names)
+            staging = self._staging_dir()
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            try:
+                root = Path(manifest_name).parent
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    p = Path(info.filename)
+                    rel = p.relative_to(root) if root != Path(".") else p
+                    target = staging / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(info))
+                info_obj = self._validate_staging(staging)
+                self._swap_in(staging)
+            except ExtensionInstallError:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            except KDSpyError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(str(exc)) from exc
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ExtensionInstallError(f"install failed: {exc}") from exc
+        return self.validate_installation_after_install()
+
+    def _validate_staging(self, staging: Path) -> ExtensionManifestInfo:
+        """Manifest + version validation of the staged add-on (pre-swap)."""
+        info_obj = _parse_manifest(staging / "manifest.json")
+        # Firefox add-ons are MV2 by convention; accept MV2/MV3 and still
+        # require a sane manifest (name/version/bg shape).
+        if info_obj.manifest_version not in (2, 3):
+            raise ExtensionInstallError(
+                f"unsupported manifest_version {info_obj.manifest_version} for a Firefox add-on"
+            )
+        min_ver = self.config.kdspy_expected_min_version
+        if min_ver and _version_tuple(info_obj.version) < _version_tuple(min_ver):
+            raise ExtensionInstallError(
+                f"KDSpy version {info_obj.version} is below required minimum {min_ver}"
+            )
+        return info_obj
+
     def _pick_manifest(self, names: list[str]) -> str | None:
         roots = [n for n in names if Path(n).name == "manifest.json" and not n.startswith("__MACOSX")]
         if not roots:
@@ -525,91 +326,51 @@ class KDSpyManager:
             return None  # nested too deep — ambiguous bundle
         return shallowest
 
-    def _check_zip_entries(self, zf: zipfile.ZipFile, names: list[str]) -> None:
+    def _check_zip_entries_firefox(self, zf: zipfile.ZipFile, names: list[str]) -> None:
         """Zip-slip, depth, and file-type defense before any byte is written."""
-        base = self.extension_path.resolve()
+        base = self.firefox_addon_path.resolve()
         for n in names:
             p = Path(n)
             if n.startswith("/") or ".." in p.parts:
-                raise ExtensionInstallError(f"unsafe path in ZIP: {n!r}")
+                raise ExtensionInstallError(f"unsafe path in XPI: {n!r}")
             if n.startswith("__MACOSX"):
                 continue
             if p.suffix.lower() not in _EXTENSION_FILE_SUFFIXES:
-                raise ExtensionInstallError(f"file type not allowed in extension: {n!r}")
+                raise ExtensionInstallError(f"file type not allowed in add-on: {n!r}")
             if len(p.parts) > 6:
                 raise ExtensionInstallError(f"entry nested too deep: {n!r}")
             resolved = (base / p).resolve()
             if base not in resolved.parents and resolved != base:
-                raise ExtensionInstallError(f"path escapes extension directory: {n!r}")
+                raise ExtensionInstallError(f"path escapes add-on directory: {n!r}")
 
     def _swap_in(self, staging: Path) -> None:
-        """Atomically move the staged dir into place (old install kept as .bak)."""
-        parent = self.extension_path.parent
-        backup = parent / f".kdspy-bak-{self.extension_path.name}"
+        """Atomically move the staged add-on dir into place (old kept as .bak)."""
+        parent = self.firefox_addon_path.parent
+        backup = parent / f".{KDSPY_FIREFOX_DIRNAME}-bak"
         if backup.exists():
             shutil.rmtree(backup)
-        if self.extension_path.exists():
-            self.extension_path.rename(backup)
-        staging.rename(self.extension_path)
+        if self.firefox_addon_path.exists():
+            self.firefox_addon_path.rename(backup)
+        staging.rename(self.firefox_addon_path)
         shutil.rmtree(backup, ignore_errors=True)
 
     def validate_installation_after_install(self) -> ExtensionManifestInfo:
         """Re-validate on-disk state and refresh the durable record."""
         self.validate_installation()
-        return self.inspect_local()
+        return _parse_manifest(self.firefox_addon_path / "manifest.json")
 
     def remove(self) -> None:
-        if self.extension_path.exists():
-            shutil.rmtree(self.extension_path)
-
-    def inspect_local(self) -> ExtensionManifestInfo:
-        """Parse and validate the on-disk extension (no browser required)."""
-        path = self.extension_path
-        if not path.is_dir():
-            raise KDSpyError(
-                f"KDSpy extension not found at {path}. "
-                "Set KDSPY_EXTENSION_PATH or upload the unpacked extension there."
-            )
-        manifest_path = path / "manifest.json"
-        if not manifest_path.is_file():
-            raise KDSpyError(f"manifest.json missing under {path}")
-        info = _parse_manifest(manifest_path)
-        min_ver = self.config.kdspy_expected_min_version
-        if min_ver and _version_tuple(info.version) < _version_tuple(min_ver):
-            raise KDSpyError(
-                f"KDSpy version {info.version} is below required minimum {min_ver}"
-            )
-        return info
+        if self.firefox_addon_path.exists():
+            shutil.rmtree(self.firefox_addon_path)
 
     # ------------------------------------------------------------------ state
     def validate_installation(self) -> ExtensionState:
-        """Full local validation and durable state record (pre-launch)."""
-        if not self.is_configured():
-            return self.store.upsert(
-                KDSPY_EXTENSION_NAME,
-                self.profile,
-                status=EXT_NOT_CONFIGURED,
-                path=str(self.extension_path),
-                detail={"reason": "extension directory absent"},
-            )
-        try:
-            info = self.inspect_local()
-        except KDSpyError as exc:
-            return self.store.upsert(
-                KDSPY_EXTENSION_NAME,
-                self.profile,
-                status=EXT_FAILED,
-                path=str(self.extension_path),
-                detail={"error": str(exc)},
-            )
-        return self.store.upsert(
-            KDSPY_EXTENSION_NAME,
-            self.profile,
-            status=EXT_INSTALLED,
-            version=info.version,
-            path=str(self.extension_path),
-            detail={"manifest": info.to_safe_dict()},
-        )
+        """Full local validation and durable state record (pre-launch).
+
+        Single extension target: the Firefox add-on loaded by the Camoufox
+        engine (kept as the canonical validate entry point).
+        """
+        return self.firefox_addon_state()
 
     def record_firefox_runtime_validated(self, addon_path: str) -> ExtensionState:
         """Called by the browser manager once the Camoufox engine launched with
@@ -640,12 +401,22 @@ class KDSpyManager:
         """Full local validation of the Firefox add-on (pre-launch check).
         Records the result durably — a WRITE path."""
         if not self.firefox_addon_is_configured():
+            if self.firefox_addon_path.is_dir():
+                # A present-but-broken install dir (e.g. manifest.json deleted
+                # or a partially-extracted upload) is a FAILURE, not "absent".
+                return self.store.upsert(
+                    KDSPY_FIREFOX_NAME,
+                    self.profile,
+                    status=EXT_FAILED,
+                    path=str(self.firefox_addon_path),
+                    detail={"error": "add-on directory exists but manifest.json is missing"},
+                )
             return self.store.upsert(
                 KDSPY_FIREFOX_NAME,
                 self.profile,
                 status=EXT_NOT_CONFIGURED,
                 path=str(self.firefox_addon_path),
-                detail={"reason": "add-on not installed — upload the KDSpy XPI from Settings"},
+                detail={"reason": "add-on not installed — install from Mozilla Add-ons in Settings"},
             )
         try:
             info = _parse_manifest(self.firefox_addon_path / "manifest.json")
@@ -675,60 +446,22 @@ class KDSpyManager:
             },
         )
 
-    def record_runtime_validated(self, extension_id: str, service_worker_url: str) -> ExtensionState:
-        """Called by the browser manager once the SW is live in Chromium."""
-        current = self.store.get(KDSPY_EXTENSION_NAME, self.profile)
-        version = current.version if current else ""
-        return self.store.upsert(
-            KDSPY_EXTENSION_NAME,
-            self.profile,
-            status=EXT_VALIDATED,
-            version=version,
-            extension_id=extension_id,
-            path=str(self.extension_path),
-            detail={"service_worker_url": service_worker_url},
-        )
-
-    def record_runtime_failure(self, reason: str) -> ExtensionState:
-        current = self.store.get(KDSPY_EXTENSION_NAME, self.profile)
-        return self.store.upsert(
-            KDSPY_EXTENSION_NAME,
-            self.profile,
-            status=EXT_FAILED,
-            version=current.version if current else "",
-            extension_id=current.extension_id if current else "",
-            path=str(self.extension_path),
-            detail={"error": reason},
-        )
-
     def state(self) -> ExtensionState:
-        s = self.store.get(KDSPY_EXTENSION_NAME, self.profile)
-        if s is None:
-            return self.validate_installation()
-        return s
+        """The durable KDSpy record (the Firefox add-on is the only flavor)."""
+        return self.firefox_addon_state_stored()
 
     def firefox_addon_state_stored(self) -> ExtensionState:
         """READ path: the durable Firefox add-on record without re-upserting.
 
-        Mirrors ``state()`` for the chromium flavor. Validating on every read
-        would clobber the post-launch ``validated`` record (written by the
-        browser manager) back down to ``installed`` — reads must not mutate.
-        Falls back to full validation only when nothing is recorded yet.
+        Validating on every read would clobber the post-launch ``validated``
+        record (written by the browser manager) back down to ``installed`` —
+        reads must not mutate. Falls back to full validation only when
+        nothing is recorded yet.
         """
         s = self.store.get(KDSPY_FIREFOX_NAME, self.profile)
         if s is None:
             return self.firefox_addon_state()
         return s
-
-    # ------------------------------------------------------------- launch args
-    def chromium_args(self) -> list[str]:
-        """Chromium args to load ONLY this extension (Playwright persistent ctx)."""
-        if not self.is_configured():
-            return []
-        return [
-            f"--disable-extensions-except={self.extension_path}",
-            f"--load-extension={self.extension_path}",
-        ]
 
 
 # The Firefox add-on must come from Mozilla's own CDN — never a mirror or a
@@ -779,9 +512,3 @@ async def fetch_amo_xpi(url: str) -> bytes:
 def _version_tuple(version: str) -> tuple[int, ...]:
     parts = re.findall(r"\d+", version)
     return tuple(int(p) for p in parts) if parts else (0,)
-
-
-def _store_name_of(name: str) -> str:
-    """Normalize a store product name: 'KDSPY – Keyword Research…' → 'kdspy'."""
-    first = re.split(r"[–\-—|:]", name or "", maxsplit=1)[0]
-    return re.sub(r"[^a-z0-9]", "", first.strip().lower())

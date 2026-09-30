@@ -548,3 +548,18 @@ textarea:focus-visible, select:focus-visible, summary:focus-visible {
 .mt8 { margin-top: 8px; } .mt14 { margin-top: 14px; } .mt20 { margin-top: 20px; }
 .hidden { display: none !important; }
 ::selection { background: var(--accent); color: #fff; }
+
+/* ---------- owner → agent messages (live research) ---------- */
+.owner-msg-bar {
+  display: flex; gap: 8px; align-items: center;
+  padding: 10px 14px; border-top: 1px solid var(--line);
+  background: var(--bg-raise);
+}
+.owner-msg-bar input {
+  flex: 1; min-height: 40px; padding: 8px 12px; font-size: 0.86rem;
+}
+.owner-msg-hint {
+  padding: 6px 14px 10px; font-size: 0.72rem; border-top: 1px solid var(--line);
+}
+.trace-item.owner .k { color: var(--ok); }
+.trace-item.owner .trace-x { color: var(--text); }

@@ -27,6 +27,7 @@ from app.config import get_config
 from app.db import init_db
 from app.events import EventLog
 from app.exports import ExportManager
+from app.owner_messages import OwnerMessageStore
 from app.interactive import InteractiveSessionManager
 from app.jobs import JobOrchestrator
 from app.kdspy import KDSpyManager
@@ -74,6 +75,7 @@ def create_app() -> FastAPI:
         app.state.jobs = JobOrchestrator(db, config, app.state.sessions, app.state.events, _errors := ErrorStateStore(db))
         app.state.errors = _errors
         app.state.checkpoints = CheckpointStore(db)
+        app.state.owner_messages = OwnerMessageStore(db)
         app.state.browser = BrowserRegistry(db, app.state.sessions)
         app.state.observations = ObservationStore(db)
         app.state.evidence = EvidenceStore(db)
@@ -97,7 +99,7 @@ def create_app() -> FastAPI:
             checkpoints=app.state.checkpoints,
         )
 
-        # --- browser infrastructure (real Chromium + Playwright) -------------
+        # --- browser infrastructure (Camoufox + Playwright) ------------------
         app.state.browser_auth = BrowserAuthStore(db)
         app.state.extension_states = ExtensionStore(db)
         app.state.login_windows = LoginWindowStore(db)
@@ -110,6 +112,9 @@ def create_app() -> FastAPI:
         app.state.interactive = InteractiveSessionManager(
             config, app.state.browser_manager, app.state.login_windows
         )
+        # The interactive session itself flips the durable Amazon auth state
+        # the moment a sign-in visibly succeeds (attention chip → ready).
+        app.state.interactive.amazon_auth = app.state.amazon_auth
         app.state.kdspy.validate_installation()  # record pre-launch state
         app.state.kdspy.firefox_addon_state()  # record Firefox add-on pre-launch state
         app.state.login_windows.expire_stale()

@@ -33,51 +33,61 @@ def kdspy(db, config) -> KDSpyManager:
 def test_not_configured_when_absent(kdspy) -> None:
     state = kdspy.validate_installation()
     assert state.status == EXT_NOT_CONFIGURED
-    assert kdspy.chromium_args() == []
+    assert kdspy.firefox_addon_args() == []
 
 
 def test_missing_manifest_is_failure(kdspy) -> None:
-    kdspy.extension_path.mkdir(parents=True, exist_ok=True)
+    kdspy.firefox_addon_path.mkdir(parents=True, exist_ok=True)
     state = kdspy.validate_installation()
     assert state.status == EXT_FAILED
 
 
 def test_valid_manifest_registers_installed(kdspy, config) -> None:
-    config.kdspy_extension_path.mkdir(parents=True, exist_ok=True)
-    (config.kdspy_extension_path / "manifest.json").write_text(json.dumps(MV3_MANIFEST))
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))
+    state = kdspy.validate_installation()
+    assert state.status == EXT_INSTALLED
+    assert state.version == FX_MANIFEST["version"]
+    assert state.detail["manifest"]["background"] == "page"
+    args = kdspy.firefox_addon_args()
+    assert len(args) == 1
+    assert args[0].endswith("kdspy-firefox")
+
+
+def test_mv3_manifest_still_accepted_for_firefox_addon(kdspy, config) -> None:
+    """Firefox add-ons are MV2 by convention; MV3 manifests must not be
+    rejected outright (AMO ships both shapes)."""
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(MV3_MANIFEST))
     state = kdspy.validate_installation()
     assert state.status == EXT_INSTALLED
     assert state.version == "4.2.1"
-    assert state.detail["manifest"]["background"] == "service_worker"
-    args = kdspy.chromium_args()
-    assert len(args) == 2
-    assert "--load-extension=" in args[1]
 
 
 def test_version_minimum_enforced(kdspy, config) -> None:
     config.kdspy_expected_min_version = "5.0.0"
-    config.kdspy_extension_path.mkdir(parents=True, exist_ok=True)
-    (config.kdspy_extension_path / "manifest.json").write_text(json.dumps(MV3_MANIFEST))
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))
     state = kdspy.validate_installation()
     assert state.status == EXT_FAILED
     assert "minimum" in state.detail["error"]
 
 
 def test_corrupt_manifest_is_failure(kdspy, config) -> None:
-    config.kdspy_extension_path.mkdir(parents=True, exist_ok=True)
-    (config.kdspy_extension_path / "manifest.json").write_text("{not json")
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text("{not json")
     state = kdspy.validate_installation()
     assert state.status == EXT_FAILED
 
 
 def test_runtime_validation_roundtrip(kdspy, config) -> None:
-    config.kdspy_extension_path.mkdir(parents=True, exist_ok=True)
-    (config.kdspy_extension_path / "manifest.json").write_text(json.dumps(MV3_MANIFEST))
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))
     kdspy.validate_installation()
-    state = kdspy.record_runtime_validated("abcdeffedcba", "chrome-extension://abcdeffedcba/bg.js")
+    state = kdspy.record_firefox_runtime_validated(str(kdspy.firefox_addon_path))
     assert state.status == EXT_VALIDATED
-    assert state.extension_id == "abcdeffedcba"
-    fail = kdspy.record_runtime_failure("sw missing")
+    assert state.detail["engine"] == "camoufox"
+    fail = kdspy.record_firefox_runtime_failure("launch refused the add-on")
     assert fail.status == EXT_FAILED
 
 
@@ -191,13 +201,14 @@ def test_firefox_addon_state_read_does_not_clobber_validated(kdspy) -> None:
     assert kdspy.firefox_addon_state_stored().status in (EXT_INSTALLED, EXT_VALIDATED)
 
 
-def test_chromium_gating_message_mentions_firefox_addon(kdspy, config) -> None:
-    """Engine-aware message: the camoufox path points at the XPI, not a bare
-    'set BROWSER_ENGINE=chromium'."""
-    config.kdspy_extension_path.mkdir(parents=True, exist_ok=True)
-    (config.kdspy_extension_path / "manifest.json").write_text(json.dumps(MV3_MANIFEST))
+def test_firefox_addon_is_the_only_target(kdspy, config) -> None:
+    """Single-extension architecture: the Firefox add-on dir is the one and
+    only KDSpy target, loaded natively by the camoufox engine."""
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))
     kdspy.validate_installation()
-    assert not kdspy.firefox_addon_is_configured()
+    assert kdspy.firefox_addon_is_configured()
+    assert kdspy.firefox_addon_args() == [str(kdspy.firefox_addon_path)]
 
 
 def test_min_version_applies_to_firefox_xpi(kdspy, config) -> None:

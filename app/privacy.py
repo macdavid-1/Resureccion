@@ -17,11 +17,10 @@ exposure minimal and deliberate:
    try to punch through the phone). Research pages have no legitimate use
    for peer connections, so non-proxied UDP is disabled at launch.
 
-3. **Telemetry dial-home suppression** — Chromium's own background
-   services (safe-browsing updates, optimization-guide fetches, component
-   updates) would otherwise contact Google directly. They are disabled:
-   nothing about the owner's browsing leaves the box except the research
-   requests themselves.
+3. **Telemetry dial-home suppression** — the browser's own background
+   services (telemetry pings, safe-browsing, component updates) would
+   otherwise phone home directly. They are disabled at the Firefox-pref
+   level in app/camoufox_engine.py (FIREFOX_USER_PREFS).
 
 4. **DNT / Global Privacy Control** — the owner's chosen preference is
    declared on every request and page (`DNT: 1`, `Sec-GPC: 1`,
@@ -178,31 +177,11 @@ def blocked_check(host: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Chromium launch flags: privacy hardening that does not affect rendering or
-# research behavior.
-# ---------------------------------------------------------------------------
-PRIVACY_CHROMIUM_ARGS: tuple[str, ...] = (
-    # WebRTC must never bypass the proxy via UDP (IP-leak vector). Valid
-    # values: default | default_public_interface_only |
-    # default_public_and_private_interfaces | disable_non_proxied_udp.
-    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-    # Don't leak local IPs via mDNS candidates either.
-    "--enable-features=WebRtcHideLocalIpsWithMdns",
-    # Chromium background phone-home (safe-browsing pings, optimization
-    # guide fetches, component updates, domain reliability) — off. Research
-    # pages are reached directly; nothing else should dial out.
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-domain-reliability",
-    "--disable-client-side-phishing-detection",
-    "--disable-sync",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OptimizationHints",
-)
-
 # Per-request privacy headers applied at the context level (every page and
-# subresource request, including through the relay).
+# subresource request, including through the relay). The engine-level WebRTC /
+# telemetry hardening that used to be Chromium launch flags lives in
+# app/camoufox_engine.py as Firefox prefs.
+# ---------------------------------------------------------------------------
 PRIVACY_EXTRA_HEADERS: dict[str, str] = {
     "DNT": "1",
     "Sec-GPC": "1",
@@ -215,19 +194,6 @@ PRIVACY_INIT_SCRIPT = r"""
   try { Object.defineProperty(Navigator.prototype, 'doNotTrack', { get: () => '1', configurable: true }); } catch (e) {}
 })();
 """
-
-
-def relay_launch_args(extra_existing: list[str] | None = None) -> list[str]:
-    """Launch args to add when the relay/privacy layer is active.
-
-    Deduplicated against existing args so a double application is harmless.
-    """
-    existing = list(extra_existing or [])
-    out: list[str] = []
-    for arg in PRIVACY_CHROMIUM_ARGS:
-        if arg not in existing:
-            out.append(arg)
-    return out
 
 
 def apply_context_privacy(context: Any) -> None:

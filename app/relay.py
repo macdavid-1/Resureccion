@@ -8,15 +8,15 @@ residential-class address.
 
 Architecture (reverse relay — works through any NAT/firewall):
 
-    Chromium ── HTTP/CONNECT proxy ──> local shim (127.0.0.1)
+    Browser ── HTTP/CONNECT proxy ──> local shim (127.0.0.1)
         shim ── control messages ──> RelayHub (inside the app)
         hub   ── SSE stream ───────> owner's device (outbound-only connect)
         owner's device ── TCP to origin ──> marketplace
-        owner's device ── POST /api/relay/upstream ──> hub ──> shim ──> Chromium
+        owner's device ── POST /api/relay/upstream ──> hub ──> shim ──> Browser
 
 The device dials OUT to the server (no port forwarding, works on cellular),
 shuttles raw TCP bytes, and the origin site sees the device's IP. Requests
-are tunneled opaquely (TLS stays end-to-end between Chromium and the site —
+are tunneled opaquely (TLS stays end-to-end between the browser and the site —
 the relay sees only encrypted bytes and destination hostnames).
 
 Fallbacks (per connection, in order): owner device → external proxy
@@ -226,7 +226,7 @@ class RelayHub:
         if self._device_queue is q:
             self._device_queue = None
             # The tunnel carrier is gone: fail all live tunnels fast so the
-            # shim resets and Chromium retries on the next path.
+            # shim resets and the browser retries on the next path.
             for t in list(self._conns.values()):
                 t.device_closed()
             self._conns.clear()
@@ -537,7 +537,7 @@ async def _socks5_connect(
 
 
 # ---------------------------------------------------------------------------
-# Local proxy shim (what Chromium points at)
+# Local proxy shim (what the browser points at)
 # ---------------------------------------------------------------------------
 class ShimServer:
     """127.0.0.1-only HTTP+CONNECT proxy that tunnels through the hub."""
@@ -610,7 +610,7 @@ class ShimServer:
         await self._shuttle(reader, writer, tunnel)
 
     async def _shuttle(self, reader, writer, tunnel: Tunnel) -> None:
-        """Bidirectional raw-byte pump between Chromium and a tunnel."""
+        """Bidirectional raw-byte pump between the browser and a tunnel."""
 
         async def c2t() -> None:
             try:
@@ -676,7 +676,7 @@ class ShimServer:
                 slash = rest.find("/")
                 path = rest[slash:] if slash >= 0 else "/"
                 break
-        # Body (Content-Length only; Chromium does not use chunked requests).
+        # Body (Content-Length only; the browser does not use chunked requests).
         body = b""
         clen = int(hdrs.get("content-length", "0") or 0)
         if clen:
