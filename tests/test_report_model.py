@@ -33,6 +33,68 @@ def _final_report(db, config, session_id: str):
     return final[0], store.read_markdown(final[0]), store.read_model_json(final[0])
 
 
+class TestKeywordPlanAndCategories:
+    """Deterministic keyword ranking + KDP category recommendations."""
+
+    def test_keyword_plan_ranks_measured_by_barrier(self):
+        from app.report_model import _keyword_plan
+
+        ev = [
+            {"id": "s1", "kind": "search_results", "marketplace": "us",
+             "url": "u1", "data": {"query": "grief journal", "result_count": 20,
+              "results": [{"review_count": 900}, {"review_count": 700}]}},
+            {"id": "s2", "kind": "search_results", "marketplace": "uk",
+             "url": "u2", "data": {"query": "grief journals for men", "result_count": 5,
+              "results": [{"review_count": 40}, {"review_count": 20}]}},
+        ]
+        plan = _keyword_plan(
+            ["never searched phrase", "grief journals for men", "grief journal"], ev)
+        # Measured first, lightest entry barrier (median top-10 reviews) wins;
+        # unmeasured keywords follow, honestly marked.
+        assert [p["keyword"] for p in plan] == [
+            "grief journals for men", "grief journal", "never searched phrase",
+        ]
+        assert plan[0]["measured"] and plan[0]["result_count"] == 5
+        assert plan[0]["top10_review_median"] == 30
+        assert plan[0]["marketplace"] == "uk"
+        assert plan[1]["top10_review_median"] == 800
+        assert not plan[2]["measured"] and plan[2]["result_count"] is None
+
+    def test_category_plan_aggregates_linked_pages(self):
+        from app.report_model import _category_plan
+
+        rows = [{
+            "id": f"p{i}", "kind": "product_page", "marketplace": "us",
+            "url": f"https://www.amazon.com/dp/B0{i}",
+            "data": {"asin": f"B0{i}",
+                     "category_path": ["Books", "Self-Help", "Grief & Bereavement"],
+                     "review_count": 100 + i * 10},
+        } for i in range(3)]
+        plan = _category_plan(["p0", "p1"], rows)
+        assert plan["basis"] == "linked"
+        assert plan["items"][0]["category"] == "Grief & Bereavement"
+        assert plan["items"][0]["observed_books"] == 2
+        assert plan["items"][0]["top_level"] == "Books"
+        assert plan["items"][0]["median_reviews"] == 105
+        # Fallback when nothing is linked is labeled honestly.
+        fb = _category_plan([], rows)
+        assert fb["basis"] == "session_fallback"
+        assert fb["items"][0]["observed_books"] == 3
+
+    @pytest.mark.asyncio
+    async def test_real_run_renders_new_sections(self, db, config, session):
+        """The rendered report carries the keyword plan, category
+        recommendations, and the demand-vs-competition verdict."""
+        await _run_session(db, config, session)
+        _, body, model = _final_report(db, config, session)
+        o = model["opportunities"][0]
+        assert o["keyword_plan"], "keyword plan empty"
+        assert "category_plan" in o and "demand_accommodation" in o
+        assert "**Keyword plan**" in body
+        assert "not searched" in body  # scripted run never searched → marked
+        assert "**Demand vs competition:**" in body
+
+
 class TestReportModelFromRealRun:
     """The model is built from a complete scripted run — every section."""
 
@@ -78,7 +140,8 @@ class TestReportModelFromRealRun:
             "marketplaces", "demand", "competitive_landscape", "consumer_needs",
             "market_gap", "differentiation", "risks", "kdp_risk",
             "verification", "confidence", "niching_chain", "marketplace_analysis",
-            "angles", "titles", "keywords", "evidence_ids", "next_step",
+            "angles", "titles", "keywords", "keyword_plan",
+            "category_plan", "demand_accommodation", "evidence_ids", "next_step",
         ):
             assert field in o, f"dossier missing: {field}"
         # Niching chain shows the hierarchy.
@@ -234,6 +297,45 @@ class TestReportPersistenceAndRerender:
         model = res.json()["model"]
         assert model["schema_version"] == 2
         assert model["session"]["id"] == s.id
+
+    @pytest.mark.asyncio
+    async def test_session_endpoint_exposes_usage(self, client):
+        """The session detail endpoint (what the UI header reads) serves this
+        run's token usage once research has made model calls, and null
+        before."""
+        from types import SimpleNamespace
+
+        from tests.test_research_runner import PHASE_OUTPUTS as PO
+        from tests.test_research_runner import ScriptedModel, make_runner
+
+        st = client.app.state
+        s = st.sessions.create(mode="prompt", prompt="usage probe", objective="o")
+        res0 = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})
+        h = {"X-Auth-Token": res0.json()["token"]}
+        before = client.get(f"/api/sessions/{s.id}", headers=h).json()["session"]
+        assert before.get("usage") is None, "no run yet → null usage"
+
+        class UsageModel(ScriptedModel):
+            def __init__(self, script):
+                super().__init__(script)
+                self.n = 0
+
+            async def call(self, session_id, *, system, user, **k):
+                r = await super().call(session_id, system=system, user=user, **k)
+                self.n += 1
+                r.usage = SimpleNamespace(
+                    calls=self.n, failed_calls=0,
+                    prompt_tokens=500 * self.n, completion_tokens=50 * self.n,
+                    cost_usd=0.0)
+                return r
+
+        model = UsageModel(PO)
+        await make_runner(st.db, st.config, model).run(s.id)
+        session = client.get(f"/api/sessions/{s.id}", headers=h).json()["session"]
+        u = session.get("usage")
+        assert u, "usage missing from session detail"
+        assert u["calls"] == model.n and model.n > 0
+        assert u["prompt_tokens"] == 500 * model.n
 
 
 class TestPortfolioValidation:

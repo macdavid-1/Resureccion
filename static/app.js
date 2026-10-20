@@ -194,6 +194,13 @@
     $("#ws-name").textContent = s.name || "—";
     $("#ws-mode").textContent = ({ prompt: "Directed", keywords: "Seeded", auto: "Autonomous" })[s.mode] || s.mode;
     $("#ws-elapsed").textContent = fmtElapsed(s.elapsed_seconds);
+    // Per-run model spend — durable checkpoint from the runner (null before
+    // the first call of a run). Cost shows only when the provider reports it.
+    const u = s.usage;
+    $("#ws-usage").textContent = u
+      ? `${(u.prompt_tokens || 0).toLocaleString()}↑ ${(u.completion_tokens || 0).toLocaleString()}↓ tok`
+        + (u.cost_usd > 0 ? ` · $${u.cost_usd.toFixed(4)}` : "")
+      : "";
     const st = $("#ws-status");
     st.className = `chip ${esc(s.status)}${["running", "queued"].includes(s.status) ? " pulse" : ""}`;
     $("#ws-status-t").textContent = s.status;
@@ -853,6 +860,15 @@
       if (st?.session) {
         const prevTabCount = rb.session?.tabs?.length ?? 0;
         rb.session = st.session;
+        // The server retires a session whose pages died (a KDSpy install
+        // relaunches the browser and closes every open tab). Close the
+        // overlay instead of streaming "Remote browser is off." until the
+        // TTL runs out.
+        if (st.session.status && st.session.status !== "open") {
+          if (st.session.status === "expired") toast("Interactive session ended");
+          rbDone();
+          return;
+        }
         $("#rb-url").textContent = st.session.url || "—";
         if ((st.session.tabs?.length ?? 0) !== prevTabCount) renderRbTabs();
         const secs = st.session.seconds_remaining ?? 0;
@@ -1002,10 +1018,9 @@
   // ---------- settings ----------
   async function refreshSettings() {
     try {
-      const [az, kd, mk] = await Promise.all([
+      const [az, kd] = await Promise.all([
         api("/api/browser/auth/amazon").catch(() => null),
         api("/api/browser/extensions/kdspy").catch(() => null),
-        api("/api/browser/marketplaces").catch(() => null),
       ]);
       const setChip = (id, ok, warn) => {
         const c = $(id);
@@ -1073,103 +1088,12 @@
           : "API key missing — add MODEL_API_KEY in the environment";
         setChip("#set-model-chip", mOk, !mOk);
       } catch {}
-      if (mk) {
-        $("#set-mkt-count").textContent = `${mk.marketplaces?.length ?? "—"} available`;
-      }
-      // Browser egress mode (relay → proxy → direct), incl. health-gate fallbacks.
-      try {
-        const bs = await api("/api/browser/status");
-        const b = bs.status || {};
-        const chip = $("#set-egress-chip");
-        const state = $("#set-egress-state");
-        const note = $("#set-egress-note");
-        const mode = b.egress_mode || "direct";
-        const labels = {
-          relay: "device relay — your phone's IP",
-          proxy: "configured proxy",
-          direct: "server direct egress",
-        };
-        // Degraded = we wanted proxy/relay but fell back to direct (note says
-        // why: "unusable", "unreachable", "went away mid-session").
-        const degraded = mode === "direct" && !!(b.egress_note || "");
-        chip.textContent = mode;
-        chip.className = "chip " + (degraded ? "paused" : mode === "relay" ? "completed" : "");
-        state.textContent = labels[mode] || mode;
-        if (b.egress_note) {
-          note.hidden = false;
-          note.textContent = b.egress_note;
-        } else {
-          note.hidden = true;
-        }
-      } catch {}
-      // Device relay status (phone IP egress).
-      try {
-        const rl = await api("/api/relay/status");
-        const r = rl.relay || {};
-        const chip = $("#set-relay-chip");
-        if (r.enabled && r.device_connected) {
-          chip.textContent = "paired";
-          chip.className = "chip completed";
-          $("#set-relay-state").textContent = "Active — research exits through your device's IP";
-          $("#set-relay-enable").textContent = "Disable";
-        } else if (r.enabled) {
-          chip.textContent = "waiting";
-          chip.className = "chip paused";
-          $("#set-relay-state").textContent = "Enabled — start the client on your phone/home device to pair";
-          $("#set-relay-enable").textContent = "Disable";
-        } else {
-          chip.textContent = "off";
-          chip.className = "chip";
-          $("#set-relay-state").textContent = "Off — browser uses the configured proxy or direct egress";
-          $("#set-relay-enable").textContent = "Enable";
-        }
-        $("#relay-help-row").hidden = false;
-      } catch {}
     } catch {}
     try {
       const m = await api("/api/methodology");
       $("#set-version").textContent = `${m.title || "9-phase methodology"} · Resurrección`;
     } catch {}
   }
-
-  function bindRelayControls() {
-    $("#set-relay-enable").addEventListener("click", async () => {
-      const btn = $("#set-relay-enable");
-      const enabling = btn.textContent.trim().toLowerCase() !== "disable";
-      btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> …';
-      try {
-        await api(enabling ? "/api/relay/enable" : "/api/relay/disable", { method: "POST" });
-        toast(enabling ? "Relay enabled — start the client on your device" : "Relay disabled");
-      } catch (e) { toast(e.message); }
-      btn.disabled = false;
-      btn.textContent = enabling ? "Disable" : "Enable";
-      refreshSettings();
-    });
-    $("#set-relay-test").addEventListener("click", async () => {
-      const out = $("#set-relay-test-out");
-      const btn = $("#set-relay-test");
-      btn.disabled = true;
-      out.hidden = false;
-      out.textContent = "Testing egress…";
-      try {
-        const res = await api("/api/relay/test-egress", { method: "POST" });
-        const ip = res.egress_ip || "unknown";
-        out.textContent = `Sites see: ${ip} · via ${res.path || "?"}${res.device_connected ? " · device paired" : " · device offline"}`;
-      } catch (e) { out.textContent = `Test failed: ${e.message}`; }
-      btn.disabled = false;
-    });
-    $("#set-relay-token-btn").addEventListener("click", async () => {
-      const out = $("#set-relay-token-out");
-      if (!out.hidden) { out.hidden = true; return; }
-      try {
-        const res = await api("/api/relay/token");
-        out.hidden = false;
-        out.textContent = `Token: ${res.token}`;
-      } catch (e) { toast(e.message); }
-    });
-  }
-  bindRelayControls();
 
   function bindKdspyUpload() {
     const installStatus = $("#kdspy-upload-status");

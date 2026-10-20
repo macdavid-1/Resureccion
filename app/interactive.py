@@ -84,6 +84,37 @@ class InteractiveError(Exception):
     pass
 
 
+def _page_alive(page: Any) -> bool:
+    """True while ``page`` can still produce frames and accept actions.
+
+    Playwright exposes ``Page.is_closed()``; lightweight fakes carry a
+    ``closed`` flag instead. A browser relaunch (the KDSpy add-on install
+    restarts the browser BEFORE the setup browser opens, and relay/egress
+    switches and refusal escalation relaunch it too) tears down the shared
+    context and closes every page behind the session's back — reading that
+    correctly is what keeps ``start()`` from handing back a corpse whose
+    ``/frame`` 404s forever as "Remote browser is off." while ``/state``
+    still claims the session is open.
+    """
+    if page is None:
+        return False
+    is_closed = getattr(page, "is_closed", None)
+    if callable(is_closed):
+        try:
+            return not is_closed()
+        except Exception:
+            return False  # a crashed browser raises on any probe: dead
+    return not bool(getattr(page, "closed", False))
+
+
+def _page_url(page: Any) -> str:
+    """Best-effort page URL — a closed or crashed target can raise on read."""
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
 @dataclass
 class InteractiveSession:
     id: str
@@ -118,11 +149,11 @@ class InteractiveSession:
             "marketplace": self.marketplace_code,
             "purpose": self.purpose,
             "status": self.status,
-            "url": scrub_url(getattr(p, "url", "") or self.last_url),
+            "url": scrub_url(_page_url(p) or self.last_url),
             "title": self.last_title,
             "expires_at": _iso_from(self.expires_at),
             "seconds_remaining": max(0, int(self.expires_at - time.time())),
-            "tabs": [scrub_url(getattr(x, "url", "") or "") for x in self.pages],
+            "tabs": [scrub_url(_page_url(x)) for x in self.pages],
             "active_tab": self.active,
         }
 
@@ -163,9 +194,34 @@ class InteractiveSessionManager:
         s = self._session
         if s is None:
             return None
-        if time.time() > s.expires_at and s.status == "open":
-            s.status = "expired"
+        if s.status == "open":
+            if time.time() > s.expires_at:
+                self._retire(s, "expired")
+            elif not _page_alive(s.page):
+                # The browser relaunched or crashed and killed this
+                # session's tab. Retire it NOW: an "open" session with a
+                # dead page makes /frame 404 forever while /state keeps
+                # claiming time remains, so the client can never recover.
+                self._retire(s, "expired")
         return s
+
+    def _retire(self, s: InteractiveSession, status: str) -> None:
+        """Mark an unusable session closed and close its durable window row.
+
+        Without the row close, the dead session's ``browser_login_windows``
+        entry stays "open" until its TTL and the owner's UI shows a login
+        flow that can never come back.
+        """
+        s.status = status
+        win_status = {
+            "completed": WINDOW_COMPLETED,
+            "cancelled": WINDOW_CANCELLED,
+        }.get(status, WINDOW_EXPIRED)
+        for w in self.windows.list(status=WINDOW_OPEN):
+            if getattr(w, "account", None) == "interactive":
+                self.windows.set_status(
+                    w.id, win_status, {"purpose": s.purpose, "outcome": status}
+                )
 
     def is_research_busy(self) -> bool:
         """True when non-interactive pages with real content are open.
@@ -600,7 +656,11 @@ class InteractiveSessionManager:
         s = self.current()
         if s is None:
             raise InteractiveError("no interactive session")
-        s.status = outcome if outcome in ("completed", "cancelled") else "completed"
+        # Never resurrect a session current() already retired (expired TTL,
+        # pages killed by a browser relaunch): completing an unusable session
+        # must not record it as a success.
+        if s.status == "open":
+            s.status = outcome if outcome in ("completed", "cancelled") else "completed"
         # Close ONLY this session's tabs — the main tab plus every popup it
         # opened. Research pages are never touched, so an owner sign-in can
         # safely run while research continues in its own tabs.

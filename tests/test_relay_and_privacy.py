@@ -529,15 +529,40 @@ def test_socks5_dial_method_refusal_raises() -> None:
 # Frontend wiring
 # ---------------------------------------------------------------------------
 def test_settings_panel_wired() -> None:
+    """Settings carries the three rows the owner actually uses.
+
+    Product decision: Amazon sign-in, KDSpy and the model status. The rest of
+    the old panel (device relay, browser egress, marketplaces, methodology)
+    was status chrome rather than a control, so it left the UI. The relay and
+    egress BACKEND stay fully wired — see
+    test_relay_backend_stays_wired_without_the_ui_row.
+    """
     from pathlib import Path
 
     html = Path("static/index.html").read_text()
     js = Path("static/app.js").read_text()
-    assert 'id="set-relay-enable"' in html
-    assert 'id="set-relay-test"' in html
-    assert 'id="set-relay-token-btn"' in html
-    for needle in ("function bindRelayControls", "bindRelayControls();"):
-        assert needle in js
-    # Rendered index carries the panel (server-side version injection).
+    for kept in ("set-amazon-open", "set-amazon-state", "set-kdspy-open", "set-model-chip"):
+        assert f'id="{kept}"' in html, f"{kept} must remain in Settings"
+    removed = (
+        "set-relay-enable", "set-relay-test", "set-relay-token-btn", "set-relay-state",
+        "set-egress-chip", "set-egress-state", "set-mkt-count", "set-view-methodology",
+    )
+    for gone in removed:
+        assert f'id="{gone}"' not in html, f"{gone} was removed from Settings"
+    # No dead binding left pointing at a row that no longer exists.
+    for needle in ("bindRelayControls", "set-relay-", "set-egress-", "set-mkt-count"):
+        assert needle not in js, f"app.js still references {needle}"
+    # Rendered index carries the kept panel (server-side version injection).
     rendered = render_index(Path("static"))
-    assert "set-relay-state" in rendered
+    assert "set-amazon-state" in rendered
+    assert "set-relay-state" not in rendered
+
+
+def test_relay_backend_stays_wired_without_the_ui_row() -> None:
+    """'Removed from the UI only' — the relay API keeps working unchanged."""
+    from app.routes.relay import router
+
+    paths = {getattr(r, "path", "") for r in router.routes}
+    for p in ("/api/relay/status", "/api/relay/enable", "/api/relay/disable",
+              "/api/relay/token", "/api/relay/test-egress"):
+        assert p in paths, f"{p} must remain available"

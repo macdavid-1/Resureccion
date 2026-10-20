@@ -85,6 +85,13 @@ async def get_session(session_id: str, request: Request) -> dict:
     data["agent"] = agent.to_dict() if agent else None
     browser = st.browser.get(session_id)
     data["browser"] = browser.to_dict() if browser else None
+    # Per-run model spend — durable checkpoint written by the runner after
+    # every model call; null until the first call of a run lands.
+    try:
+        cp = st.checkpoints.get(session_id, "model_usage")
+        data["usage"] = dict(cp.payload) if cp else None
+    except Exception:
+        data["usage"] = None
     return {"session": data}
 
 

@@ -33,6 +33,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -656,6 +657,89 @@ class BrowserManager:
     async def pages(self) -> list[Any]:
         ctx = await self._ensure_context()
         return list(ctx.pages)
+
+    # ------------------------------------------------------------- keepalive
+    async def _keepalive_ping(self) -> bool:
+        """One invisible same-origin HEAD request on the first open page.
+
+        Returns False when there is nothing to ping (browser not running, or
+        no page). Never launches a browser and never raises.
+        """
+        ctx = self._context
+        if ctx is None:
+            return False
+        try:
+            pages = list(ctx.pages)
+        except Exception:
+            return False
+        if not pages:
+            return False
+        # A HEAD on the page's own origin: real bytes out and back through the
+        # same proxy/relay path the research uses, no DOM change, no repaint.
+        await pages[0].evaluate(
+            "async () => { try {"
+            " await fetch(location.href, { method: 'HEAD', cache: 'no-store',"
+            " credentials: 'same-origin', keepalive: true });"
+            " } catch (e) { /* best effort — never surface */ } }"
+        )
+        return True
+
+    @asynccontextmanager
+    async def keepalive_during(self, interval: float | None = None):
+        """Hold the browser's proxy path open while the model is thinking.
+
+        Why this exists
+        ---------------
+        A research iteration is dominated by the LLM call (commonly 30-180s,
+        longer with thinking models). Nothing loads in the browser during that
+        window, so the connection to the current host goes idle. Firefox reaps
+        idle connections after ~115s; Cloudflare fronts after ~400s. When the
+        reaper is a middlebox (a CONNECT/SOCKS5 bridge, a WARP hop) rather than
+        an endpoint, the reap can leave the socket half-open, and the next
+        action then hangs for the full navigation timeout instead of failing
+        fast — which reads as "the browser died" but is really a stale pipe.
+
+        What it does
+        ------------
+        Issues one same-origin HEAD request per interval — genuine traffic
+        through the real egress path. It deliberately does NOT move the mouse
+        or scroll: page-local JS timers and synthetic input generate no network
+        traffic and therefore cannot hold a connection open, they only burn
+        CPU and risk perturbing the page the model is about to read.
+
+        Failure is always swallowed: a dead page, a crashed context or a
+        cancelled ping stops the loop, and never disturbs the research run.
+        """
+        period = self.config.browser_keepalive_seconds if interval is None else interval
+        if not period or period <= 0 or not self.is_running:
+            yield self
+            return
+        stop = asyncio.Event()
+
+        async def _loop() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=period)
+                    return  # clean gap between pings
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    await asyncio.wait_for(self._keepalive_ping(), timeout=10)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return  # page/context went away — stop pinging
+
+        task = asyncio.create_task(_loop())
+        try:
+            yield self
+        finally:
+            stop.set()
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # ------------------------------------------------------------- screenshots
     async def screenshot(self, page: Any) -> bytes:

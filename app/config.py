@@ -21,6 +21,19 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
 
 
+# Research-model defaults. Defined HERE (not in model_client) so there is one
+# source of truth: model_client imports these, and config uses them. Keeping
+# them duplicated is how a model switch ends up half-applied.
+DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
+# MiMo-V2.6-Flash (Xiaomi): natively multimodal (text/image/video/audio), 1M
+# context, and a thinking/reasoning model — which is why reasoning_effort is
+# sent below. Supersedes GLM-5.3-Flash.
+DEFAULT_MODEL = "XiaomiMiMo/MiMo-V2.6-Flash"
+
+# DeepInfra documents these reasoning strengths for reasoning-capable models.
+_REASONING_EFFORTS = ("none", "low", "medium", "high")
+
+
 class Config:
     """Central runtime configuration. Instantiated once per process."""
 
@@ -47,13 +60,32 @@ class Config:
         self.heartbeat_timeout_seconds = _int_env("HEARTBEAT_TIMEOUT_SECONDS", 180)
         self.checkpoint_interval_seconds = _int_env("CHECKPOINT_INTERVAL_SECONDS", 120)
 
-        # --- research model (OpenAI-compatible; DeepInfra GLM-5.3-Flash default)
-        # GLM-5.3-Flash: native vision + strong reasoning + prompt caching —
-        # it reasons, orchestrates, reads screenshots, and emits JSON actions.
+        # --- research model (OpenAI-compatible; DeepInfra MiMo-V2.6-Flash default)
+        # MiMo-V2.6-Flash: a thinking model with native vision and 1M context.
+        # It reasons, orchestrates, reads screenshots, and emits JSON actions.
         self.model_api_key = os.environ.get("MODEL_API_KEY", "").strip()
-        self.model_base_url = os.environ.get("MODEL_BASE_URL", "https://api.deepinfra.com/v1/openai").strip()
-        self.model_name = os.environ.get("MODEL_NAME", "zai-org/GLM-5.3-Flash").strip()
-        self.model_max_tokens = _int_env("MODEL_MAX_TOKENS", 8192)
+        self.model_base_url = os.environ.get("MODEL_BASE_URL", DEFAULT_BASE_URL).strip()
+        self.model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL).strip()
+        # Thinking: MiMo-V2.6-Flash is a reasoning model. DeepInfra's
+        # OpenAI-compatible API takes `reasoning_effort` for reasoning models
+        # and silently ignores it on models that don't support it, so sending
+        # it is safe either way. Turn off with MODEL_THINKING=false.
+        self.model_thinking_enabled = os.environ.get("MODEL_THINKING", "true").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        effort = os.environ.get("MODEL_REASONING_EFFORT", "high").strip().lower()
+        if effort not in _REASONING_EFFORTS:
+            raise RuntimeError(
+                f"MODEL_REASONING_EFFORT must be one of {', '.join(_REASONING_EFFORTS)}, "
+                f"got {effort!r}"
+            )
+        self.model_reasoning_effort = effort
+        # Completion budget. On an OpenAI-compatible API a reasoning model's
+        # thinking tokens are billed against max_tokens, so at high effort it
+        # can spend the whole allowance thinking and leave nothing for the
+        # answer, hence a generous default. Providers clamp above a model's own
+        # ceiling rather than erroring.
+        self.model_max_tokens = _int_env("MODEL_MAX_TOKENS", 16384)
         self.model_temperature = float(os.environ.get("MODEL_TEMPERATURE", "0.4").strip() or "0.4")
         self.model_timeout_seconds = _int_env("MODEL_TIMEOUT_SECONDS", 180)
         # Vision: when enabled, the runner attaches the latest browser
@@ -91,9 +123,21 @@ class Config:
             "1", "true", "yes", "on"
         )
         self.browser_idle_shutdown_seconds = _int_env("BROWSER_IDLE_SHUTDOWN_SECONDS", 300)
+        # Keepalive cadence while the model is thinking. A research iteration
+        # is dominated by the LLM call (often 30-180s) and nothing loads in the
+        # browser during it, so the connection to the current host goes idle.
+        # Firefox reaps idle connections after ~115s; Cloudflare fronts after
+        # ~400s. One invisible same-origin request per period keeps the proxy
+        # path warm well inside the tightest of those. 0 disables.
+        self.browser_keepalive_seconds = max(0, min(_int_env("BROWSER_KEEPALIVE_SECONDS", 45), 600))
         self.browser_default_timeout_seconds = _int_env("BROWSER_DEFAULT_TIMEOUT_SECONDS", 45)
         self.browser_navigation_timeout_seconds = _int_env("BROWSER_NAV_TIMEOUT_SECONDS", 60)
         self.browser_max_open_pages = _int_env("BROWSER_MAX_OPEN_PAGES", 4)
+        # Firefox content processes (dom.ipc.processCount). Each one is a few
+        # hundred MB, so this is the main lever for fitting the engine to the
+        # host: 2 on a 2-core/4 GB box, 3-4 when the VPS has room. Clamped to
+        # a sane band so a typo can never starve or overcommit the browser.
+        self.browser_content_processors = max(1, min(_int_env("BROWSER_CONTENT_PROCESSORS", 2), 8))
         self.browser_user_agent = os.environ.get("BROWSER_USER_AGENT", "").strip()
         self.browser_locale = os.environ.get("BROWSER_LOCALE", "en-US").strip()
         self.browser_timezone = os.environ.get("BROWSER_TIMEZONE", "America/New_York").strip()

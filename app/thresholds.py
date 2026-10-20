@@ -92,6 +92,13 @@ class EvidenceThresholds:
     # Reviews must come from at least this many distinct products before a
     # consumer-need pattern is treated as market-wide.
     min_review_products: int = 3
+    # Per-candidate evidence floor. Phase gates count SESSION totals, so this
+    # is what stops an individual candidate from reaching the report on a
+    # couple of pages: four distinct evidence records is the smallest set
+    # that can cover both sides of the market (demand AND competition) plus
+    # corroboration. Below it the candidate is downgraded to "needs more
+    # research" — never advanced on thin per-candidate data.
+    min_candidate_evidence: int = 4
 
     @classmethod
     def from_env(cls) -> "EvidenceThresholds":
@@ -111,6 +118,7 @@ class EvidenceThresholds:
             ),
             min_saturation_sample=_int_env("THRESH_MIN_SATURATION_SAMPLE", cls.min_saturation_sample),
             min_review_products=_int_env("THRESH_MIN_REVIEW_PRODUCTS", cls.min_review_products),
+            min_candidate_evidence=_int_env("THRESH_MIN_CANDIDATE_EVIDENCE", cls.min_candidate_evidence),
         )
 
     def describe(self) -> dict:
@@ -151,6 +159,10 @@ class EvidenceThresholds:
             "min_review_products": {
                 "value": self.min_review_products,
                 "why": "Reviews must span this many distinct products before a consumer-need pattern is treated as market-wide.",
+            },
+            "min_candidate_evidence": {
+                "value": self.min_candidate_evidence,
+                "why": "Per-candidate evidence floor: an individual candidate may not advance on a couple of pages; four distinct records is the smallest set spanning demand, competition, and corroboration.",
             },
         }
 

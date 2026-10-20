@@ -19,6 +19,9 @@ Filters (per the owner's specification):
     stale_evidence               evidence predates the staleness window
     contradictory_evidence       claims conflict without resolution
     unverifiable_claims          too many claims lack any evidence ids
+    demand_accommodation         entrenched competition not matched by
+                                 corroborated demand (the ratio question:
+                                 is demand high enough for THIS competition?)
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ SOFT_FILTERS = (
     "insufficient_competitors",
     "insufficient_consumer_evidence",
     "stale_evidence",
+    "demand_accommodation",
 )
 
 FILTER_NAMES = HARD_FILTERS + SOFT_FILTERS
@@ -139,6 +143,7 @@ class CandidateFilterEngine:
         results.append(self._filter_too_narrow(candidate, evidence_records))
         results.append(self._filter_weak_demand(claims, evidence_records))
         results.append(self._filter_excessive_competition(evidence_records, claims))
+        results.append(self._filter_demand_accommodation(evidence_records, claims))
         results.append(self._filter_misleading_anomaly(evidence_records, claims))
         results.append(self._filter_insufficient_competitors(evidence_records, claims))
         results.append(self._filter_insufficient_consumer_evidence(evidence_records))
@@ -165,7 +170,25 @@ class CandidateFilterEngine:
         )
 
         # Persist each failure as a durable assessment (and a summary).
+        # Exception: demand_accommodation is a STANDING comparative assessment
+        # — recorded pass OR fail, because the final report renders the
+        # demand-vs-competition comparison for every opportunity, not only
+        # when the filter fires.
+        for r in results:
+            if r.name == "demand_accommodation":
+                self.assessments.record(
+                    session_id,
+                    kind=KIND_FILTER,
+                    subject_type="candidate",
+                    subject_id=report.candidate_id,
+                    stage=r.name,
+                    outcome="pass" if r.passed else "warn",
+                    reason=r.reason,
+                    metrics=r.metrics,
+                )
         for r in failures:
+            if r.name == "demand_accommodation":
+                continue  # recorded above (pass or fail)
             self.assessments.record(
                 session_id,
                 kind=KIND_FILTER,
@@ -192,7 +215,10 @@ class CandidateFilterEngine:
     # -------------------------------------------------------------- filters
     def _filter_insufficient_evidence(self, evidence_records: list[dict[str, Any]]) -> FilterResult:
         n = len(evidence_records)
-        floor = max(2, self.t.min_independent_sources)
+        # Per-candidate floor (min_candidate_evidence), never below the
+        # corroboration minimum: a candidate may not advance on a couple of
+        # pages even when SESSION totals are high.
+        floor = max(self.t.min_candidate_evidence, self.t.min_independent_sources)
         ok = n >= floor
         return FilterResult(
             name="insufficient_evidence",
@@ -357,6 +383,80 @@ class CandidateFilterEngine:
                 "deep_review_moats": deep_moats,
                 "saturation_claims": len(saturation_claims),
                 "threshold_multiplier": 2,
+            },
+        )
+
+    def _filter_demand_accommodation(
+        self, evidence_records: list[dict[str, Any]], claims: list[Any]
+    ) -> FilterResult:
+        """Is observed demand corroborated ENOUGH for the observed competition?
+
+        weak_demand and excessive_competition each judge one side alone; the
+        question the owner actually asks is the ratio: can the demand shown
+        for this niche plausibly feed the entrenched incumbents already in
+        it? This fires only on the joint condition — entrenched competition
+        (same bar as excessive_competition, minus its saturation-claim
+        requirement) while fewer than min_independent_sources evidenced
+        demand claims exist — and DOWNGRADES: the niche may be viable, but
+        the research cannot yet SHOW demand accommodates this competition.
+        """
+        competitor_asins = _distinct_asins(evidence_records)
+        deep_moats = _deep_review_moat_count(evidence_records)
+        saturation_claims = [
+            c for c in claims
+            if getattr(c, "kind", "") == "competition"
+            and "saturat" in str(getattr(c, "statement", "")).lower()
+            and getattr(c, "evidence_ids", None)
+        ]
+        supported_demand = [
+            c for c in claims
+            if getattr(c, "kind", "") == "demand"
+            and getattr(c, "evidence_ids", None)
+            and getattr(c, "status", "") != CLAIM_UNSUPPORTED
+        ]
+        demand_signals = _demand_signal_count(evidence_records)
+        entrenched = (
+            len(competitor_asins) >= self.t.min_competitor_sample * 2
+            and deep_moats > len(competitor_asins) / 2
+        )
+        corroborated = len(supported_demand) >= self.t.min_independent_sources
+        ok = not entrenched or corroborated
+        if ok and entrenched:
+            reason = (
+                f"competition is entrenched ({len(competitor_asins)} incumbents, "
+                f"{deep_moats} with deep review moats) but demand is corroborated by "
+                f"{len(supported_demand)} evidenced demand claim(s) — demand support "
+                "is proportionate to the observed competition"
+            )
+        elif ok:
+            reason = (
+                f"competition is not entrenched ({len(competitor_asins)} incumbents, "
+                f"{deep_moats} deep review moats) — demand-vs-competition ratio "
+                "within bounds"
+            )
+        else:
+            reason = (
+                f"entrenched competition ({len(competitor_asins)} incumbents, "
+                f"{deep_moats} with deep review moats, {len(saturation_claims)} "
+                f"corroborated saturation claim(s)) but only "
+                f"{len(supported_demand)} evidenced demand claim(s) — cannot yet "
+                "show demand accommodates this competition; needs more demand research"
+            )
+        return FilterResult(
+            name="demand_accommodation",
+            passed=ok,
+            outcome="pass" if ok else "downgrade",
+            reason=reason,
+            metrics={
+                "entrenched": entrenched,
+                "demand_corroborated": corroborated,
+                "distinct_competitor_asins": len(competitor_asins),
+                "deep_review_moats": deep_moats,
+                "saturation_claims": len(saturation_claims),
+                "supported_demand_claims": len(supported_demand),
+                "demand_signals": demand_signals,
+                "required_demand_claims": self.t.min_independent_sources,
+                "incumbent_bar": self.t.min_competitor_sample * 2,
             },
         )
 

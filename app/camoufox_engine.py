@@ -36,6 +36,20 @@ def _has_camoufox_install(cache_home: str) -> bool:
     return (root / "browsers").is_dir() or (root / "version.json").is_file()
 
 
+def camoufox_cache_present() -> bool:
+    """True when the resolved cache actually holds a downloaded browser.
+
+    Boot uses this to decide whether ``camoufox fetch`` must run (a fresh VPS
+    has no cache, and without the binary the first launch fails with
+    "official/stable is not installed").
+    """
+    _ensure_camoufox_cache_env()
+    cache = os.environ.get("CAMOUFOX_CACHE") or os.environ.get("XDG_CACHE_HOME")
+    if not cache:
+        cache = os.path.expanduser("~/.cache")
+    return _has_camoufox_install(cache)
+
+
 def _ensure_camoufox_cache_env() -> None:
     """Point the camoufox package at the cache that actually holds the binary.
 
@@ -153,7 +167,10 @@ FIREFOX_USER_PREFS: dict[str, Any] = {
     "browser.aboutwelcome.enabled": False,
     "permissions.default.geo": 2,
     "permissions.default.desktop-notification": 2,
-    # Long-run stability under the 2-core budget.
+    # Long-run stability: cap Firefox content processes. This static default
+    # is the 2-core budget; launch_kwargs() substitutes the configured value
+    # (BROWSER_CONTENT_PROCESSORS) so a bigger host can raise it — each extra
+    # process costs a few hundred MB of RAM.
     "dom.ipc.processCount": 2,
     "browser.tabs.unloadOnLowMemory": True,
     # Rate-limited proxies: a page load opens many tunnels at once, and the
@@ -329,8 +346,12 @@ def launch_kwargs(
         # window dimensions drive layout instead of Playwright's fixed
         # viewport fighting the spoof.
         "no_viewport": True,
-        "firefox_user_prefs": dict(FIREFOX_USER_PREFS),
     }
+    # Firefox privacy/anti-leak prefs, with the host-specific content-process
+    # count substituted over the module default (see FIREFOX_USER_PREFS).
+    prefs = dict(FIREFOX_USER_PREFS)
+    prefs["dom.ipc.processCount"] = max(1, config.browser_content_processors)
+    kwargs["firefox_user_prefs"] = prefs
     if config.camoufox_humanize:
         # Humanized cursor movement — helps interactive pages feel real to
         # behavioral checks. Disabled by default: the owner taps by hand.

@@ -69,6 +69,34 @@ def test_launch_kwargs_shape(cfg: Config) -> None:
 
 
 @requires_camoufox
+def test_content_process_count_follows_config(cfg: Config) -> None:
+    """BROWSER_CONTENT_PROCESSORS is the host-fitting lever: it must reach the
+    Firefox prefs, and the module default must stay at the 2-core budget."""
+    assert ce.FIREFOX_USER_PREFS["dom.ipc.processCount"] == 2
+    assert cfg.browser_content_processors == 2
+    assert ce.launch_kwargs(cfg)["firefox_user_prefs"]["dom.ipc.processCount"] == 2
+
+    cfg.browser_content_processors = 4
+    assert ce.launch_kwargs(cfg)["firefox_user_prefs"]["dom.ipc.processCount"] == 4
+
+    # The rest of the privacy/anti-leak prefs must survive the substitution.
+    kw = ce.launch_kwargs(cfg)
+    assert kw["firefox_user_prefs"]["media.peerconnection.enabled"] is False
+    assert kw["firefox_user_prefs"]["privacy.donottrackheader.enabled"] is True
+
+
+def test_content_processors_are_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo must never starve or overcommit the browser: clamp to 1-8."""
+    monkeypatch.setenv("BROWSER_CONTENT_PROCESSORS", "1000")
+    assert Config().browser_content_processors == 8
+    monkeypatch.setenv("BROWSER_CONTENT_PROCESSORS", "0")
+    assert Config().browser_content_processors == 1
+    monkeypatch.setenv("BROWSER_CONTENT_PROCESSORS", "banana")
+    with pytest.raises(RuntimeError, match="BROWSER_CONTENT_PROCESSORS"):
+        Config()
+
+
+@requires_camoufox
 def test_fingerprint_is_stable_across_restarts(cfg: Config) -> None:
     fp1 = ce.load_or_generate_fingerprint(cfg)
     fp2 = ce.load_or_generate_fingerprint(cfg)

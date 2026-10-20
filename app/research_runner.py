@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,6 +90,17 @@ from app.trace import (
     verification_text,
 )
 from app.verification import VerificationEngine, evidence_for_candidate
+
+
+@asynccontextmanager
+async def _noop_keepalive():
+    """Stand-in keepalive for browser objects that do not implement one.
+
+    ResearchRunner is constructed with duck-typed browser objects in tests and
+    in the live smoke scripts, so the keepalive hook is looked up rather than
+    assumed. Production always passes a real BrowserManager.
+    """
+    yield
 
 
 @dataclass
@@ -175,6 +187,9 @@ class ResearchRunner:
             events,
         )
         self._cancelled = False
+        # Per-session all-time usage (prior runs merged on resume) — see
+        # _record_model_usage.
+        self._usage_prior: dict[str, dict] = {}
 
     # ------------------------------------------------- owner message channel
     def _take_owner_messages(self, session_id: str) -> None:
@@ -234,6 +249,42 @@ class ResearchRunner:
             t = TimingTracker(self.db, session_id)
             self._timings[session_id] = t
         return t
+
+    # ---------------------------------------------------------- usage/cost
+    def _record_model_usage(self, session_id: str, reply: Any) -> None:
+        """Checkpoint this session's cumulative token/cost usage (durable).
+
+        `reply.usage` is the ModelClient's cumulative totals for the current
+        run (the registry builds a fresh client per run); totals from PRIOR
+        runs of the same session (crash/resume) are re-loaded from the
+        checkpoint once and added, so the checkpoint always holds the
+        session's all-time spend. This feeds the session detail endpoint so
+        the owner can see what research costs. Accounting never breaks
+        research — any failure here is swallowed.
+        """
+        u = getattr(reply, "usage", None)
+        if u is None:
+            return
+        if session_id not in self._usage_prior:
+            prior: dict = {}
+            try:
+                cp = self.checkpoints.get(session_id, "model_usage")
+                prior = dict(cp.payload) if cp else {}
+            except Exception:
+                prior = {}
+            self._usage_prior[session_id] = prior
+        prior = self._usage_prior[session_id]
+        total = {
+            "calls": int(prior.get("calls", 0)) + int(getattr(u, "calls", 0)),
+            "failed_calls": int(prior.get("failed_calls", 0)) + int(getattr(u, "failed_calls", 0)),
+            "prompt_tokens": int(prior.get("prompt_tokens", 0)) + int(getattr(u, "prompt_tokens", 0)),
+            "completion_tokens": int(getattr(u, "completion_tokens", 0)) + int(prior.get("completion_tokens", 0)),
+            "cost_usd": round(float(prior.get("cost_usd", 0.0)) + float(getattr(u, "cost_usd", 0.0)), 6),
+        }
+        try:
+            self.checkpoints.save(session_id, "model_usage", total)
+        except Exception:
+            pass  # usage accounting is additive; never impede research
 
     # ------------------------------------------------------------------- run
     async def run(self, session_id: str) -> None:
@@ -448,11 +499,18 @@ class ResearchRunner:
             call_key = f"model:{phase}:{iteration}"
             timings.start(call_key, TaskType.MODEL_CALL)
             try:
-                reply = await self.model.call(
-                    session_id, system=system, user=user,
-                    expect_fields=spec.output_contract,
-                    screenshot_png=screenshot_png,
-                )
+                # Hold the browser's egress path open for the whole call.
+                # Nothing loads while the model thinks, so the connection to
+                # the current host idles; a middlebox (CONNECT/WARP bridge)
+                # can reap it mid-call and the next navigation then hangs
+                # instead of failing fast. Duck-typed for test doubles.
+                keepalive = getattr(self.browser, "keepalive_during", None) or _noop_keepalive
+                async with keepalive():
+                    reply = await self.model.call(
+                        session_id, system=system, user=user,
+                        expect_fields=spec.output_contract,
+                        screenshot_png=screenshot_png,
+                    )
                 timings.finish(call_key, outcome="ok")
             except asyncio.CancelledError:
                 timings.abandon(call_key, outcome="cancelled")
@@ -465,9 +523,10 @@ class ResearchRunner:
                 if verdict.hard_stuck:
                     self.events.append(
                         session_id, level="warn", actor="agent",
-                        action="model_call_hard_timeout",
-                        detail=verdict.to_dict(),
+                        action="model_call_hard_timeout", detail=verdict.to_dict(),
                     )
+            # Durable per-run token/cost accounting (exposed on the session).
+            self._record_model_usage(session_id, reply)
             if reply.elapsed_seconds and reply.elapsed_seconds >= 150:
                 self.events.append(
                     session_id, level="info", actor="agent",
@@ -744,7 +803,7 @@ class ResearchRunner:
 
         For every non-rejected candidate:
           1. register the candidate's claims from the phase analyses,
-          2. run the 12 named deterministic filters,
+          2. run the 13 named deterministic filters,
           3. run the verification engine (evidence chain, claim integrity,
              corroboration, KDP risk).
 

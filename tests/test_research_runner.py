@@ -300,6 +300,70 @@ async def test_full_methodology_produces_validated_opportunity(db, config, sessi
 
 
 @pytest.mark.asyncio
+async def test_vision_screenshot_attached_to_every_research_call(db, config, session):
+    """The model must ALWAYS see the current screen: once any screenshot
+    exists, EVERY subsequent model call — in all 9 phases, including
+    adversarial verification and synthesis — receives it. A phase may never
+    run blind."""
+    class ScreenshotRecordingModel(ScriptedModel):
+        def __init__(self, script: dict[str, list[dict[str, Any]]]) -> None:
+            super().__init__(script)
+            self.shots: list[Any] = []
+
+        async def call(self, session_id: str, *, system: str, user: str, **k: Any) -> Any:
+            self.shots.append(k.get("screenshot_png"))
+            return await super().call(session_id, system=system, user=user, **k)
+
+    model = ScreenshotRecordingModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert SessionStore(db, config).require(session).status == "completed"
+    shots = model.shots
+    assert len(shots) >= len(PHASE_ORDER), f"too few calls: {len(shots)}"
+    first = next((i for i, s in enumerate(shots) if s is not None), None)
+    assert first is not None, "no screenshot ever reached the model"
+    # From the first attached screenshot onward NO call may drop it — the
+    # adversarial and synthesis phases (which browse least) included.
+    assert all(s is not None for s in shots[first:]), \
+        [i for i, s in enumerate(shots) if s is None]
+
+
+@pytest.mark.asyncio
+async def test_model_usage_checkpointed_per_session(db, config, session):
+    """Token/cost usage is persisted per session after every model call —
+    the durable source behind the session's usage display."""
+    from types import SimpleNamespace
+
+    class UsageModel(ScriptedModel):
+        def __init__(self, script: dict[str, list[dict[str, Any]]]) -> None:
+            super().__init__(script)
+            self.n = 0
+
+        async def call(self, session_id: str, *, system: str, user: str, **k: Any) -> Any:
+            reply = await super().call(session_id, system=system, user=user, **k)
+            self.n += 1
+            # Cumulative for the run — mirrors the real ModelClient.usage.
+            reply.usage = SimpleNamespace(
+                calls=self.n, failed_calls=0,
+                prompt_tokens=1000 * self.n, completion_tokens=100 * self.n,
+                cost_usd=0.001 * self.n,
+            )
+            return reply
+
+    model = UsageModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert SessionStore(db, config).require(session).status == "completed"
+    cp = CheckpointStore(db).get(session, "model_usage")
+    assert cp is not None, "usage checkpoint missing"
+    p = cp.payload
+    assert p["calls"] == model.n and model.n > 0
+    assert p["prompt_tokens"] == 1000 * model.n
+    assert p["completion_tokens"] == 100 * model.n
+    assert p["cost_usd"] == pytest.approx(0.001 * model.n, abs=1e-6)
+
+
+@pytest.mark.asyncio
 async def test_phase_sequence_enforced_even_when_model_hides_phases(db, config, session):
     """The scripted model can't skip phases: prompts carry the phase contract."""
     model = ScriptedModel(PHASE_OUTPUTS)

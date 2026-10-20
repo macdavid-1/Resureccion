@@ -1,17 +1,19 @@
 """Real LLM client for the research agent.
 
 OpenAI-compatible chat-completions JSON client with native vision support.
-Default endpoint is DeepInfra serving **GLM-5.3-Flash** (native vision +
-strong reasoning + prompt caching): it reasons, orchestrates, reads the live
-browser screenshot, and emits JSON. Any OpenAI-compatible endpoint works —
+Default endpoint is DeepInfra serving **MiMo-V2.6-Flash** (Xiaomi: natively
+multimodal, 1M context, reasoning/thinking model): it thinks, orchestrates,
+reads the live browser screenshot, and emits JSON. Any OpenAI-compatible endpoint works —
 configured entirely via environment variables:
 
 - MODEL_API_KEY         (required for research; absent -> model calls fail
                          with ModelConfigError)
 - MODEL_BASE_URL        (default https://api.deepinfra.com/v1/openai)
-- MODEL_NAME            (default zai-org/GLM-5.3-Flash)
+- MODEL_NAME            (default XiaomiMiMo/MiMo-V2.6-Flash)
 - MODEL_MAX_TOKENS      (default 8192)
 - MODEL_TEMPERATURE     (default 0.4)
+- MODEL_THINKING        (default true — ask a reasoning model to think)
+- MODEL_REASONING_EFFORT(default high — none|low|medium|high)
 - MODEL_VISION_ENABLED  (default true — attach latest screenshot per call)
 - MODEL_VISION_MAX_BYTES (default 400000 — size guard for screenshots)
 
@@ -34,12 +36,12 @@ from typing import Any
 
 import httpx
 
-from app.config import Config
+from app.config import DEFAULT_BASE_URL, DEFAULT_MODEL, Config
 from app.events import EventLog
 from app.redact import scrub_url
 
-DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
-DEFAULT_MODEL = "zai-org/GLM-5.3-Flash"
+# DEFAULT_BASE_URL / DEFAULT_MODEL are re-exported from app.config (single
+# source of truth) — callers and tests import them from here.
 
 
 class ModelConfigError(Exception):
@@ -184,7 +186,7 @@ class ModelClient:
 
         When `screenshot_png` is provided (and vision is enabled) it is sent
         as an OpenAI-style image_url content part so vision-capable models
-        (GLM-5.3-Flash) can see exactly what the browser sees.
+        (MiMo-V2.6-Flash) can see exactly what the browser sees.
         """
         if not self.is_configured:
             raise ModelConfigError(
@@ -211,6 +213,12 @@ class ModelClient:
             "max_tokens": max_tokens or self.config.model_max_tokens,
             "temperature": self.config.model_temperature if temperature is None else temperature,
         }
+        # Thinking. MiMo-V2.6-Flash is a reasoning model; DeepInfra takes
+        # `reasoning_effort` on reasoning-capable models and ignores it on
+        # ones that aren't, so this stays safe across model swaps. Omitted
+        # entirely when MODEL_THINKING=false.
+        if self.config.model_thinking_enabled:
+            payload["reasoning_effort"] = self.config.model_reasoning_effort
         started = time.monotonic()
         last_error: Exception | None = None
         client = await self._ensure_client()

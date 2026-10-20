@@ -77,13 +77,18 @@ class FakeBrowser:
 
     async def new_page(self, *, interactive: bool = False) -> FakePage:
         self.launched += 1
-        # Mirror the real BrowserManager: protected pages carry the marker
-        # attribute the eviction/busy logic reads.
+        # Mirror the real BrowserManager: every new_page hands back a FRESH
+        # page (the previous context's pages stay closed after a relaunch),
+        # and protected pages carry the marker attribute the eviction/busy
+        # logic reads.
+        page = FakePage()
+        page.url = "about:blank"
         if interactive:
-            self.page._resurreccion_protected = True
-        self.page.protected = interactive
-        self._context.pages.append(self.page)
-        return self.page
+            page._resurreccion_protected = True
+        page.protected = interactive
+        self.page = page
+        self._context.pages.append(page)
+        return page
 
     async def navigate(self, page: Any, url: str) -> None:
         self.navigated.append(url)
@@ -195,6 +200,74 @@ async def test_start_is_idempotent_while_open(manager: InteractiveSessionManager
     s1 = await manager.start(purpose="amazon_signin", marketplace="us")
     s2 = await manager.start(purpose="kdspy_setup")
     assert s1.id == s2.id, "a second start must reuse the open session"
+
+
+@pytest.mark.asyncio
+async def test_start_recovers_after_browser_restart_kills_pages(
+    manager: InteractiveSessionManager,
+) -> None:
+    """Regression: the KDSpy install relaunches the browser
+    (launch(force=True) tears down the context) BEFORE the client asks for
+    the setup browser. That closes an open session's pages — e.g. an Amazon
+    sign-in the owner left open. start() used to reuse the corpse without
+    checking it, so /frame 404'd forever ("Remote browser is off.") while
+    /state still claimed the session was open with time left."""
+    s1 = await manager.start(purpose="amazon_signin", marketplace="us")
+    # Context teardown closes every page behind the session's back.
+    s1.pages[0].closed = True
+
+    s2 = await manager.start(purpose="kdspy_setup")
+    assert s2.id != s1.id, "a dead session must never be handed back"
+    assert s2.status == "open"
+    assert not s2.page.closed
+    assert "publishingaltitude" in (s2.last_url or "")  # the KDSpy login page
+    # Exactly ONE durable window row is open: the fresh session's.
+    open_rows = [
+        r for r in manager.windows.list(status="open")
+        if getattr(r, "account", None) == "interactive"
+    ]
+    assert len(open_rows) == 1
+    # And frames flow again.
+    assert await manager.frame() is not None
+
+
+@pytest.mark.asyncio
+async def test_current_expires_session_whose_pages_died(
+    manager: InteractiveSessionManager,
+) -> None:
+    s = await manager.start(purpose="manual")
+    s.page.closed = True  # browser relaunch killed the tab
+    cur = manager.current()
+    assert cur is not None and cur.status == "expired"
+    # Durable row closed too — the owner's UI must not show a login flow
+    # that can never come back.
+    assert not manager.windows.list(status="open")
+    # /frame answers 404 (client shows the message and closes) — no raise.
+    assert await manager.frame() is None
+    with pytest.raises(InteractiveError, match="expired"):
+        await manager.act("key", {"key": "Enter"})
+
+
+@pytest.mark.asyncio
+async def test_ttl_expiry_closes_durable_window_row(
+    manager: InteractiveSessionManager,
+) -> None:
+    s = await manager.start(purpose="manual", ttl_seconds=600)
+    s.expires_at = 0  # force TTL expiry
+    assert manager.current().status == "expired"
+    assert not manager.windows.list(status="open")
+
+
+@pytest.mark.asyncio
+async def test_complete_after_restart_does_not_record_false_success(
+    manager: InteractiveSessionManager,
+) -> None:
+    """Back-tap after the browser relaunched: the session is already dead,
+    and completing it must not overwrite the expiry with "completed"."""
+    s = await manager.start(purpose="amazon_signin", marketplace="us")
+    s.page.closed = True
+    done = await manager.complete(outcome="completed")
+    assert done.status == "expired"
 
 
 @pytest.mark.asyncio

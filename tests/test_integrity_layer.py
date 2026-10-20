@@ -389,6 +389,81 @@ class TestCandidateFilters:
         assert rep.verdict == "reject"
         assert any(f.name == "duplicate_opportunity" for f in rep.failures)
 
+    def test_entrenched_competition_with_thin_demand_downgrades(self, db, session_id):
+        """The ratio question: entrenched incumbents but only ONE evidenced
+        demand claim → downgrade 'needs more demand research'. Today's
+        weak_demand (passes on 1 claim) and excessive_competition (needs a
+        saturation claim) both stay green here — this is the joint gap."""
+        cand = CandidateStore(db).create(
+            session_id,
+            niche="sudden-loss grief journals for adult children settling estates")
+        ev = [{
+            "id": f"evm{i}", "kind": "product_page", "marketplace": "us",
+            "title": f"incumbent {i}",
+            "url": f"https://www.amazon.com/dp/ASIN{i}",
+            "data": {"asin": f"ASIN{i}", "review_count": 700,
+                     "best_seller_rank": 5000 + i},
+            "captured_at": _recent_iso(),
+        } for i in range(13)]
+        claims = _supported_claims(db, session_id, cand.id, ["evm0", "evm1"])
+        rep = self._engine(db).evaluate(
+            session_id, cand, evidence_records=ev, claims=claims,
+            existing_niches=[])
+        ratio = [f for f in rep.failures if f.name == "demand_accommodation"]
+        assert ratio, [f.name for f in rep.failures]
+        assert "cannot yet show demand accommodates" in ratio[0].reason
+        assert rep.verdict == "downgrade"
+        audits = IntegrityAssessmentStore(db).list(session_id, kind="filter")
+        assert any(a.stage == "demand_accommodation" and a.outcome == "warn"
+                   for a in audits)
+
+    def test_entrenched_competition_with_corroborated_demand_passes_ratio(
+        self, db, session_id
+    ):
+        """Entrenched incumbents BUT corroborated demand (≥2 evidenced demand
+        claims) → the ratio question is answered positively."""
+        cand = CandidateStore(db).create(
+            session_id,
+            niche="guided divorce recovery journals for men in year one")
+        ev = [{
+            "id": f"evm{i}", "kind": "product_page", "marketplace": "us",
+            "title": f"incumbent {i}",
+            "url": f"https://www.amazon.com/dp/ASIN{i}",
+            "data": {"asin": f"ASIN{i}", "review_count": 700,
+                     "best_seller_rank": 5000 + i},
+            "captured_at": _recent_iso(),
+        } for i in range(13)]
+        claims = _supported_claims(db, session_id, cand.id, ["evm0", "evm1"])
+        claims.append(ClaimStore(db).create(
+            session_id, kind="demand",
+            statement="seven incumbents each sustain steady review accumulation",
+            evidence_ids=["evm2", "evm3"], candidate_id=cand.id))
+        rep = self._engine(db).evaluate(
+            session_id, cand, evidence_records=ev, claims=claims,
+            existing_niches=[])
+        assert not [f for f in rep.failures if f.name == "demand_accommodation"], \
+            [f.reason for f in rep.failures if f.name == "demand_accommodation"]
+        # The standing verdict is recorded pass too — the report renders it.
+        audits = IntegrityAssessmentStore(db).list(session_id, kind="filter")
+        assert any(a.stage == "demand_accommodation" and a.outcome == "pass"
+                   for a in audits)
+
+    def test_candidate_under_evidence_floor_is_downgraded(self, db, session_id):
+        """Per-candidate floor: three evidence records → 'needs more
+        research', even when the demand claims look supported. Session-level
+        totals must not carry a thin candidate to the report."""
+        cand = CandidateStore(db).create(
+            session_id,
+            niche="sudden-loss grief journals for adult children settling estates")
+        ev = _evidence(3)
+        claims = _supported_claims(db, session_id, cand.id, ["ev1", "ev2"])
+        rep = self._engine(db).evaluate(
+            session_id, cand, evidence_records=ev, claims=claims,
+            existing_niches=[])
+        insuff = [f for f in rep.failures if f.name == "insufficient_evidence"]
+        assert insuff and insuff[0].metrics["required"] >= 4
+        assert rep.verdict == "downgrade"
+
 
 # ------------------------------------------------- keyword metadata integrity
 class TestKeywordIntegrity:

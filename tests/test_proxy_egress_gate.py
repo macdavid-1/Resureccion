@@ -609,6 +609,7 @@ def test_camoufox_proxy_kwargs_skip_dead_proxy(monkeypatch) -> None:
         camoufox_geoip=False,
         browser_headless=True,
         browser_profiles_dir=Path("/tmp/rx-camo-fp"),
+        browser_content_processors=2,
     )
     # Avoid the fingerprint cache touching disk.
     monkeypatch.setattr(

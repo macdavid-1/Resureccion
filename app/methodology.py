@@ -181,7 +181,11 @@ SPECS: dict[str, PhaseSpec] = {
             "pricing, rankings where observable, publication dates, review "
             "counts, review patterns, recurring complaints, recurring praise, "
             "apparent weaknesses, and saturation signals. Note whether the "
-            "top sellers are saturated rehashes or strong incumbents."
+            "top sellers are saturated rehashes or strong incumbents. Open "
+            "each incumbent's product page (open_product) so its category "
+            "path and best-seller rank are captured — the report derives "
+            "recommended KDP categories and entry barriers from exactly "
+            "these pages."
         ),
     ),
     P4_CONSUMER: PhaseSpec(
@@ -230,7 +234,13 @@ SPECS: dict[str, PhaseSpec] = {
             "Use ranking stability, review velocity, breadth of competing "
             "titles, and KDSpy data where available. NEVER declare demand "
             "merely because a keyword exists. Downgrade or reject candidates "
-            "whose demand rests on a single anomaly."
+            "whose demand rests on a single anomaly. Validate KEYWORDS "
+            "concretely: for every serious candidate run search_marketplace "
+            "with the EXACT keyword phrases you intend to recommend "
+            "(prioritize the strongest candidates; one action per phrase) — "
+            "the report ranks keywords by the result counts and top-10 "
+            "review barriers captured from these searches, and marks "
+            "unsearched keywords as unmeasured."
         ),
     ),
     P6_GAP: PhaseSpec(
@@ -275,7 +285,10 @@ SPECS: dict[str, PhaseSpec] = {
             "language-specific, marketplace-specific, broadly recurring, or "
             "emerging elsewhere. Do NOT mechanically visit every marketplace "
             "and do NOT require identical performance across markets — "
-            "absence in one market is data, not disqualification."
+            "absence in one market is data, not disqualification. While "
+            "there, spot-check the strongest keywords of leading candidates "
+            "on the additional marketplaces so cross-market keyword demand "
+            "is measured, not assumed."
         ),
     ),
     P8_ADVERSARIAL: PhaseSpec(
@@ -321,7 +334,10 @@ SPECS: dict[str, PhaseSpec] = {
             "manufacture opportunities to hit a quota; quality precedes "
             "quantity. Each opportunity must already have survived "
             "adversarial verification: the owner must not need to redo basic "
-            "validation."
+            "validation. Order recommended keywords by the measured search "
+            "evidence already captured (fewer results and lighter top-10 "
+            "review barriers first); never present an unmeasured keyword as "
+            "validated."
         ),
     ),
 }

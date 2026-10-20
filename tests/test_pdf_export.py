@@ -273,3 +273,197 @@ class TestExportAPI:
         res = client.get(f"/api/sessions/{s.id}/artifacts/{body['pdf']['id']}/file", headers=h)
         assert res.status_code == 200
         assert res.content[:5] == b"%PDF-"
+
+
+# 1x1 transparent PNG — a real decodable image PDFKit will accept.
+_TINY_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _with_figures(model: dict, session_id: str, artifacts) -> dict:
+    """Wire figures the same way export_pdf does before shaping blocks."""
+    from app.pdf_export import _resolve_figures
+
+    return {**model, "figures": _resolve_figures(session_id, model, artifacts)}
+
+
+def _seed_screenshot(session_id: str, artifacts, filename: str = "cap.png") -> str:
+    art = artifacts.save_bytes(
+        session_id, kind="screenshot", filename=filename, data=_TINY_PNG
+    )
+    return art.id
+
+
+class TestReportFigures:
+    """Screenshots must flow WITH the claim they document, not pile up at the end."""
+
+    def test_competitor_screenshot_sits_under_its_own_metrics(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import model_to_blocks
+
+        arts = ArtifactStore(db, config)
+        sid = _seed_screenshot(session, arts)
+        m = _minimal_model()
+        m["competitors"][0]["screenshot_artifact_id"] = sid
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = sid
+
+        _, _, blocks = model_to_blocks(_with_figures(m, session, arts))
+
+        imgs = [i for i, b in enumerate(blocks) if b.get("t") == "img"]
+        assert len(imgs) == 1, "the competitor's capture must appear exactly once"
+
+        # It must sit INSIDE the competitor's entry — after its heading, and
+        # before the next section — so the numbers and the image read together.
+        idx = imgs[0]
+        headings_before = [b for b in blocks[:idx] if b.get("t") in ("h2", "h3")]
+        assert headings_before, "image must come after a heading"
+        assert headings_before[-1]["x"] == "Generic Grief Journal"
+        after = [b for b in blocks[idx + 1:] if b.get("t") == "h2"]
+        assert after and after[0]["x"] == "Candidate Ledger"
+
+        # Caption carries the claim the screenshot substantiates.
+        cap = blocks[idx]["caption"]
+        assert "310 reviews" in cap and "42000" in cap and "TEST00001" in cap
+
+    def test_no_trailing_gallery_when_everything_is_inline(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import model_to_blocks
+
+        arts = ArtifactStore(db, config)
+        sid = _seed_screenshot(session, arts)
+        m = _minimal_model()
+        m["competitors"][0]["screenshot_artifact_id"] = sid
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = sid
+
+        _, _, blocks = model_to_blocks(_with_figures(m, session, arts))
+        h2s = [b["x"] for b in blocks if b.get("t") == "h2"]
+        assert "Research Screenshots" not in h2s, (
+            "an inline-placed capture must not be duplicated in a gallery"
+        )
+
+    def test_orphan_evidence_still_gets_a_capped_gallery(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import MAX_REPORT_FIGURES, model_to_blocks
+
+        arts = ArtifactStore(db, config)
+        m = _minimal_model()
+        # Screenshots on evidence rows that match no competitor.
+        m["evidence_appendix"] = [
+            {"id": f"e{i}", "kind": "product", "marketplace": "us",
+             "url": f"https://www.amazon.com/dp/X{i:06d}", "title": f"Row {i}",
+             "asin": f"X{i:06d}", "captured_at": "2026-09-18T00:00:00Z",
+             "screenshot_artifact_id": _seed_screenshot(session, arts, f"c{i}.png")}
+            for i in range(40)
+        ]
+        _, _, blocks = model_to_blocks(_with_figures(m, session, arts))
+        imgs = [b for b in blocks if b.get("t") == "img"]
+        assert 0 < len(imgs) <= MAX_REPORT_FIGURES, (
+            f"expected a capped gallery, got {len(imgs)}"
+        )
+
+    def test_budget_is_shared_across_inline_and_gallery(self, db, config, session):
+        """Inline placement spends the same budget — total never exceeds the cap."""
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import MAX_REPORT_FIGURES, model_to_blocks
+
+        arts = ArtifactStore(db, config)
+        m = _minimal_model()
+        rows = []
+        for i in range(30):
+            sid = _seed_screenshot(session, arts, f"s{i}.png")
+            rows.append({"id": f"e{i}", "kind": "product", "marketplace": "us",
+                         "url": f"https://www.amazon.com/dp/Y{i:06d}", "title": f"Row {i}",
+                         "asin": f"Y{i:06d}", "captured_at": "2026-09-18T00:00:00Z",
+                         "screenshot_artifact_id": sid})
+            if i < 5:  # five competitors also claim a capture
+                m["competitors"].append({
+                    "title": f"Rival {i}", "marketplace": "us", "asin": f"Y{i:06d}",
+                    "rank": 6709 + i, "review_count": 0, "lesson": "x",
+                    "screenshot_artifact_id": sid,
+                })
+        m["evidence_appendix"] = rows
+
+        _, _, blocks = model_to_blocks(_with_figures(m, session, arts))
+        imgs = [b for b in blocks if b.get("t") == "img"]
+        assert len(imgs) <= MAX_REPORT_FIGURES
+        # No artifact is rendered twice.
+        paths = [b["path"] for b in imgs]
+        assert len(paths) == len(set(paths))
+
+    def test_zero_review_competitor_reads_next_to_its_image(self, db, config, session):
+        """The worked example: 'no reviews and a 6709 BSR' beside the screenshot."""
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import model_to_blocks
+
+        arts = ArtifactStore(db, config)
+        sid = _seed_screenshot(session, arts)
+        m = _minimal_model()
+        m["competitors"][0].update(
+            {"review_count": 0, "rank": 6709, "screenshot_artifact_id": sid}
+        )
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = sid
+
+        _, _, blocks = model_to_blocks(_with_figures(m, session, arts))
+        img = next(b for b in blocks if b.get("t") == "img")
+        assert "0 reviews" in img["caption"]
+        assert "BSR 6709" in img["caption"]
+
+    def test_missing_or_pruned_artifact_never_breaks_export(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import _resolve_figures
+
+        arts = ArtifactStore(db, config)
+        m = _minimal_model()
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = "art_does_not_exist"
+        assert _resolve_figures(session, m, arts) == []
+
+    def test_path_escaping_artifacts_root_is_refused(self, db, config, session, tmp_path):
+        """The renderer reads whatever path it is handed — containment is checked."""
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import _resolve_figures
+
+        arts = ArtifactStore(db, config)
+        real = arts.save_bytes(session, kind="screenshot", filename="ok.png", data=_TINY_PNG)
+        # A real file that genuinely sits OUTSIDE the artifacts root.
+        outside = tmp_path / "outside-root.png"
+        outside.write_bytes(_TINY_PNG)
+
+        # Threat model: the artifact row itself points somewhere it shouldn't.
+        # The sidecar reads whatever path it is handed, so containment is
+        # verified in _resolve_figures rather than trusted from the DB.
+        with db.tx() as conn:
+            conn.execute(
+                "UPDATE artifacts SET path = ? WHERE id = ?",
+                (str(outside), real.id),
+            )
+        m = _minimal_model()
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = real.id
+        assert arts.get(session, real.id).path == str(outside)
+        assert _resolve_figures(session, m, arts) == []
+
+        # And the same row resolves fine once it points back inside the root.
+        with db.tx() as conn:
+            conn.execute(
+                "UPDATE artifacts SET path = ? WHERE id = ?",
+                (real.path, real.id),
+            )
+        assert len(_resolve_figures(session, m, arts)) == 1
+
+    def test_html_artifact_renders_the_same_figure(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import model_to_blocks, render_report_html
+
+        arts = ArtifactStore(db, config)
+        sid = _seed_screenshot(session, arts)
+        m = _minimal_model()
+        m["competitors"][0]["screenshot_artifact_id"] = sid
+        m["evidence_appendix"][0]["screenshot_artifact_id"] = sid
+
+        wired = _with_figures(m, session, arts)
+        _, _, blocks = model_to_blocks(wired)
+        html = render_report_html(wired, blocks)
+        assert "<figure class=\"fig\">" in html
+        assert "310 reviews" in html

@@ -22,15 +22,17 @@ Set these in the deployment platform's environment settings (never commit real v
 ## Research model (Stage 3 — required for research runs)
 
 The agent reasons, orchestrates, reads screenshots, and emits JSON actions
-through an OpenAI-compatible vision LLM. Default: **GLM-5.3-Flash on
-DeepInfra** (native vision + strong reasoning + prompt caching, 1M context).
+through an OpenAI-compatible vision LLM. Default: **MiMo-V2.6-Flash on
+DeepInfra** (thinking/reasoning model, native vision, 1M context).
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `MODEL_API_KEY` | **yes** (for research) | — | DeepInfra API token (or any OpenAI-compatible key) |
 | `MODEL_BASE_URL` | no | `https://api.deepinfra.com/v1/openai` | OpenAI-compatible endpoint |
-| `MODEL_NAME` | no | `zai-org/GLM-5.3-Flash` | Model id at the endpoint |
-| `MODEL_MAX_TOKENS` | no | `8192` | Max completion tokens per call |
+| `MODEL_NAME` | no | `XiaomiMiMo/MiMo-V2.6-Flash` | Model id at the endpoint |
+| `MODEL_MAX_TOKENS` | no | `16384` | Max completion tokens per call. A reasoning model's thinking tokens are billed against this, so a thinking run at high effort needs headroom or the answer gets truncated |
+| `MODEL_THINKING` | no | `true` | Ask the reasoning model to think before answering |
+| `MODEL_REASONING_EFFORT` | no | `high` | `low` / `medium` / `high`. Any other value is a loud boot error. Providers ignore this on non-reasoning models |
 | `MODEL_TEMPERATURE` | no | `0.4` | Sampling temperature |
 | `MODEL_TIMEOUT_SECONDS` | no | `180` | HTTP timeout per model call |
 | `MODEL_VISION_ENABLED` | no | `true` | Attach latest browser screenshot to each iteration |
@@ -58,6 +60,7 @@ rejection or downgrade, never a lowered bar.
 | `THRESH_MIN_SUPPORTED_RATIO` | `0.6` | Min share of important claims that must cite evidence ids |
 | `THRESH_MAX_INFERENCE_RATIO` | `0.5` | Max share of claims that may be pure model inference |
 | `THRESH_MIN_SATURATION_SAMPLE` | `4` | Competitors with observable data before a saturation judgment is allowed |
+| `THRESH_MIN_CANDIDATE_EVIDENCE` | `4` | Per-candidate evidence floor: distinct evidence records an individual candidate needs before advancing (session totals don't count) |
 
 The integrity pipeline (after Phase 8, before synthesis) runs 12 named
 candidate filters, the verification engine, KDP risk screening, the 7 session
@@ -84,9 +87,11 @@ itself, never silently.
 | `RELAY_ALLOW_DIRECT` | no | `true` | When `false`, direct server egress is never used — browser traffic is strictly device-or-proxy only |
 | `RELAY_TOKEN` | no | — | Explicit relay bearer token; when unset a strong token is generated once and stored under `DATA_DIR/relay_token` (owner-only permissions, never committed) |
 | `BROWSER_IDLE_SHUTDOWN_SECONDS` | no | `300` | Auto-stop the browser after idle to free the 2 cores |
+| `BROWSER_KEEPALIVE_SECONDS` | no | `45` | Cadence for the invisible same-origin request sent while the model is thinking, so the egress path is not reaped mid-call. Firefox reaps idle connections after ~115s and Cloudflare fronts after ~400s; 45s sits well inside both. It is real traffic through the real proxy — deliberately **not** cursor motion or scrolling, which produce no network traffic and cannot hold a connection open. `0` disables. A non-integer is a loud boot error, never a silent fallback. |
 | `BROWSER_DEFAULT_TIMEOUT_SECONDS` | no | `45` | Playwright default action timeout |
 | `BROWSER_NAV_TIMEOUT_SECONDS` | no | `60` | Navigation timeout |
 | `BROWSER_MAX_OPEN_PAGES` | no | `4` | Page pool cap (2-core budget) |
+| `BROWSER_CONTENT_PROCESSORS` | no | `2` | Firefox content processes (`dom.ipc.processCount`) — the main lever for fitting the engine to the host. Each costs a few hundred MB of RAM: keep `2` on a small box, `3`–`4` on a 4-core/8 GB VPS. Clamped to 1–8 so a typo can never starve or overcommit the browser; a non-integer is a loud boot error. The pm2 profile on a 4 vCPU/8 GB box sets `3` |
 | `BROWSER_USER_AGENT` | no | — | Optional explicit UA override |
 | `BROWSER_LOCALE` | no | `en-US` | Browser locale |
 | `BROWSER_TIMEZONE` | no | `America/New_York` | Browser timezone |

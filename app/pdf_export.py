@@ -39,11 +39,86 @@ class PdfExportError(Exception):
     pass
 
 
+# Research screenshots embedded in the PDF. Capped deliberately: each is a
+# full-width image on a 6x9 page, so an uncapped appendix would turn a
+# readable report into a screenshot dump.
+MAX_REPORT_FIGURES = 12
+
+# PDFKit can only decode these; anything else makes the renderer fall back
+# to a placeholder line.
+_FIGURE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+
+
 def node_available() -> bool:
     global _node_ok
     if _node_ok is None:
         _node_ok = shutil.which("node") is not None and _SIDECAR.is_file()
     return _node_ok
+
+
+def _resolve_figures(
+    session_id: str,
+    model: dict[str, Any],
+    artifacts: ArtifactStore,
+    *,
+    limit: int = MAX_REPORT_FIGURES,
+) -> list[dict[str, str]]:
+    """Resolve the report's evidence screenshots to embeddable file paths.
+
+    Walks the report's own evidence appendix (not every row in the database)
+    so a screenshot only appears when the evidence it documents actually
+    reached the report. Each path is checked to exist, to be a decodable
+    image, and to live inside the artifact root — the renderer reads whatever
+    path it is handed, so containment is verified here rather than trusted.
+
+    A missing or pruned artifact is skipped: losing a figure must never abort
+    an export.
+    """
+    appendix = model.get("evidence_appendix") or []
+    if not isinstance(appendix, list) or not appendix:
+        return []
+    try:
+        root = artifacts.config.artifacts_dir.resolve()
+    except Exception:
+        return []
+
+    figures: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in appendix:
+        if len(figures) >= limit:
+            break
+        artifact_id = row.get("screenshot_artifact_id") if isinstance(row, dict) else None
+        if not artifact_id or artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        try:
+            art = artifacts.get(session_id, artifact_id)
+        except Exception:
+            continue
+        if art is None or not art.path:
+            continue
+        path = Path(art.path)
+        if path.suffix.lower() not in _FIGURE_SUFFIXES:
+            continue
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root)  # raises when the path escapes the root
+        except Exception:
+            continue
+        if not resolved.is_file():
+            continue
+        label = str(row.get("title") or row.get("url") or "").strip()
+        kind = str(row.get("kind") or "capture").replace("_", " ")
+        market = str(row.get("marketplace") or "")
+        caption = " · ".join(
+            x for x in (market.upper() if market else "", kind, label[:90]) if x
+        )
+        figures.append({
+            "artifact_id": artifact_id,
+            "path": str(resolved),
+            "caption": caption or "Research capture",
+        })
+    return figures
 
 
 # --------------------------------------------------------------------- blocks
@@ -221,6 +296,40 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
         )
 
     # --------------------------------------------------------- competitors
+    # Screenshots travel WITH the claim they document rather than being dumped
+    # in a gallery at the end: each competitor's capture sits directly under its
+    # own metrics, so "0 reviews · BSR 6,709" is readable next to the image that
+    # proves it. One shared budget spans the whole report, so a session with a
+    # hundred captures still ships a readable report, not a screenshot album.
+    figures: list[dict[str, Any]] = list(model.get("figures", []) or [])
+    fig_by_id = {f.get("artifact_id"): f for f in figures if f.get("artifact_id")}
+    placed: set[str] = set()
+    _budget = {"left": MAX_REPORT_FIGURES}
+
+    def place(artifact_id: Any, caption: str) -> None:
+        """Emit one figure inline if the budget allows. Idempotent per artifact."""
+        if not artifact_id or _budget["left"] <= 0 or artifact_id in placed:
+            return
+        fig = fig_by_id.get(artifact_id)
+        if not fig:
+            return
+        placed.add(artifact_id)
+        _budget["left"] -= 1
+        blocks.append({"t": "img", "path": fig["path"], "caption": caption})
+
+    def competitor_caption(c: dict[str, Any]) -> str:
+        """Caption states the claim the screenshot is evidence for."""
+        bits = []
+        if c.get("marketplace"):
+            bits.append(str(c["marketplace"]).upper())
+        if c.get("review_count") is not None:
+            bits.append(f"{c['review_count']} reviews")
+        if c.get("rank") is not None:
+            bits.append(f"BSR {c['rank']}")
+        if c.get("asin"):
+            bits.append(str(c["asin"]))
+        return " · ".join(bits) or str(c.get("title") or "Research capture")
+
     comps = model.get("competitors", []) or []
     if comps:
         h2("Competitor Analysis")
@@ -243,6 +352,8 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
                 bits.append(f"Saturation: {c['saturation']}")
             if bits:
                 p(" · ".join(str(b) for b in bits))
+            # The capture lands right under the numbers it substantiates.
+            place(c.get("screenshot_artifact_id"), competitor_caption(c))
             if c.get("url"):
                 p(str(c["url"]))
             if c.get("positioning"):
@@ -306,6 +417,28 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
             ],
         )
 
+    # ------------------------------------------- remaining research captures
+    # Only evidence that did NOT already appear next to a competitor, and only
+    # within whatever budget the inline placement left. A report whose captures
+    # all found an inline home gets no trailing section at all.
+    leftovers = [
+        f for f in figures
+        if isinstance(f, dict) and f.get("path")
+        and f.get("artifact_id") not in placed and _budget["left"] > 0
+    ][: _budget["left"]]
+    if leftovers:
+        h2("Research Screenshots")
+        p("Captured live by the research browser during this session — the "
+          "visual ground truth behind the evidence table above.")
+        for fig in leftovers:
+            placed.add(fig.get("artifact_id"))
+            _budget["left"] -= 1
+            blocks.append({
+                "t": "img",
+                "path": str(fig["path"]),
+                "caption": str(fig.get("caption") or "Research capture"),
+            })
+
     blocks.append({"t": "hr"})
     p("Generated by Resurrección from durable, evidence-linked research state. "
       "Every opportunity above passed the deterministic methodology, the "
@@ -341,6 +474,10 @@ td { padding: 5px 6px; border-bottom: .5px solid #d8dce8; vertical-align: top; }
         color: #1207DA; border: 1px solid #1207DA; border-radius: 8px; padding: 2px 10px; margin: 10px 0; }
 hr { border: none; border-top: .6px solid #d8dce8; margin: 16px 0; }
 img { max-width: 100%; }
+.fig { margin: 12px 0; }
+.fig img { display: block; width: 100%; border: .5px solid #d8dce8; }
+.fig figcaption { font-family: Helvetica, Arial, sans-serif; font-size: 7.2pt; color: #4b5162;
+                  letter-spacing: .03em; margin-top: 4px; }
 .small { font-size: 7.5pt; color: #4b5162; }
 """
 
@@ -392,6 +529,15 @@ def render_report_html(model: dict[str, Any], blocks: list[dict[str, Any]]) -> s
             body.append("<hr>")
         elif t == "chip":
             body.append(f'<span class="chip">{esc(b.get("x", ""))}</span>')
+        elif t == "img":
+            # Same figure the PDF shows — without this the HTML artifact
+            # would silently drop every screenshot from the report.
+            src = str(b.get("path") or "")
+            if src:
+                body.append(
+                    f'<figure class="fig"><img src="{esc(src)}" alt="{esc(b.get("caption", ""))}">'
+                    f'<figcaption>{esc(b.get("caption", ""))}</figcaption></figure>'
+                )
         elif t == "table":
             rows = b.get("rows", [])
             head = b.get("head", [])
@@ -428,6 +574,9 @@ def export_pdf(
         raise PdfExportError(
             "PDF export unavailable: node or scripts/render_pdf.js is missing"
         )
+    # Resolve the report's evidence screenshots to real files BEFORE shaping
+    # blocks, so the sidecar receives plain paths and never touches the DB.
+    model = {**model, "figures": _resolve_figures(session_id, model, artifacts)}
     title, subtitle, blocks = model_to_blocks(model)
     out_dir = artifacts.session_dir(session_id)
     out_dir.mkdir(parents=True, exist_ok=True)

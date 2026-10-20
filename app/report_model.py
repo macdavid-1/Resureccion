@@ -18,6 +18,9 @@ Every section is derived from stores — never invented here:
   Book angles              ← P4 design opportunities + P6 gap analyses
   Titles                   ← opportunity contract title_concepts
   Keywords                 ← opportunity keywords, integrity-screened
+  Keyword plan             ← keywords ranked by measured search evidence
+  KDP categories           ← recommended categories from competitor pages
+  Demand vs competition    ← standing ratio verdict from the filters
   KDP risk                 ← deterministic risk assessments
   Evidence appendix        ← browser evidence ledger
   Quality statement        ← counts, verification outcomes, limitations
@@ -27,9 +30,11 @@ Nothing in this module fabricates: where data is absent the model says so.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.integrity import KIND_FILTER
 from app.methodology import PHASE_ORDER, PHASE_TITLES
 from app.marketplace import AMAZON_MARKETPLACES
 
@@ -124,11 +129,21 @@ def build_report_model(
     # Flat lookups -----------------------------------------------------------
     risk_by_cand: dict[str, dict[str, Any]] = {}
     kwi_by_cand: dict[str, dict[str, Any]] = {}
+    demand_acc_by_cand: dict[str, dict[str, Any]] = {}
     if assessments is not None:
         for a in assessments.list(session_id, kind="kdp_risk", limit=800):
             risk_by_cand.setdefault(a.subject_id, a.metrics or {})
         for a in assessments.list(session_id, kind="keyword_integrity", limit=800):
             kwi_by_cand.setdefault(a.subject_id, a.metrics or {})
+        # The standing demand-vs-competition verdict (recorded pass or fail
+        # by the demand_accommodation filter) — rendered for every dossier.
+        for a in assessments.list(session_id, kind=KIND_FILTER, limit=800):
+            if a.stage == "demand_accommodation":
+                demand_acc_by_cand.setdefault(a.subject_id, {
+                    "outcome": a.outcome,
+                    "reason": a.reason,
+                    "metrics": a.metrics or {},
+                })
     claims_by_cand: dict[str, list[Any]] = {}
     for c in claims.list(session_id, limit=3000):
         claims_by_cand.setdefault(c.candidate_id or "", []).append(c)
@@ -179,6 +194,9 @@ def build_report_model(
             "angles": _angles_for(o.niche, cons_out, gap_out, cand_claims),
             "titles": _titles_for(meta),
             "keywords": _keyword_clusters(o.keywords, o.niche),
+            "keyword_plan": _keyword_plan(o.keywords, ev_rows),
+            "category_plan": _category_plan(ev_ids, ev_rows),
+            "demand_accommodation": demand_acc_by_cand.get(o.candidate_id) or {},
             "evidence_ids": ev_ids[:24],
             "next_step": _next_step(o, best_v),
         })
@@ -485,6 +503,130 @@ def _titles_for(meta: dict[str, Any]) -> list[dict[str, Any]]:
             out.append({"title": str(t), "subtitle": "",
                         "rationale": "Derived from observed buyer language and competitor positioning."})
     return out
+
+
+def _norm_kw(s: str) -> str:
+    """Normalized keyword/query text for matching (case/punct/space-insensitive)."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())).strip()
+
+
+def _ev_field(e: Any, name: str, default: Any = None) -> Any:
+    """Evidence rows are BrowserEvidence objects from the store (dicts in
+    unit tests) — read either shape interchangeably."""
+    if isinstance(e, dict):
+        return e.get(name, default)
+    v = getattr(e, name, default)
+    return default if v is None else v
+
+
+def _median_int(values: list[int]) -> int | None:
+    if not values:
+        return None
+    s = sorted(values)
+    mid = len(s) // 2
+    return int(s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2)
+
+
+def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank opportunity keywords against MEASURED Amazon search evidence.
+
+    Keywords the research actually searched (matching search_results
+    evidence) carry their captured result count and the median review count
+    of the top results (the entry barrier), and rank first — lightest
+    barrier first. Keywords never searched follow, honestly marked, so an
+    unmeasured keyword is never presented as validated.
+    """
+    exact: dict[str, dict[str, Any]] = {}
+    partial: list[tuple[str, dict[str, Any]]] = []
+    for e in ev_rows:
+        if _ev_field(e, "kind") != "search_results":
+            continue
+        data = _ev_field(e, "data") or {}
+        nq = _norm_kw(str(data.get("query") or ""))
+        if not nq:
+            continue
+        exact.setdefault(nq, e)
+        partial.append((nq, e))
+    plan: list[dict[str, Any]] = []
+    for kw in keywords or []:
+        k = str(kw).strip()
+        if not k:
+            continue
+        nk = _norm_kw(k)
+        match = exact.get(nk)
+        if match is None:
+            for nq, e in partial:
+                if nk in nq or nq in nk:
+                    match = e
+                    break
+        if match is not None:
+            d = _ev_field(match, "data") or {}
+            results = list(d.get("results") or [])[:10]
+            reviews = [int(r.get("review_count") or 0) for r in results
+                       if r.get("review_count") is not None]
+            plan.append({
+                "keyword": k,
+                "measured": True,
+                "result_count": int(d.get("result_count") or 0),
+                "top10_review_median": _median_int(reviews),
+                "marketplace": str(_ev_field(match, "marketplace") or ""),
+                "evidence_id": str(_ev_field(match, "id") or ""),
+            })
+        else:
+            plan.append({
+                "keyword": k, "measured": False, "result_count": None,
+                "top10_review_median": None, "marketplace": "", "evidence_id": "",
+            })
+    measured = [p for p in plan if p["measured"]]
+    unmeasured = [p for p in plan if not p["measured"]]
+    # Measured first: lightest entry barrier wins; ties → fewer results,
+    # then alphabetical for determinism.
+    measured.sort(key=lambda p: (
+        p["top10_review_median"] is None,
+        p["top10_review_median"] if p["top10_review_median"] is not None else 0,
+        p["result_count"] if p["result_count"] is not None else 0,
+        p["keyword"].lower(),
+    ))
+    return measured + unmeasured
+
+
+def _category_plan(ev_ids: list[str], ev_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Recommended KDP categories from observed competitor product pages.
+
+    Pages linked to the opportunity are preferred; when none are linked it
+    falls back to session-wide product pages and SAYS SO — the report never
+    presents a fallback as direct linkage.
+    """
+    want = {str(x) for x in ev_ids}
+    pages = [e for e in ev_rows
+             if _ev_field(e, "kind") == "product_page"
+             and str(_ev_field(e, "id")) in want]
+    basis = "linked"
+    if not pages:
+        pages = [e for e in ev_rows if _ev_field(e, "kind") == "product_page"]
+        basis = "session_fallback"
+    stats: dict[str, dict[str, Any]] = {}
+    for e in pages:
+        d = _ev_field(e, "data") or {}
+        path = [str(c).strip() for c in (d.get("category_path") or []) if str(c).strip()]
+        cat = (path[-1] if path else str(d.get("best_seller_category") or "").strip())
+        if not cat:
+            continue
+        s = stats.setdefault(cat, {
+            "category": cat, "top_level": path[0] if path else "",
+            "observed_books": 0, "_reviews": [],
+        })
+        s["observed_books"] += 1
+        if d.get("review_count") is not None:
+            s["_reviews"].append(int(d.get("review_count") or 0))
+    items: list[dict[str, Any]] = []
+    for s in stats.values():
+        med = _median_int(s.pop("_reviews"))
+        items.append({**s, "median_reviews": med})
+    # Where most observed incumbents actually rank first; on ties the
+    # lighter review barrier is friendlier for a new entrant.
+    items.sort(key=lambda s: (-s["observed_books"], s["median_reviews"] if s["median_reviews"] is not None else -1))
+    return {"basis": basis, "items": items[:5]}
 
 
 def _keyword_clusters(keywords: list[str], niche: str) -> dict[str, Any]:
@@ -971,6 +1113,24 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
         a(f"  - Demand risks: {'; '.join(str(x) for x in d['demand_risks'])}")
     a("")
 
+    # Demand vs competition — the standing ratio verdict from the
+    # deterministic demand_accommodation filter (recorded pass or fail).
+    da = o.get("demand_accommodation") or {}
+    if da:
+        m = da.get("metrics") or {}
+        verdict = (
+            "accommodated" if da.get("outcome") == "pass"
+            else "needs more demand research"
+        )
+        a("**Demand vs competition:** "
+          f"{m.get('distinct_competitor_asins', '—')} incumbent(s), "
+          f"{m.get('deep_review_moats', '—')} with deep review moats · "
+          f"{m.get('supported_demand_claims', '—')} evidenced demand claim(s), "
+          f"{m.get('demand_signals', '—')} demand signal(s) → **{verdict}**")
+        if da.get("outcome") != "pass" and da.get("reason"):
+            a(f"  - {da['reason']}")
+        a("")
+
     # Marketplace analysis.
     m = o.get("marketplace_analysis") or {}
     if m:
@@ -992,6 +1152,28 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
         a("")
     if o.get("consumer_needs"):
         a(f"**Consumer needs:** {o['consumer_needs']}")
+        a("")
+
+    # Recommended KDP categories — derived from observed competitor pages.
+    cat_plan = o.get("category_plan") or {}
+    cat_items = cat_plan.get("items") or []
+    if cat_items:
+        a("**Recommended KDP categories** (where the observed competitors "
+          "actually rank — entry barrier = median reviews among the books "
+          "observed there)")
+        a("")
+        for c in cat_items:
+            rev = c.get("median_reviews")
+            line = (f"- **{c.get('category', '—')}** — "
+                    f"{c.get('observed_books', 0)} observed incumbent(s)"
+                    + (f", median {rev} reviews" if rev is not None else ""))
+            top = str(c.get("top_level") or "")
+            if top and top != c.get("category"):
+                line += f" · top-level: {top}"
+            a(line)
+        if cat_plan.get("basis") == "session_fallback":
+            a("- *Derived from session-wide competitor pages — none were "
+              "directly linked to this opportunity.*")
         a("")
 
     # Angles.
@@ -1037,6 +1219,26 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
         kwi = o.get("keyword_integrity") or {}
         if kwi.get("warnings"):
             a(f"- *Integrity notes:* {'; '.join(str(w) for w in kwi['warnings'][:3])}")
+        a("")
+
+    # Keyword plan — ranked by MEASURED search evidence.
+    kp = o.get("keyword_plan") or []
+    if kp:
+        a("**Keyword plan** (ranked by measured Amazon search evidence — "
+          "lighter top-10 review barriers first; keywords the research never "
+          "searched are marked, never assumed)")
+        a("")
+        a("| Rank | Keyword | Results captured | Median reviews (top 10) | Marketplace |")
+        a("|---|---|---|---|---|")
+        for i, e in enumerate(kp, 1):
+            kw = str(e.get("keyword", "")).replace("|", "\\|")
+            if e.get("measured"):
+                med = e.get("top10_review_median")
+                a(f"| {i} | {kw} | {e.get('result_count', '—')} "
+                  f"| {med if med is not None else '—'} "
+                  f"| {e.get('marketplace') or '—'} |")
+            else:
+                a(f"| {i} | {kw} | not searched | not searched | — |")
         a("")
 
     # KDP risk.

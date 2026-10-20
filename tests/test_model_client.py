@@ -177,15 +177,81 @@ async def test_no_screenshot_sends_plain_text_even_with_vision_on():
 
 
 def test_deepinfra_defaults():
-    """Defaults must target GLM-5.3-Flash on DeepInfra."""
+    """Defaults must target MiMo-V2.6-Flash on DeepInfra (a thinking model)."""
     from app.model_client import DEFAULT_BASE_URL, DEFAULT_MODEL
-
     assert DEFAULT_BASE_URL == "https://api.deepinfra.com/v1/openai"
-    assert DEFAULT_MODEL == "zai-org/GLM-5.3-Flash"
+    assert DEFAULT_MODEL == "XiaomiMiMo/MiMo-V2.6-Flash"
     cfg = Config()
     assert cfg.model_base_url == DEFAULT_BASE_URL
     assert cfg.model_name == DEFAULT_MODEL
     assert cfg.model_vision_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_thinking_is_on_by_default_and_sends_reasoning_effort():
+    """Thinking is the default: reasoning_effort must ride the payload."""
+    cfg = _config()
+    assert cfg.model_thinking_enabled is True
+    assert cfg.model_reasoning_effort == "high"
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call("s1", system="s", user="u")
+    assert seen["body"]["reasoning_effort"] == "high"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_can_be_lowered():
+    """MODEL_REASONING_EFFORT=low must be what actually ships."""
+    cfg = _config(model_reasoning_effort="low")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call("s1", system="s", user="u")
+    assert seen["body"]["reasoning_effort"] == "low"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_thinking_disabled_omits_reasoning_effort():
+    """MODEL_THINKING=false must not send the parameter at all."""
+    cfg = _config(model_thinking_enabled=False)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call("s1", system="s", user="u")
+    assert "reasoning_effort" not in seen["body"]
+    await client.aclose()
+
+
+def test_reasoning_effort_is_validated(monkeypatch) -> None:
+    """A typo in the effort must be a loud boot error, never a silent default."""
+    monkeypatch.setenv("MODEL_REASONING_EFFORT", "ultra")
+    with pytest.raises(RuntimeError, match="MODEL_REASONING_EFFORT"):
+        Config()
+
+
+def test_single_source_of_truth_for_model_default() -> None:
+    """config and model_client must agree — a half-applied model switch is
+    exactly the failure this guards."""
+    from app import config as config_mod
+    from app import model_client as mc
+
+    assert mc.DEFAULT_MODEL == config_mod.DEFAULT_MODEL
+    assert mc.DEFAULT_BASE_URL == config_mod.DEFAULT_BASE_URL
 
 
 @pytest.mark.asyncio

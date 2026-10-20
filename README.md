@@ -172,6 +172,22 @@ shell required, on the preview or on the deployed Space:
    research never stalls — and switches back automatically when the device
    returns. Verify the live exit IP anytime with **Test egress**.
 
+## Running on your own VPS
+
+Clone, add your env values, and run one command:
+
+```bash
+git clone <repo> ~/resurreccion && cd ~/resurreccion
+sudo sh scripts/vps_deploy.sh
+```
+
+It provisions the host (Python, Node for the PDF sidecar, browser libraries,
+swap, pm2, the Camoufox binary), scaffolds `.env` with generated secrets,
+creates the durable data directory the SQLite database lives in, starts the
+app under pm2, registers it to survive a reboot, and waits until
+`/api/health` answers. Re-running it is the idempotent update path. Full
+walkthrough: `VPS.md`.
+
 ## Your own VPS as the egress proxy (recommended for offline hours)
 
 A dual-stack (IPv4 **and** IPv6) VPS is the cheapest always-on egress that

@@ -34,6 +34,7 @@ from app.browser_store import (
     EXT_INSTALLED,
     EXT_NOT_CONFIGURED,
     EXT_VALIDATED,
+    ExtensionState,
     ExtensionStore,
 )
 from app.config import Config
