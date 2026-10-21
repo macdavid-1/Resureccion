@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -157,6 +158,68 @@ class TestBlockFidelity:
         for s in ("adult children who lost a parent suddenly",
                   "estate checklist section", "Suddenly Gone"):
             assert s in html
+
+
+class TestReportLogo:
+    """Both report covers render the owner-supplied logo (never a redrawn one)."""
+
+    def test_installed_logo_file_is_used_as_is(self):
+        from app.pdf_export import logo_file
+
+        logo = logo_file()
+        assert logo is not None, "static/logo.png missing"
+        assert logo.name == "logo.png"
+        assert logo.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_html_cover_carries_the_logo(self):
+        from app.pdf_export import model_to_blocks, render_report_html
+
+        model = _minimal_model()
+        _, _, blocks = model_to_blocks(model)
+        html = render_report_html(model, blocks)
+        assert 'class="cover-logo"' in html
+        assert "/static/logo.png?v=" in html
+        # The mark leads the cover, above the wordmark.
+        assert html.index("cover-logo") < html.index("R E S U R R E C C I Ó N")
+
+    def test_pdf_job_hands_the_sidecar_the_logo_path(self, db, config, session, monkeypatch):
+        """export_pdf passes the real file path; the sidecar draws it as-is."""
+        if not node_available():
+            pytest.skip("node/pdfkit sidecar unavailable")
+        import app.pdf_export as pex
+        from app.artifacts import ArtifactStore
+
+        captured: dict = {}
+
+        def fake_run(cmd, **kw):
+            captured["job"] = json.loads(kw["input"].decode("utf-8"))
+
+            class Failed:
+                returncode = 1
+                stderr = b"forced"
+
+            return Failed()
+
+        monkeypatch.setattr(pex.subprocess, "run", fake_run)
+        with pytest.raises(PdfExportError):
+            pex.export_pdf(db, config, session, model=_minimal_model(),
+                           artifacts=ArtifactStore(db, config))
+        job = captured["job"]
+        assert job["logo"], "sidecar job is missing the logo path"
+        assert job["logo"].endswith("logo.png")
+        assert Path(job["logo"]).is_file()
+
+    @pytest.mark.skipif(not node_available(), reason="node/pdfkit sidecar unavailable")
+    def test_pdf_cover_actually_embeds_the_logo(self, db, config, session):
+        """The sidecar draws the supplied bytes onto the cover. This model has
+        no screenshots wired, so any embedded image XObject IS the logo."""
+        from app.artifacts import ArtifactStore
+
+        artifacts = ArtifactStore(db, config)
+        result = export_pdf(db, config, session, model=_minimal_model(), artifacts=artifacts)
+        art = artifacts.get(session, result["pdf"]["id"])
+        data = Path(art.path).read_bytes()
+        assert re.search(rb"/Subtype\s*/Image", data), "cover logo missing from the PDF"
 
 
 class TestRealRender:

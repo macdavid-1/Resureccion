@@ -302,6 +302,17 @@ class Renderer {
     // Premium dark cover page.
     d.rect(0, 0, PAGE_W, PAGE_H).fill("#000000");
     d.rect(0, PAGE_H * 0.42, PAGE_W, 2.2).fill(ACCENT);
+    // The installed app logo (static/logo.png) — supplied bytes only, and a
+    // missing/unreadable file must never abort an export.
+    if (this.job.logo) {
+      try {
+        const size = 44;
+        d.image(this.job.logo, MARGIN, PAGE_H * 0.15, { width: size, height: size });
+      } catch (e) {
+        d.font(SANS).fontSize(7).fillColor("#5d6890")
+          .text("[logo unavailable]", MARGIN, PAGE_H * 0.15);
+      }
+    }
     d.font(SANS).fontSize(7.5).fillColor("#5d6890");
     d.text("R E S U R R E C C I Ó N", MARGIN, PAGE_H * 0.30, { characterSpacing: 3 });
     d.font(SANS_BOLD).fontSize(19).fillColor("#f2f4fa");

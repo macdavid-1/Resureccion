@@ -10,6 +10,8 @@ pinned: false
 
 # Resurrección
 
+<img src="static/logo.png" alt="Resurrección logo" width="110">
+
 Private, single-user, server-side autonomous KDP market-research agent.
 
 Live long-running research driven by a real browser + AI agent, designed to run inside a Hugging Face Space with ~2 CPU cores / 16 GB RAM, persisting everything to the Space's persistent storage bucket so that research survives app restarts, Space restarts, browser crashes, and network/model failures. A session can run for hours unattended and be resumed afterward.

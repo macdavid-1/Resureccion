@@ -32,7 +32,19 @@ from app.db import Database, atomic_write_text
 from app.timeutil import iso_now
 
 _SIDECAR = Path(__file__).resolve().parent.parent / "scripts" / "render_pdf.js"
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+LOGO_FILE = _STATIC_DIR / "logo.png"
 _node_ok: bool | None = None  # probe once per process
+
+
+def logo_file() -> Path | None:
+    """The installed app logo (static/logo.png), or None when it is absent.
+
+    The logo is a supplied asset, never generated here — both report covers
+    (the PDF sidecar and the standalone report HTML) render exactly these
+    bytes, and skip the mark cleanly when the file is not deployed.
+    """
+    return LOGO_FILE if LOGO_FILE.is_file() else None
 
 
 class PdfExportError(Exception):
@@ -454,6 +466,8 @@ body { margin: 0; background: #e8e9ee; font-family: Georgia, 'Times New Roman', 
 .sheet { width: 6in; min-height: 9in; margin: 0 auto; background: #fff; padding: 0.72in 0.72in 0.9in;
          box-shadow: 0 2px 14px rgba(0,0,0,.18); }
 .cover { background: #000; color: #f2f4fa; margin: 0; padding: 2.6in 0.72in 0.72in; }
+.cover .cover-logo { display: block; width: 0.62in; height: 0.62in; border-radius: 0.13in;
+                     border: 1px solid #1c2340; margin: 0 0 0.2in; }
 .cover .brand { font-family: Helvetica, Arial, sans-serif; font-size: 7.5pt; letter-spacing: .35em; color: #5d6890; }
 .cover h1 { font-family: Helvetica, Arial, sans-serif; font-size: 19pt; margin: 0.3in 0 0; font-weight: 700; }
 .cover .sub { font-style: italic; color: #aab3d0; font-size: 10pt; margin-top: 10px; }
@@ -500,8 +514,19 @@ def render_report_html(model: dict[str, Any], blocks: list[dict[str, Any]]) -> s
 
     title, subtitle, _ = model_to_blocks(model)
     s = model.get("session", {}) or {}
+    cover_logo = ""
+    if logo_file() is not None:
+        # Served from the same origin as this artifact, content-hash versioned
+        # exactly like the app shell so the cover never shows a stale mark.
+        from app.static_cache import asset_version
+
+        cover_logo = (
+            '<img class="cover-logo" src="/static/logo.png?v='
+            f'{asset_version(_STATIC_DIR, "logo.png")}" alt="Resurrección">'
+        )
     body: list[str] = [
         '<section class="cover">',
+        cover_logo,
         '<div class="brand">R E S U R R E C C I Ó N</div>',
         '<div class="bar"></div>',
         f"<h1>{esc(title)}</h1>",
@@ -588,6 +613,7 @@ def export_pdf(
         "subtitle": subtitle,
         "footer": f"Resurrección  ·  {subtitle}  ·  {stamp}",
         "blocks": blocks,
+        "logo": str(logo) if (logo := logo_file()) else None,
     }
     try:
         proc = subprocess.run(

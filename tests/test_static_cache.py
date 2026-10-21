@@ -50,6 +50,35 @@ def test_versioned_asset_is_immutable_unversioned_is_no_cache(monkeypatch, tmp_p
     assert ru.headers["cache-control"] == "no-cache"
 
 
+def test_logo_installed_and_rendered_everywhere(monkeypatch, tmp_path):
+    """The supplied logo (commit "Logo.png") ships as static/logo.png — byte
+    for byte as uploaded — and renders on every brand surface: favicon,
+    touch icon, login card and app topbar, all content-hash versioned."""
+    client = _client(monkeypatch, tmp_path)
+    logo = Path("static") / "logo.png"
+    assert logo.is_file(), "logo was not installed into static/"
+    data = logo.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "logo is not a PNG"
+    assert len(data) > 10_000, "logo looks truncated"
+
+    r = client.get("/")
+    assert r.status_code == 200
+    ref = f"/static/logo.png?v={_hash(logo)}"
+    # favicon + apple-touch-icon + login + topbar
+    assert r.text.count(ref) >= 4, "logo must render on all four surfaces"
+    assert 'rel="icon"' in r.text and 'rel="apple-touch-icon"' in r.text
+    assert 'class="login-logo"' in r.text
+    assert 'class="brand-logo"' in r.text
+    assert not re.search(r'\?v=\d+"', r.text)  # no manual version leaks
+
+    # The versioned mark is served with the exact uploaded bytes.
+    img = client.get(ref)
+    assert img.status_code == 200
+    assert img.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert img.content == data
+    assert img.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
 def test_render_rewrites_placeholder_versions(monkeypatch, tmp_path):
     """Raw index.html keeps a numeric ?v= placeholder; server rewrites it."""
     raw = (Path("static") / "index.html").read_text(encoding="utf-8")

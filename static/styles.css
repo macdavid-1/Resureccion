@@ -57,6 +57,12 @@ button { font-family: inherit; }
   backdrop-filter: blur(8px);
 }
 .brand { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+/* the installed app logo — black plate on the black chrome */
+.brand-logo {
+  align-self: center; flex: 0 0 auto;
+  width: 30px; height: 30px; border-radius: 7px;
+  border: 1px solid var(--line-strong);
+}
 .brand .word {
   font-size: 1.02rem; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap;
 }
@@ -179,6 +185,11 @@ select { appearance: none; }
 /* ---------- login ---------- */
 #login-view { flex: 1; display: grid; place-items: center; padding: 24px; }
 .login-card { width: min(400px, 100%); }
+.login-logo {
+  display: block; width: 76px; height: 76px; border-radius: 17px;
+  border: 1px solid var(--line-strong); margin-bottom: 16px;
+  box-shadow: 0 10px 34px rgba(18, 7, 218, 0.32);
+}
 .login-mark {
   font-size: 0.72rem; font-weight: 700; letter-spacing: 0.34em;
   color: var(--accent-bright); text-transform: uppercase; margin-bottom: 10px;
