@@ -140,6 +140,15 @@ def pivot_text(phase_title: str, reason: str) -> str:
     return f"Pivoting within {phase_title}: {reason}"
 
 
+def focus_pivot_text(round_no: int, rejected: int) -> str:
+    """Strategic focus pivot: the whole pass was unviable, not just a query."""
+    return (
+        f"Strategic pivot (round {round_no}): deep research and niche-down left "
+        f"nothing verified ({rejected} candidate(s) rejected) — re-entering "
+        "discovery on a new market focus"
+    )
+
+
 def marketplace_text(codes: list[str], mode: str) -> str:
     if mode == "explicit":
         return f"Researching owner-specified marketplaces: {', '.join(codes)}"

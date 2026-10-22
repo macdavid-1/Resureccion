@@ -46,6 +46,7 @@ from app.methodology import (
     SPECS,
     STALL_LIMIT,
     PhaseTiming,
+    focus_pivot_directive,
     validate_opportunity,
 )
 from app.methodology import P8_ADVERSARIAL
@@ -84,6 +85,7 @@ from app.trace import (
     candidate_created_text,
     candidate_rejected_text,
     candidate_verified_text,
+    focus_pivot_text,
     marketplace_text,
     phase_text,
     pivot_text,
@@ -112,6 +114,9 @@ class RunnerConfig:
     max_candidates: int = 24                    # candidates tracked at once
     min_opportunities_target: int = 5           # target for auto sessions
     max_opportunities: int = 12                 # synthesis output cap
+    # A strategic focus pivot spends a whole new P1→P9 pass, so it only
+    # fires while this fraction of the session's hard time budget remains.
+    min_remaining_session_fraction_for_pivot: float = 0.5
 
 
 class ResearchRunner:
@@ -335,43 +340,68 @@ class ResearchRunner:
                 marketplace_text([m.code for m in marketplaces], marketplace_mode),
             )
 
-            # 1-9. The methodology.
+            # 1-9. The methodology. The phase order is strict; the only
+            # repetition is the STRATEGIC FOCUS PIVOT: when a full pass
+            # (deep research + niche-down + adversarial verification + the
+            # integrity pipeline) leaves ZERO verified candidates, discovery
+            # re-enters on a fresh focus, bounded by config.max_focus_pivots.
             phase_outputs: dict[str, Any] = {}
             timings = self._timings_for(session_id)
-            for phase in PHASE_ORDER:
-                if self._cancelled:
-                    raise _Cancelled()
-                if self._pause_requested:
-                    self.checkpoints.save(session_id, "paused:owner", {"at": iso_now(), "phase": phase})
-                    self.sessions.update(session_id, status="paused", error=None)
-                    self.agent.transition(session_id, "waiting_recovery", substate="owner_pause")
-                    self.events.append(session_id, level="info", actor="system", action="paused_by_owner", detail={"phase": phase})
-                    self.trace.record(session_id, KIND_PHASE, f"Paused by owner before {PHASE_TITLES.get(phase, phase)}")
-                    return
-                output = await self._run_phase(
-                    session_id, session, phase, phase_outputs, session_started
-                )
-                phase_outputs[phase] = output
-                self.checkpoints.save(
-                    session_id, f"phase_complete:{phase}",
-                    {"completed_at": iso_now(), "output_keys": sorted(output.keys())},
-                )
-                timings.finish(f"phase:{phase}", outcome="ok")
-                if self.supervisor is not None:
-                    self.supervisor.heartbeat(session_id, phase=phase, note="phase_complete")
-                self.sessions.update(
-                    session_id, phase=SESSION_PHASE_BY_METHOD_PHASE.get(phase, "exploration")
-                )
-                # After adversarial verification (P8), the deterministic
-                # integrity pipeline filters and verifies every synthesis-bound
-                # candidate BEFORE synthesis may run.
-                if phase == P8_ADVERSARIAL:
-                    self.trace.record(
-                        session_id, KIND_VERIFICATION,
-                        "Running the deterministic integrity pipeline: filters and "
-                        "verification decide which candidates may reach synthesis",
+            pivot_round = 0
+            while True:
+                completed_all_phases = True
+                for phase in PHASE_ORDER:
+                    if self._cancelled:
+                        raise _Cancelled()
+                    if self._pause_requested:
+                        self.checkpoints.save(session_id, "paused:owner", {"at": iso_now(), "phase": phase})
+                        self.sessions.update(session_id, status="paused", error=None)
+                        self.agent.transition(session_id, "waiting_recovery", substate="owner_pause")
+                        self.events.append(session_id, level="info", actor="system", action="paused_by_owner", detail={"phase": phase})
+                        self.trace.record(session_id, KIND_PHASE, f"Paused by owner before {PHASE_TITLES.get(phase, phase)}")
+                        return
+                    output = await self._run_phase(
+                        session_id, session, phase, phase_outputs, session_started
                     )
-                    self._run_integrity_pipeline(session_id, phase_outputs)
+                    phase_outputs[phase] = output
+                    self.checkpoints.save(
+                        session_id, f"phase_complete:{phase}",
+                        {"completed_at": iso_now(), "output_keys": sorted(output.keys())},
+                    )
+                    timings.finish(f"phase:{phase}", outcome="ok")
+                    if self.supervisor is not None:
+                        self.supervisor.heartbeat(session_id, phase=phase, note="phase_complete")
+                    self.sessions.update(
+                        session_id, phase=SESSION_PHASE_BY_METHOD_PHASE.get(phase, "exploration")
+                    )
+                    # After adversarial verification (P8), the deterministic
+                    # integrity pipeline filters and verifies every synthesis-bound
+                    # candidate BEFORE synthesis may run.
+                    if phase == P8_ADVERSARIAL:
+                        self.trace.record(
+                            session_id, KIND_VERIFICATION,
+                            "Running the deterministic integrity pipeline: filters and "
+                            "verification decide which candidates may reach synthesis",
+                        )
+                        self._run_integrity_pipeline(session_id, phase_outputs)
+                        # Strategic focus pivot gate: the pass above was deep
+                        # and adversarial, and NOTHING survived it. When the
+                        # session can still afford a full pass, restart
+                        # discovery on a new focus with the failure on record.
+                        if self._maybe_strategic_pivot(
+                            session_id, session, pivot_round, session_started
+                        ):
+                            pivot_round += 1
+                            # The new pass analyzes from scratch: the dead
+                            # focus's decisions must not masquerade as the
+                            # new pass's. Its full record survives in the
+                            # candidate ledger, events, trace, and the
+                            # 'focus_pivots' checkpoint.
+                            phase_outputs = {}
+                            completed_all_phases = False
+                            break
+                if completed_all_phases:
+                    break
 
             self.agent.transition(session_id, "reporting", substate="synthesis_done")
             self.trace.record(session_id, KIND_REPORT, "Generating the final research report")
@@ -417,6 +447,8 @@ class ResearchRunner:
         phase_start = time.monotonic()
         timing = PhaseTiming(phase=phase, started_at=iso_now())
         timings = self._timings_for(session_id)
+        # Strategic pivot framing (durable; None on a normal pass).
+        pivot_directive = self._current_pivot_directive(session_id)
         timings.start(f"phase:{phase}", TaskType.PHASE)
         self.agent.transition(session_id, spec.agent_states[0], substate=phase)
         self.events.append(
@@ -489,6 +521,7 @@ class ResearchRunner:
                 ),
                 screenshot_attached=screenshot_png is not None,
                 owner_messages=self._owner_note_lines_for(session_id),
+                pivot_directive=pivot_directive,
             )
             model_calls += 1
             self.agent.advance_iteration(session_id)
@@ -889,6 +922,109 @@ class ResearchRunner:
             detail={"accepted": accepted, "downgraded": downgraded, "rejected": rejected},
         )
 
+    # ---------------------------------------------------- strategic pivot
+    def _maybe_strategic_pivot(
+        self, session_id: str, session: Any, pivot_round: int, session_started: float
+    ) -> bool:
+        """Strategic focus pivot gate (runs after Phase 8's integrity pipeline).
+
+        The methodology is allowed to conclude that the whole focus is
+        unviable — deep research and niche-down included. When that happens
+        (zero candidates verified) and the session can still afford another
+        full pass, discovery re-enters on a NEW focus. The pivot is durable
+        (event + trace + 'focus_pivots' checkpoint) and its directive is
+        re-injected into every prompt of the next pass. Returns True when a
+        pivot pass should run.
+        """
+        if pivot_round >= self.config.max_focus_pivots:
+            return False
+        survivors = self.candidates.list(
+            session_id, status="verified", limit=self.rc.max_candidates
+        )
+        if survivors:
+            return False
+        # A pivot spends a whole new P1→P9 pass: only while most of the
+        # session's hard time budget is still available.
+        budget = self.config.session_hard_timeout_hours * 3600
+        elapsed = time.monotonic() - session_started
+        remaining = budget - elapsed
+        if remaining < budget * self.rc.min_remaining_session_fraction_for_pivot:
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="focus_pivot_skipped_no_time_budget",
+                detail={"round": pivot_round + 1,
+                        "remaining_seconds": round(remaining, 1)},
+            )
+            return False
+
+        all_cands = self.candidates.list(session_id, limit=self.rc.max_candidates)
+        dead = [c for c in all_cands if c.status == "rejected"]
+        unresolved = [c for c in all_cands if c.status not in ("rejected", "verified")]
+        directive = focus_pivot_directive(
+            round_no=pivot_round + 1,
+            dead_niches=[c.niche for c in dead],
+            unresolved_niches=[c.niche for c in unresolved],
+            has_brief=bool((session.prompt or "").strip()),
+        )
+        record: dict[str, Any] = {
+            "round": pivot_round + 1,
+            "at": iso_now(),
+            "verified": 0,
+            "rejected": len(dead),
+            "dead_niches": [c.niche[:120] for c in dead[:8]],
+            "unresolved_niches": [c.niche[:120] for c in unresolved[:8]],
+            "directive": directive,
+        }
+        prior = self.checkpoints.get_safe(session_id, "focus_pivots")
+        pivots = list((prior.payload or {}).get("pivots") or []) if prior else []
+        pivots.append(record)
+        self.checkpoints.save(session_id, "focus_pivots", {"pivots": pivots})
+        self.events.append(
+            session_id, level="warn", actor="agent", action="focus_pivot",
+            detail={
+                "round": record["round"],
+                "rejected": record["rejected"],
+                "dead_niches": record["dead_niches"],
+                "pivot_budget_remaining": self.config.max_focus_pivots - pivot_round - 1,
+            },
+        )
+        self.trace.record(
+            session_id, KIND_PIVOT,
+            focus_pivot_text(record["round"], record["rejected"]),
+            detail={"round": record["round"], "rejected": record["rejected"]},
+        )
+        return True
+
+    def _current_pivot_directive(self, session_id: str) -> str | None:
+        """The latest strategic pivot directive, or None for a normal pass.
+
+        Read from the durable checkpoint (never run-local state) so a paused
+        or restarted session keeps the pivot framing on every prompt.
+        """
+        cp = self.checkpoints.get_safe(session_id, "focus_pivots")
+        pivots = list((cp.payload or {}).get("pivots") or []) if cp else []
+        if not pivots:
+            return None
+        text = str(pivots[-1].get("directive") or "").strip()
+        return text or None
+
+    def _focus_pivot_history(self, session_id: str) -> list[dict[str, Any]]:
+        """Durable pivot history for the final report (without directives)."""
+        cp = self.checkpoints.get_safe(session_id, "focus_pivots")
+        pivots = list((cp.payload or {}).get("pivots") or []) if cp else []
+        out: list[dict[str, Any]] = []
+        for p in pivots:
+            if not isinstance(p, dict):
+                continue
+            out.append({
+                "round": p.get("round"),
+                "at": p.get("at") or "",
+                "rejected": p.get("rejected", 0),
+                "dead_niches": list(p.get("dead_niches") or []),
+                "unresolved_niches": list(p.get("unresolved_niches") or []),
+            })
+        return out
+
     def _register_candidate_claims(
         self, session_id: str, cand: Any, phase_outputs: dict[str, Any]
     ) -> None:
@@ -1142,6 +1278,7 @@ class ResearchRunner:
             observations=self.observations,
             assessments=self.assessments,
             phase_outputs=phase_outputs,
+            focus_pivots=self._focus_pivot_history(session_id),
         )
         body = render_markdown(model)
 

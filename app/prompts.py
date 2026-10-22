@@ -74,6 +74,7 @@ def build_user_prompt(
     images_note: str = "",
     screenshot_attached: bool = False,
     owner_messages: list[str] | None = None,
+    pivot_directive: str | None = None,
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -89,6 +90,17 @@ def build_user_prompt(
     if images_note:
         brief["reference_images"] = images_note
     parts.append("SESSION BRIEF: " + _compact({k: v for k, v in brief.items() if v}))
+
+    # --- strategic focus pivot (autonomous re-discovery) --------------------
+    # Present only when the previous research pass died with zero verified
+    # candidates and the session re-entered discovery on a new focus. The
+    # directive is deterministic (app.methodology.focus_pivot_directive).
+    if pivot_directive:
+        parts.append(
+            "\nSTRATEGIC PIVOT — this pass is a fresh start on a NEW focus "
+            "(the previous one failed adversarial verification entirely):\n"
+            + pivot_directive
+        )
 
     # --- phase-specific instruction ----------------------------------------
     parts.append(f"\nTASK ({PHASE_TITLES[phase]}):\n{spec.guidance}")

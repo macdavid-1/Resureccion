@@ -100,6 +100,7 @@ class ScriptedModel:
     def __init__(self, script: dict[str, list[dict[str, Any]]]) -> None:
         self.script = script
         self.calls: list[str] = []
+        self.user_prompts: dict[str, list[str]] = {}
         self.usage = type("U", (), {"calls": 0, "failed_calls": 0})()
 
     @staticmethod
@@ -135,11 +136,35 @@ class ScriptedModel:
         for phase in PHASE_ORDER:
             if SPECS[phase].guidance[:40] in system:
                 self.calls.append(phase)
+                self.user_prompts.setdefault(phase, []).append(user)
                 return self._reply_for(phase, user)
         raise AssertionError("model called with unknown phase prompt")
 
     async def aclose(self) -> None:
         pass
+
+
+class RejectAllModel(ScriptedModel):
+    """Phase 8 rejects every candidate, whatever the script says.
+
+    Uses LIVE candidate ids, so no candidate can survive to synthesis: the
+    session ends each pass with zero verified candidates and the strategic
+    focus pivot gate can fire.
+    """
+
+    def __init__(self, script: dict[str, list[dict[str, Any]]], db: Database, session_id: str) -> None:
+        super().__init__(script)
+        self._candidates = CandidateStore(db)
+        self._session_id = session_id
+
+    def _reply_for(self, phase: str, user: str) -> FakeModelReply:
+        reply = super()._reply_for(phase, user)
+        if phase == "adversarial_verification":
+            reply.content["verdicts"] = [
+                {"candidate_id": c.id, "verdict": "reject", "reasons": ["dead focus"]}
+                for c in self._candidates.list(self._session_id, limit=50)
+            ]
+        return reply
 
 
 class PausingModel:
@@ -297,6 +322,8 @@ async def test_full_methodology_produces_validated_opportunity(db, config, sessi
     assert any(r.kind == "final" for r in reports)
     # agent reached done
     assert AgentStateStore(db, EventLog(db)).require(session).state == "done"
+    # a surviving verified candidate means no strategic pivot was considered
+    assert not any(e.action == "focus_pivot" for e in EventLog(db).tail(session))
 
 
 @pytest.mark.asyncio
@@ -627,3 +654,124 @@ def test_runner_config_defaults_are_depth_friendly():
     rc = RunnerConfig()
     assert rc.max_model_calls_per_session >= 100
     assert rc.max_opportunities >= 10
+
+
+# ------------------------------------------------------------ focus pivot
+@pytest.mark.asyncio
+async def test_strategic_pivot_reruns_discovery_on_new_focus(db, config, session):
+    """Deep research kills every candidate -> the session pivots to a new
+    focus (P1 re-runs with the pivot directive) instead of ending."""
+    from app.trace import ActivityTrace
+
+    sessions = SessionStore(db, config)
+    events = EventLog(db)
+    trace = ActivityTrace(db)
+    model = RejectAllModel(PHASE_OUTPUTS, db, session)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    s = sessions.require(session)
+    assert s.status == "completed", s.error
+
+    # one pivot only (budget): synthesis ran exactly once — the pivot gate
+    # fires before pass 1 could reach it, and pass 2 completes the report
+    assert len(model.user_prompts["opportunity_synthesis"]) == 1
+
+    # the pivot is durable: event + trace + checkpoint
+    pivot_events = [e for e in events.tail(session) if e.action == "focus_pivot"]
+    assert len(pivot_events) == 1
+    assert pivot_events[0].detail["round"] == 1
+    pivot_trace = [
+        t for t in trace.recent(session)
+        if t.kind == "pivot" and t.text.startswith("Strategic pivot (round 1)")
+    ]
+    assert len(pivot_trace) == 1
+    cp = CheckpointStore(db).get(session, "focus_pivots")
+    assert cp is not None and len(cp.payload["pivots"]) == 1
+
+    # the directive framed the re-run pass only, and names the dead focus
+    p1_prompts = model.user_prompts["opportunity_discovery"]
+    plain = [u for u in p1_prompts if "STRATEGIC PIVOT" not in u]
+    pivoted = [u for u in p1_prompts if "STRATEGIC PIVOT" in u]
+    assert plain and pivoted
+    assert p1_prompts.index(plain[-1]) < p1_prompts.index(pivoted[0])
+    assert "sudden-loss grief journals for adult children" in pivoted[0]
+
+    # the final report records the pivot
+    store = ReportStore(db, config)
+    final = [r for r in store.list(session) if r.kind == "final"]
+    assert final
+    body = store.read_markdown(final[0])
+    assert "Strategic pivot (round 1)" in body
+
+
+@pytest.mark.asyncio
+async def test_strategic_pivot_disabled_by_budget(db, config, session):
+    """MAX_FOCUS_PIVOTS=0 keeps the old behavior: one pass, then report."""
+    config.max_focus_pivots = 0
+    events = EventLog(db)
+    model = RejectAllModel(PHASE_OUTPUTS, db, session)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert SessionStore(db, config).require(session).status == "completed"
+    # no prompt ever carried pivot framing — a pivot pass is exactly that
+    assert all(
+        "STRATEGIC PIVOT" not in u
+        for prompts in model.user_prompts.values() for u in prompts
+    )
+    assert not any(e.action == "focus_pivot" for e in events.tail(session))
+    assert CheckpointStore(db).get(session, "focus_pivots") is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_pivot_skipped_without_time_budget(db, config, session):
+    """A pivot spends a whole new pass: it is skipped (and logged) when too
+    little of the session's hard time budget remains."""
+    events = EventLog(db)
+    model = RejectAllModel(PHASE_OUTPUTS, db, session)
+    runner = make_runner(db, config, model)
+    runner.rc.min_remaining_session_fraction_for_pivot = 1.5  # never enough
+    await runner.run(session)
+    assert SessionStore(db, config).require(session).status == "completed"
+    assert all(
+        "STRATEGIC PIVOT" not in u
+        for prompts in model.user_prompts.values() for u in prompts
+    )
+    assert any(
+        e.action == "focus_pivot_skipped_no_time_budget" for e in events.tail(session)
+    )
+    assert not any(e.action == "focus_pivot" for e in events.tail(session))
+
+
+def test_focus_pivot_directive_scope():
+    from app.methodology import focus_pivot_directive
+
+    brief = focus_pivot_directive(
+        round_no=1, dead_niches=["grief journals"], unresolved_niches=[],
+        has_brief=True,
+    )
+    assert "ZERO verified" in brief
+    assert "owner's brief remains authoritative" in brief
+    assert "grief journals" in brief
+    auto = focus_pivot_directive(
+        round_no=2, dead_niches=[], unresolved_niches=["prayer journals"],
+        has_brief=False,
+    )
+    assert "no topic was specified" in auto
+    assert "prayer journals" in auto
+
+
+def test_build_user_prompt_includes_pivot_directive():
+    from app.methodology import P1_DISCOVERY, PhaseTiming
+    from app.prompts import build_user_prompt
+
+    base = dict(
+        mode="auto", objective=None, prompt_text="", marketplaces=["us"],
+        marketplace_mode="auto", evidence_digest=[], candidates_digest=[],
+        prior_phase_outputs=None, timing=PhaseTiming(P1_DISCOVERY, "t0"),
+    )
+    assert "STRATEGIC PIVOT" not in build_user_prompt(P1_DISCOVERY, **base)
+    pivoted = build_user_prompt(
+        P1_DISCOVERY, **base, pivot_directive="explore a different parent market"
+    )
+    assert "STRATEGIC PIVOT" in pivoted
+    assert "explore a different parent market" in pivoted

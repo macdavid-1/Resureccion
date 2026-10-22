@@ -51,12 +51,25 @@ class Config:
         self.auth_secret = os.environ.get("AUTH_SECRET", "").strip()
         self.auth_session_ttl_hours = _int_env("SESSION_TTL_HOURS", 24 * 7)
         self.auth_cookie_name = "resurreccion_session"
+        # Set the auth cookie's Secure flag when the app is served over HTTPS
+        # (custom domain behind a TLS reverse proxy). Browsers will then only
+        # send the cookie over https://, so it cannot be sniffed in transit.
+        # Off by default so plain-http LAN previews keep working.
+        self.cookie_secure = os.environ.get("COOKIE_SECURE", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
 
         # --- research ----------------------------------------------------------
         self.max_sessions = _int_env("MAX_SESSIONS", 5)
         self.max_concurrent_sessions = _int_env("MAX_CONCURRENT_SESSIONS", 1)
         self.session_soft_timeout_hours = _int_env("SESSION_SOFT_TIMEOUT_HOURS", 8)
         self.session_hard_timeout_hours = _int_env("SESSION_HARD_TIMEOUT_HOURS", 12)
+        # Strategic focus pivots: after a full research pass in which ZERO
+        # candidates survive adversarial verification + the integrity
+        # pipeline (deep research and niche-down both failed), an autonomous
+        # session may spend another pass re-entering discovery on a fresh
+        # focus. 0 disables the behavior entirely.
+        self.max_focus_pivots = max(0, min(3, _int_env("MAX_FOCUS_PIVOTS", 1)))
         self.heartbeat_timeout_seconds = _int_env("HEARTBEAT_TIMEOUT_SECONDS", 180)
         self.checkpoint_interval_seconds = _int_env("CHECKPOINT_INTERVAL_SECONDS", 120)
 

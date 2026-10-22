@@ -69,6 +69,7 @@ class ReportModel:
     competitors: list[dict[str, Any]] = field(default_factory=list)
     candidate_ledger: list[dict[str, Any]] = field(default_factory=list)
     methodology_trace: list[dict[str, Any]] = field(default_factory=list)
+    focus_pivots: list[dict[str, Any]] = field(default_factory=list)
     evidence_appendix: list[dict[str, Any]] = field(default_factory=list)
     quality_statement: dict[str, Any] = field(default_factory=dict)
     validation: dict[str, Any] = field(default_factory=dict)
@@ -84,6 +85,7 @@ class ReportModel:
             "competitors": self.competitors,
             "candidate_ledger": self.candidate_ledger,
             "methodology_trace": self.methodology_trace,
+            "focus_pivots": self.focus_pivots,
             "evidence_appendix": self.evidence_appendix,
             "quality_statement": self.quality_statement,
             "validation": self.validation,
@@ -98,10 +100,10 @@ class ReportModel:
         for f in (
             "schema_version", "session", "generated_at", "executive_summary",
             "opportunities", "consumer_intelligence", "competitors",
-            "candidate_ledger", "methodology_trace", "evidence_appendix",
+            "candidate_ledger", "methodology_trace", "focus_pivots", "evidence_appendix",
             "quality_statement", "validation",
         ):
-            setattr(m, f, data.get(f, {} if f != "opportunities" and f != "competitors" and f != "candidate_ledger" and f != "methodology_trace" and f != "evidence_appendix" else []))
+            setattr(m, f, data.get(f, {} if f not in ("opportunities", "competitors", "candidate_ledger", "methodology_trace", "focus_pivots", "evidence_appendix") else []))
         return m
 
 
@@ -118,6 +120,7 @@ def build_report_model(
     observations: Any,
     assessments: Any | None = None,
     phase_outputs: dict[str, Any] | None = None,
+    focus_pivots: list[dict[str, Any]] | None = None,
 ) -> ReportModel:
     """Assemble the structured report model from durable state. Deterministic."""
     session = sessions.require(session_id)
@@ -222,8 +225,12 @@ def build_report_model(
         competitors=competitors,
         candidate_ledger=_ledger(cands),
         methodology_trace=_trace(outputs),
+        focus_pivots=_pivot_rows(focus_pivots),
         evidence_appendix=_evidence_appendix(ev_rows),
-        quality_statement=_quality_statement(counts, cands, verifications, session_id, assessments, claims),
+        quality_statement=_quality_statement(
+            counts, cands, verifications, session_id, assessments, claims,
+            focus_pivots=focus_pivots,
+        ),
     )
     return model
 
@@ -779,6 +786,22 @@ def _trace(outputs: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _pivot_rows(pivots: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Strategic focus pivots (autonomous re-discovery) for the report."""
+    rows: list[dict[str, Any]] = []
+    for p in pivots or []:
+        if not isinstance(p, dict):
+            continue
+        rows.append({
+            "round": p.get("round"),
+            "at": p.get("at") or "",
+            "rejected": p.get("rejected", 0),
+            "dead_niches": list(p.get("dead_niches") or []),
+            "unresolved_niches": list(p.get("unresolved_niches") or []),
+        })
+    return rows
+
+
 def _evidence_appendix(ev_rows: list[Any], limit: int = 120) -> list[dict[str, Any]]:
     rows = []
     for row in ev_rows[:limit]:
@@ -803,6 +826,7 @@ def _quality_statement(
     session_id: str,
     assessments: Any | None,
     claims: Any,
+    focus_pivots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rejected = [c for c in cands if c.status == "rejected"]
     verifying = [c for c in cands if c.status in ("discovered", "verifying")]
@@ -827,6 +851,15 @@ def _quality_statement(
         "rejected": counts.get("rejected", 0),
         "rejection_reasons": [
             {"niche": c.niche, "rationale": (c.rationale or "")[:200]} for c in rejected[:10]
+        ],
+        "focus_pivots": [
+            (
+                f"Round {p.get('round') or '—'}: {int(p.get('rejected', 0) or 0)} "
+                "candidate(s) from the earlier focus were rejected; deep research "
+                "and niche-down produced no verified opportunity, so discovery "
+                "re-entered on a new focus."
+            )
+            for p in (focus_pivots or []) if isinstance(p, dict)
         ],
         "remains_uncertain": uncertain,
         "verification_limitations": limitations,
@@ -1004,6 +1037,12 @@ def render_markdown(model: ReportModel) -> str:
     for t in model.methodology_trace:
         extra = f" ({', '.join(t['outputs'])})" if t.get("outputs") else ""
         a(f"- **{t['title']}** — completed{extra}")
+    for p in model.focus_pivots:
+        a(
+            f"- **Strategic pivot (round {p.get('round') or '—'})** — deep "
+            "research and niche-down left no verified candidate, so discovery "
+            "re-entered on a new market focus"
+        )
     a("")
 
     # ------------------------------------------------------------- quality
@@ -1026,6 +1065,11 @@ def render_markdown(model: ReportModel) -> str:
         a("**What remains uncertain.**")
         for u in q["remains_uncertain"]:
             a(f"- {u}")
+        a("")
+    if q.get("focus_pivots"):
+        a("**Strategic focus pivots (autonomous re-discovery).**")
+        for p in q["focus_pivots"]:
+            a(f"- {p}")
         a("")
     if q.get("verification_limitations"):
         a("**Recorded verification limitations.**")

@@ -431,6 +431,69 @@ class PhaseTiming:
 STALL_LIMIT = 3
 
 
+# --------------------------------------------------------------------------- #
+# Strategic focus pivot (autonomous re-discovery)
+# --------------------------------------------------------------------------- #
+
+def focus_pivot_directive(
+    *,
+    round_no: int,
+    dead_niches: list[str],
+    unresolved_niches: list[str],
+    has_brief: bool,
+) -> str:
+    """Deterministic framing injected into every prompt of the next pass.
+
+    Triggered when a full pass (deep research, aggressive niching,
+    adversarial verification, integrity pipeline) leaves ZERO verified
+    candidates: even niche-down could not rescue the focus. The directive
+    restarts discovery on a new focus while keeping the methodology, the
+    owner's brief, and every integrity verdict final. Deterministic text —
+    the model reasons INSIDE it, never around it.
+    """
+    dead = "; ".join(n[:80] for n in dead_niches[:6]) or "the earlier candidates"
+    lines = [
+        (
+            f"Research round {round_no} concluded with ZERO verified "
+            "opportunities: deep research, aggressive niching, adversarial "
+            "verification and the deterministic integrity pipeline killed "
+            f"every candidate from that focus ({dead}). Niche-down was already "
+            "attempted and did not rescue it."
+        ),
+        (
+            "The earlier phase decisions of this session belong to the "
+            "abandoned focus; their rejections are final. Do NOT re-propose "
+            "those niches or their niching chains — this pass starts from a "
+            "genuinely different place."
+        ),
+    ]
+    if unresolved_niches:
+        lines.append(
+            "Still-unresolved candidates from the dead focus (status is in "
+            "CANDIDATES) may be re-niched or dropped, but never carry the "
+            "pass on their own: " + "; ".join(n[:80] for n in unresolved_niches[:4])
+        )
+    if has_brief:
+        lines.append(
+            "SCOPE: the owner's brief remains authoritative — pivot INSIDE "
+            "it: explore different parent markets, audiences and needs the "
+            "brief permits; never substitute an unrelated market."
+        )
+    else:
+        lines.append(
+            "SCOPE: no topic was specified — explore genuinely different "
+            "parent markets and audiences than the abandoned focus."
+        )
+    lines.append(
+        "How to pivot: restart from broad market signals with different "
+        "parent markets and reader groups, and gather FRESH evidence for "
+        "every new claim even where similar evidence exists from the dead "
+        "focus. If the new focus also fails adversarial verification, say so "
+        "plainly in the report — never manufacture an opportunity."
+    )
+    return "\n".join(lines)
+
+
 class Methodology:
     """Runtime facade over the deterministic methodology.
 
