@@ -581,6 +581,41 @@ def render_report_html(model: dict[str, Any], blocks: list[dict[str, Any]]) -> s
 
 
 # -------------------------------------------------------------------- export
+def _render_to_tmp(job: dict[str, Any]) -> Path:
+    """Run the Node sidecar on a render job; returns the validated temp PDF.
+
+    On any failure the temp file is removed and PdfExportError is raised —
+    a broken render never leaves a stray file behind.
+    """
+    if not node_available():
+        raise PdfExportError(
+            "PDF export unavailable: node or scripts/render_pdf.js is missing"
+        )
+    pdf_tmp = Path(job["out"])
+    try:
+        proc = subprocess.run(
+            ["node", str(_SIDECAR)],
+            input=json.dumps(job, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            # Combined multi-report PDFs are larger than single ones.
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            raise PdfExportError(
+                f"PDF renderer failed (exit {proc.returncode}): "
+                f"{proc.stderr.decode('utf-8', 'replace')[:300]}"
+            )
+        if not pdf_tmp.is_file() or pdf_tmp.stat().st_size < 500:
+            raise PdfExportError("PDF renderer produced no usable output")
+    except PdfExportError:
+        pdf_tmp.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        pdf_tmp.unlink(missing_ok=True)
+        raise PdfExportError(f"PDF export failed: {exc}") from exc
+    return pdf_tmp
+
+
 def export_pdf(
     db: Database,
     config: Config,
@@ -615,30 +650,17 @@ def export_pdf(
         "blocks": blocks,
         "logo": str(logo) if (logo := logo_file()) else None,
     }
+    pdf_tmp = _render_to_tmp(job)
     try:
-        proc = subprocess.run(
-            ["node", str(_SIDECAR)],
-            input=json.dumps(job, ensure_ascii=False).encode("utf-8"),
-            capture_output=True,
-            timeout=180,
-        )
-        if proc.returncode != 0:
-            raise PdfExportError(
-                f"PDF renderer failed (exit {proc.returncode}): "
-                f"{proc.stderr.decode('utf-8', 'replace')[:300]}"
-            )
-        if not pdf_tmp.is_file() or pdf_tmp.stat().st_size < 500:
-            raise PdfExportError("PDF renderer produced no usable output")
-        final_pdf = out_dir / f"report-{stamp}.pdf"
+        # The short uuid keeps same-second exports from overwriting each
+        # other (separate mode renders several PDFs back to back).
+        final_pdf = out_dir / f"report-{stamp}-{uuid.uuid4().hex[:6]}.pdf"
         os.replace(pdf_tmp, final_pdf)  # atomic: interrupted export leaves no artifact
         pdf_art = artifacts.register_external_file(
             session_id, kind="pdf", path=final_pdf,
             meta={"generator": "pdfkit", "page_size": "6x9in",
                   "report_session": session_id, "blocks": len(blocks)},
         )
-    except PdfExportError:
-        pdf_tmp.unlink(missing_ok=True)
-        raise
     except Exception as exc:
         pdf_tmp.unlink(missing_ok=True)
         raise PdfExportError(f"PDF export failed: {exc}") from exc
@@ -659,5 +681,100 @@ def export_pdf(
     return {
         "pdf": pdf_art.to_dict(),
         "html_artifact_id": html_id,
+        "bytes": final_pdf.stat().st_size,
+    }
+
+
+def export_reports(
+    db: Database,
+    config: Config,
+    session_id: str,
+    *,
+    models: list[dict[str, Any]],
+    artifacts: ArtifactStore,
+    separate: bool = False,
+) -> dict[str, Any]:
+    """Export one or more of a session's reports as designed 6×9in PDFs.
+
+    Default: every selected report lands in ONE combined PDF, each report
+    introduced by its own section page (page break + divider heading). The
+    owner opts into separate=True for one PDF artifact per report.
+
+    Returns {"separate": bool, "pdfs": [per-report export result], "bytes": int}.
+    """
+    if not models:
+        raise PdfExportError("no reports to export")
+    if separate:
+        pdfs = [
+            export_pdf(db, config, session_id, model=m, artifacts=artifacts)
+            for m in models
+        ]
+        return {
+            "separate": True,
+            "pdfs": pdfs,
+            "bytes": sum(int(p.get("bytes") or 0) for p in pdfs),
+        }
+
+    # --- combined: one PDF, one section divider per report ------------------
+    stamp = iso_now().replace(":", "").replace("-", "")[:15]
+    blocks: list[dict[str, Any]] = []
+    labels: list[str] = []
+    first_resolved: dict[str, Any] = {}
+    for i, m in enumerate(models):
+        resolved = {**m, "figures": _resolve_figures(session_id, m, artifacts)}
+        _, session_name, r_blocks = model_to_blocks(resolved)
+        label = session_name or f"Report {i + 1}"
+        labels.append(label)
+        if not first_resolved:
+            first_resolved = resolved
+        if i:
+            blocks.append({"t": "pagebreak"})
+        blocks.append({"t": "section", "x": label})
+        blocks.extend(r_blocks)
+    title = "Market Intelligence Reports" if len(models) > 1 else "Market Intelligence Report"
+    subtitle = labels[0] if len(labels) == 1 else f"{len(models)} reports combined"
+    out_dir = artifacts.session_dir(session_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job = {
+        "out": str(out_dir / f".pdf-{uuid.uuid4().hex[:8]}.tmp"),
+        "title": title,
+        "subtitle": subtitle,
+        "footer": f"Resurrección  ·  {subtitle}  ·  {stamp}",
+        "blocks": blocks,
+        "logo": str(logo) if (logo := logo_file()) else None,
+    }
+    pdf_tmp = _render_to_tmp(job)
+    try:
+        final_pdf = out_dir / f"report-combined-{stamp}-{uuid.uuid4().hex[:6]}.pdf"
+        os.replace(pdf_tmp, final_pdf)  # atomic: interrupted export leaves no artifact
+        pdf_art = artifacts.register_external_file(
+            session_id, kind="pdf", path=final_pdf,
+            meta={"generator": "pdfkit", "page_size": "6x9in",
+                  "report_session": session_id, "blocks": len(blocks),
+                  "combined_reports": len(models), "report_labels": labels[:10]},
+        )
+    except Exception as exc:
+        pdf_tmp.unlink(missing_ok=True)
+        raise PdfExportError(f"PDF export failed: {exc}") from exc
+    # The designed HTML mirror of the combined document (additive).
+    html_id = None
+    try:
+        html = render_report_html(first_resolved, blocks)
+        html_art = artifacts.save_text(
+            session_id, kind="page_snapshot",
+            filename=f"report-combined-{stamp}.html", text=html,
+            meta={"generator": "pdf_export", "role": "report_html",
+                  "combined_reports": len(models)},
+        )
+        html_id = html_art.id
+    except Exception:
+        pass  # PDF is the primary deliverable; HTML is additive
+    return {
+        "separate": False,
+        "pdfs": [{
+            "pdf": pdf_art.to_dict(),
+            "html_artifact_id": html_id,
+            "bytes": final_pdf.stat().st_size,
+        }],
         "bytes": final_pdf.stat().st_size,
     }

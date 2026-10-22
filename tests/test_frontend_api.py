@@ -48,6 +48,63 @@ class TestRecordingAPI:
         h = _login(client)
         assert client.post("/api/sessions/nope/recording/start", headers=h).status_code == 404
 
+
+def _seed_reports(client, sid: str, n: int) -> None:
+    """n final reports with stored structured models (PDF-exportable)."""
+    import json as _json
+
+    from tests.test_pdf_export import _minimal_model
+
+    st = client.app.state
+    for i in range(n):
+        rep = st.reports.save(
+            sid, kind="final", title=f"Sweep {i}", body_markdown=f"# Sweep {i}",
+        )
+        st.reports.save_model_json(sid, report=rep, model_json=_json.dumps(_minimal_model()))
+
+
+class TestReportsPdfExport:
+    """POST /sessions/{sid}/reports/export-pdf — combined by default,
+    separate=true opts into one PDF per report."""
+
+    def test_export_all_combined_by_default(self, client):
+        h = _login(client)
+        sid = _mk_session(client, h)
+        _seed_reports(client, sid, 2)
+
+        res = client.post(f"/api/sessions/{sid}/reports/export-pdf", headers=h, json={})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["separate"] is False
+        assert len(body["pdfs"]) == 1          # ONE combined PDF
+        assert len(body["reports"]) == 2       # …covering both reports
+        pdf_id = body["pdfs"][0]["pdf"]["id"]
+        dl = client.get(f"/api/sessions/{sid}/artifacts/{pdf_id}/file", headers=h)
+        assert dl.status_code == 200
+
+    def test_separate_opt_in_produces_one_pdf_per_report(self, client):
+        h = _login(client)
+        sid = _mk_session(client, h)
+        _seed_reports(client, sid, 2)
+
+        res = client.post(
+            f"/api/sessions/{sid}/reports/export-pdf", headers=h, json={"separate": True},
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["separate"] is True
+        assert len(body["pdfs"]) == 2
+        assert len({p["pdf"]["id"] for p in body["pdfs"]}) == 2
+
+    def test_export_all_needs_stored_models(self, client):
+        h = _login(client)
+        sid = _mk_session(client, h)
+        client.app.state.reports.save(
+            sid, kind="final", title="No model", body_markdown="# x",
+        )
+        res = client.post(f"/api/sessions/{sid}/reports/export-pdf", headers=h, json={})
+        assert res.status_code == 404
+
     def test_recording_lifecycle(self, client):
         h = _login(client)
         sid = _mk_session(client, h)

@@ -24,6 +24,14 @@ class ExportRequest(BaseModel):
     format: str = "tar_gz"
 
 
+class ReportsPdfRequest(BaseModel):
+    # Default (None): every report of the session that has a stored model.
+    report_ids: list[str] | None = None
+    # False (default): all selected reports in ONE combined PDF.
+    # True: one PDF artifact per report (the owner's opt-in).
+    separate: bool = False
+
+
 class ReportRequest(BaseModel):
     kind: str = "intermediate"
     title: str
@@ -311,6 +319,50 @@ async def export_report_pdf(session_id: str, report_id: str, request: Request) -
         session_id, level="info", actor="system", action="report_pdf_exported",
         detail={"report_id": report_id, "bytes": result["bytes"]},
     )
+    return result
+
+
+@router.post("/sessions/{session_id}/reports/export-pdf")
+async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: Request) -> dict:
+    """Export the session's reports as designed 6×9in PDFs.
+
+    All selected reports go into ONE combined PDF by default (each report
+    introduced by its own section page); the owner opts into separate=true
+    for one PDF per report. Optional report_ids narrows the selection.
+    """
+    _auth(request)
+    st = _st(request)
+    _session_or_404(request, session_id)
+    reports = st.reports.list(session_id)
+    if body.report_ids:
+        wanted = set(body.report_ids)
+        reports = [r for r in reports if r.id in wanted]
+        if not reports:
+            raise HTTPException(status_code=404, detail="no matching reports")
+    chosen = []
+    models = []
+    for r in reports:
+        m = st.reports.read_model_json(r)
+        if m is not None:
+            chosen.append(r)
+            models.append(m)
+    if not chosen:
+        raise HTTPException(status_code=404, detail="no reports with a stored model")
+    from app.pdf_export import PdfExportError, export_reports
+
+    try:
+        result = export_reports(
+            st.db, st.config, session_id, models=models,
+            artifacts=st.artifacts, separate=body.separate,
+        )
+    except PdfExportError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    st.events.append(
+        session_id, level="info", actor="system", action="reports_pdf_exported",
+        detail={"reports": len(chosen), "separate": body.separate,
+                "bytes": result.get("bytes")},
+    )
+    result["reports"] = [{"id": r.id, "title": r.title} for r in chosen]
     return result
 
 

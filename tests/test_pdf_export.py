@@ -530,3 +530,52 @@ class TestReportFigures:
         html = render_report_html(wired, blocks)
         assert "<figure class=\"fig\">" in html
         assert "310 reviews" in html
+
+
+# ------------------------------------------------------ multi-report export
+class TestExportReports:
+    """Default: every selected report in ONE combined PDF (each report gets
+    its own section page). separate=True: one PDF artifact per report."""
+
+    def test_combined_default_renders_one_pdf_for_many_reports(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import export_reports
+
+        arts = ArtifactStore(db, config)
+        result = export_reports(
+            db, config, session, models=[_minimal_model(), _minimal_model()],
+            artifacts=arts,
+        )
+        assert result["separate"] is False
+        assert len(result["pdfs"]) == 1
+        pdf = result["pdfs"][0]["pdf"]
+        assert "combined" in pdf["path"]
+        assert result["bytes"] > 500
+        assert Path(pdf["path"]).is_file()
+        # The artifact records how many reports went into the combined file.
+        assert arts.get(session, pdf["id"]).meta["combined_reports"] == 2
+
+    def test_separate_opt_in_renders_one_pdf_per_report(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import export_reports
+
+        arts = ArtifactStore(db, config)
+        result = export_reports(
+            db, config, session, models=[_minimal_model(), _minimal_model()],
+            artifacts=arts, separate=True,
+        )
+        assert result["separate"] is True
+        assert len(result["pdfs"]) == 2
+        paths = [p["pdf"]["path"] for p in result["pdfs"]]
+        assert len(set(paths)) == 2  # distinct artifacts, not the same file twice
+        assert all(Path(p).is_file() for p in paths)
+
+    def test_export_reports_requires_at_least_one_model(self, db, config, session):
+        from app.artifacts import ArtifactStore
+        from app.pdf_export import export_reports
+
+        with pytest.raises(PdfExportError):
+            export_reports(
+                db, config, session, models=[],
+                artifacts=ArtifactStore(db, config),
+            )

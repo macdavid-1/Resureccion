@@ -563,21 +563,36 @@
       try { return { s, reports: (await api(`/api/sessions/${s.id}/reports`)).reports }; }
       catch { return { s, reports: [] }; }
     }));
-    const rows = perSession.flatMap(({ s, reports }) => reports.map((r) => ({ s, r })));
-    if (!rows.length) {
+    const withReports = perSession.filter(({ reports }) => reports.length);
+    if (!withReports.length) {
       body.innerHTML = `<div class="panel"><div class="empty"><div class="mark">▤</div><p>Reports appear as sessions complete.</p></div></div>`;
       return;
     }
-    body.innerHTML = `<div class="panel">${rows.map(({ s, r }) => `
+    // One block per session: its reports plus the PDF export controls —
+    // every report of the session in ONE combined PDF (default), or one
+    // PDF per report when the owner ticks "separate".
+    body.innerHTML = withReports.map(({ s, reports }) => `
+      <div class="panel">
+        <div class="spread" style="margin-bottom:8px">
+          <strong>${esc(s.name)}</strong>
+          <span class="row" style="gap:8px">
+            <label class="muted row" style="gap:4px"><input type="checkbox" class="rep-pdf-separate"> separate</label>
+            <button class="btn small primary rep-pdf-all" data-sid="${esc(s.id)}">Export PDF${reports.length > 1 ? "s" : ""}</button>
+          </span>
+        </div>
+        ${reports.map((r) => `
       <div class="rep-row" data-sid="${esc(s.id)}" data-rid="${esc(r.id)}">
         <div>
           <div class="rep-title">${esc(r.title)}${r.kind === "final" ? ' <span class="chip completed" style="margin-left:6px">final</span>' : ""}</div>
-          <div class="rep-sub">${esc(s.name)} · ${esc(fmtClock(r.created_at))}</div>
+          <div class="rep-sub">${esc(fmtClock(r.created_at))}</div>
         </div>
         <span class="muted">›</span>
-      </div>`).join("")}</div>`;
+      </div>`).join("")}
+      </div>`).join("");
     body.querySelectorAll(".rep-row").forEach((row) =>
       row.addEventListener("click", () => openReport(row.dataset.sid, row.dataset.rid, row.querySelector(".rep-title").textContent.trim())));
+    body.querySelectorAll(".rep-pdf-all").forEach((btn) =>
+      btn.addEventListener("click", () => exportAllPdf(btn.dataset.sid, btn)));
   }
 
   // Minimal, safe markdown → HTML for report bodies.
@@ -680,6 +695,37 @@
   }
 
   function splitReportSections(md) { return mdToHtml(md); }
+
+  async function exportAllPdf(sid, btn) {
+    // Default: every report of this session in ONE combined PDF. Ticking
+    // "separate" opts into one PDF per report.
+    const separate = btn.closest(".spread")?.querySelector(".rep-pdf-separate")?.checked === true;
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Rendering…';
+    try {
+      const res = await api(`/api/sessions/${sid}/reports/export-pdf`, {
+        method: "POST",
+        body: JSON.stringify({ separate }),
+      });
+      for (const p of res.pdfs || []) {
+        const a = document.createElement("a");
+        a.href = `/api/sessions/${sid}/artifacts/${p.pdf.id}/file`;
+        a.download = p.pdf.path ? p.pdf.path.split("/").pop() : "report.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      toast(separate
+        ? `${(res.pdfs || []).length} PDF(s) exported — one per report`
+        : "Combined PDF exported — every report in one 6×9 file");
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
 
   async function exportPdf(sid, rid) {
     const btn = $("#rep-pdf");

@@ -353,6 +353,19 @@ class Renderer {
         case "table": this.table(b.head || [], b.rows || []); break;
         case "kv": this.kv(b.head, b.rows || []); break;
         case "img": this.image(b); break;
+        case "pagebreak": {
+          // Explicit new page (combined multi-report PDFs).
+          this.doc.addPage({ size: [PAGE_W, PAGE_H], margin: 0 });
+          this.y = MARGIN;
+          break;
+        }
+        case "section": {
+          // Divider heading introducing each report in a combined PDF.
+          this.gap(6);
+          this.heading(plain(b.x), 1);
+          this.gap(2); this.rule(); this.gap(8);
+          break;
+        }
         default: break;
       }
     }
