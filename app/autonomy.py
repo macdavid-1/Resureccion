@@ -27,6 +27,7 @@ from app.config import Config
 from app.db import Database
 from app.events import EventLog
 from app.recovery import CheckpointStore, ErrorStateStore
+from app.reports import ReportStore
 from app.sessions import SessionStore
 from app.timeutil import iso_now
 
@@ -146,7 +147,7 @@ class AutonomySupervisor:
 
         Returns counts by action for boot logging. Idempotent.
         """
-        counts = {"resumed": 0, "interrupted": 0, "waiting": 0, "failed": 0, "jobs_requeued": 0}
+        counts = {"resumed": 0, "interrupted": 0, "waiting": 0, "failed": 0, "finished": 0, "jobs_requeued": 0}
         # 1. Jobs left 'running'-ish by a dead process -> back to queued.
         with self.db.tx() as conn:
             cur = conn.execute(
@@ -161,6 +162,20 @@ class AutonomySupervisor:
             if s.status not in ("running", "queued"):
                 if s.status in ("paused", "interrupted"):
                     counts["waiting"] += 1
+                continue
+            if self._research_finished(s.id):
+                # The research ACTUALLY finished: its final report is durable
+                # on disk. Only the status column was stale (the process died
+                # around the final update). A finished research must never
+                # resume itself when the container wakes or restarts.
+                if s.status != "completed":
+                    self.sessions.update(s.id, status="completed", error=None)
+                    self.events.append(
+                        s.id, level="info", actor="system",
+                        action="job_recovered_as_completed",
+                        detail={"reason": "final report already exists; stale running status corrected"},
+                    )
+                counts["finished"] += 1
                 continue
             paused = self.checkpoints.get(s.id, "paused:auth") or self.checkpoints.get(s.id, "paused:model") \
                 or self.checkpoints.get(s.id, "paused:browser")
@@ -200,6 +215,15 @@ class AutonomySupervisor:
         for s in self.sessions.list(include_terminal=True):
             if s.status != "interrupted":
                 continue
+            if self._research_finished(s.id):
+                # Belt and braces: a finished research never auto-resumes,
+                # even if a stale resume request checkpoint is present.
+                self.events.append(
+                    s.id, level="warn", actor="system",
+                    action="auto_resume_skipped_finished",
+                    detail={"reason": "final report already exists"},
+                )
+                continue
             if self.checkpoints.get(s.id, "resume_requested") is None:
                 continue
             try:
@@ -217,6 +241,23 @@ class AutonomySupervisor:
                     message=f"auto-resume failed: {exc}", recoverable=True,
                 )
         return resumed
+
+    def _research_finished(self, session_id: str) -> bool:
+        """True when the research durably finished (its final report exists).
+
+        The report row is the authoritative signal — never the status column:
+        a process killed around the final update leaves status='running'
+        while the research is done. Both wake paths (boot recovery marking
+        running sessions 'interrupted', and auto-resume re-queuing them) are
+        gated on this so a finished session cannot restart itself.
+        """
+        try:
+            return any(
+                r.kind == "final"
+                for r in ReportStore(self.db, self.config).list(session_id)
+            )
+        except Exception:
+            return False  # unreadable report store -> treat as not finished
 
     # ------------------------------------------------------------------ heartbeat
     def heartbeat(self, session_id: str, *, phase: str, note: str = "") -> None:

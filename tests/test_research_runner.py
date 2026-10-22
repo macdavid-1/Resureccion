@@ -625,6 +625,39 @@ class TestAutonomySupervisor:
         assert counts["waiting"] == 1
         assert SessionStore(db, config).require(session).status == "paused"
 
+    def test_wake_never_resumes_a_finished_research(self, db, config, session):
+        """A session whose final report is durable is FINISHED, even when the
+        status column is stale ('running') because the process died around
+        the final update. Wake/reboot must correct the status to completed
+        and must never auto-resume the finished research."""
+        from app.reports import ReportStore
+
+        sup = self._supervisor(db, config)
+        sessions = SessionStore(db, config)
+        CheckpointStore(db).save(
+            session, "phase_complete:opportunity_synthesis", {"at": "now"}
+        )
+        ReportStore(db, config).save(
+            session, kind="final", title="Final Report", body_markdown="# done",
+        )
+        sessions.update(session, status="running")
+
+        counts = sup.recover_on_boot()
+        assert counts["finished"] == 1
+        assert counts["resumed"] == 0
+        assert sessions.require(session).status == "completed"
+
+        # Even with a stale resume request + interrupted status, the finished
+        # research must not respawn a runner.
+        CheckpointStore(db).save(session, "resume_requested", {"at": "now"})
+        sessions.update(session, status="interrupted")
+
+        class _NoStart:
+            def start(self, sid):
+                raise AssertionError("finished research must never respawn a runner")
+
+        assert sup.auto_resume_recovered(_NoStart()) == 0
+
     def test_job_states_flow_through_supervisor(self, db, config, session):
         from app.autonomy import JOB_RESEARCHING, JOB_WAITING_AUTH
 
