@@ -77,3 +77,32 @@ def test_expired_token_rejected(auth, db) -> None:
             "UPDATE auth_sessions SET expires_at = ?", (iso(past),)
         )
     assert not auth.verify_token(token)
+
+
+class TestCookieSecureFlag:
+    """COOKIE_SECURE=true behind TLS (the HTTPS custom domain) must mark the
+    session cookie Secure; the plain-http preview must stay cookie-compatible."""
+
+    def test_default_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.config import Config
+
+        monkeypatch.delenv("COOKIE_SECURE", raising=False)
+        assert Config().cookie_secure is False
+
+    def test_env_enables_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.config import Config
+
+        monkeypatch.setenv("COOKIE_SECURE", "true")
+        assert Config().cookie_secure is True
+
+    def test_login_cookie_carries_the_flag(self, client) -> None:
+        creds = {"username": "owner", "password": "hunter2"}
+
+        plain = client.post("/api/auth/login", json=creds)
+        assert plain.status_code == 200
+        assert "secure" not in plain.headers.get("set-cookie", "").lower()
+
+        client.app.state.config.cookie_secure = True
+        tls = client.post("/api/auth/login", json=creds)
+        assert tls.status_code == 200
+        assert "secure" in tls.headers.get("set-cookie", "").lower()

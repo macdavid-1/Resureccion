@@ -11,9 +11,12 @@ Set these in the deployment platform's environment settings (never commit real v
 | `OWNER_PASSWORD_HASH` | **yes** | — | scrypt hash; generate with `python -m app.scripts.set_password` |
 | `AUTH_SECRET` | **yes** | — | Long random string for auth session salting |
 | `SESSION_TTL_HOURS` | no | `168` | Auth session lifetime |
+| `COOKIE_SECURE` | no | `false` | Set `true` when served over HTTPS (custom domain behind TLS) — the session cookie then only travels over https |
 | `MAX_SESSIONS` | no | `5` | Concurrent research session cap |
+| `MAX_CONCURRENT_SESSIONS` | no | `1` | Research runs executing at once. Keep `1` on a 2-core box |
 | `SESSION_SOFT_TIMEOUT_HOURS` | no | `8` | Soft research time budget |
 | `SESSION_HARD_TIMEOUT_HOURS` | no | `12` | Hard kill switch for a run |
+| `MAX_FOCUS_PIVOTS` | no | `1` | Strategic focus pivots per autonomous run (0 disables): after a full pass where deep research + niche-down + adversarial verification leave zero verified candidates, discovery re-enters on a new focus |
 | `HEARTBEAT_TIMEOUT_SECONDS` | no | `180` | Consider agent dead after this |
 | `CHECKPOINT_INTERVAL_SECONDS` | no | `120` | Periodic checkpoint cadence |
 | `PORT` | no | `7860` | HTTP port |
@@ -41,6 +44,19 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw
 HTML, cookies, or credentials.
+
+## Container runtime (Docker / docker-compose)
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `SWAP_ENABLED` | no | `true` | Create + enable a swap file inside the container at boot (needs `--cap-add SYS_ADMIN`; skipped with a warning otherwise) |
+| `SWAP_SIZE_MB` | no | `2048` | Swap file size in MB, created at `/swapfile` in the container's writable layer |
+
+See `docker-compose.yml` for the full 2-core / 5 GB sizing (memory/CPU caps,
+local-only port, in-container swap), `scripts/host_sleep.sh` /
+`scripts/host_awake.sh` for the one-command sleep/awake lifecycle, and
+`deploy/nginx-resureccion.conf` for the reverse-proxy block behind
+`resureccion.omnivex-academy.xyz`.
 
 ## Research integrity thresholds (Stage 4)
 

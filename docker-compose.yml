@@ -1,0 +1,41 @@
+# Resurrección on a multi-app VPS — one container, right-sized.
+#
+#   docker compose up -d              # awake (or: sh scripts/host_awake.sh)
+#   docker compose stop               # sleep — releases CPU+RAM, keeps SSD
+#                                     # (or: sh scripts/host_sleep.sh)
+#
+# Sizing matches the container this runs in: 2 cores, 5 GB RAM, 35 GB SSD.
+# The SYS_ADMIN capability is needed ONLY for the in-container 2 GB swap file;
+# without it the container still runs, just without swap (the entrypoint
+# warns and continues).
+services:
+  resurreccion:
+    build: .
+    image: resurreccion:latest
+    container_name: resureccion
+    restart: unless-stopped        # a slept container stays stopped after a reboot
+    stop_grace_period: 60s         # room for a graceful SIGTERM shutdown (checkpoints flush)
+    cap_add:
+      - SYS_ADMIN                  # enables the in-container swap file only
+    mem_limit: 5g                  # RAM cap — leaves the rest of the VPS alone
+    memswap_limit: 7g              # 5 GB RAM + the 2 GB swap file
+    cpus: 2
+    ports:
+      # Local only: the host's reverse proxy owns the public edge
+      # (resureccion.omnivex-academy.xyz → 127.0.0.1:7860).
+      - "127.0.0.1:7860:7860"
+    volumes:
+      - resurreccion-data:/data    # SQLite DB, artifacts, browser profile (SSD)
+    env_file:
+      # Secrets live here, never in git: OWNER_PASSWORD_HASH, AUTH_SECRET,
+      # MODEL_API_KEY — and COOKIE_SECURE=true for the HTTPS domain.
+      - .env
+    environment:
+      MAX_CONCURRENT_SESSIONS: "1" # one research session on this box
+      BROWSER_CONTENT_PROCESSORS: "2"
+      BROWSER_MAX_OPEN_PAGES: "4"
+      SWAP_ENABLED: "1"
+      SWAP_SIZE_MB: "2048"
+
+volumes:
+  resurreccion-data:

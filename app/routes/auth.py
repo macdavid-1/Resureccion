@@ -29,7 +29,9 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict:
         max_age=ttl,
         httponly=True,
         samesite="lax",
-        secure=False,  # set True behind TLS in production if desired
+        # COOKIE_SECURE=true behind TLS (custom domain / reverse proxy) so the
+        # session cookie is never sent over plaintext http.
+        secure=getattr(service.config, "cookie_secure", False),
     )
     return {"ok": True, "token": token}
 

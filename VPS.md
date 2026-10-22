@@ -161,7 +161,70 @@ If logs show a memory kill, lower `BROWSER_MAX_OPEN_PAGES` and
 
 ## Why not Docker here
 
-The `Dockerfile` in this repo is the Hugging Face Spaces deployment. On your
-own VPS, running directly under pm2 is simpler: no container layer to debug,
-the browser profile and database sit on your own disk, and you can inspect
-them directly. If you prefer containers, the Dockerfile still works as-is.
+The `Dockerfile` in this repo also serves Hugging Face Spaces. On a VPS where
+Resurrección owns the whole box, running directly under pm2 is simpler: no
+container layer to debug, the browser profile and database sit on your own
+disk, and you can inspect them directly. If you prefer containers, the
+docker path below works as-is.
+
+## Running as a container on a multi-app VPS
+
+When the VPS hosts several apps and Resurrección must stay inside its own
+allocation (this setup: **2 cores / 5 GB RAM / 35 GB SSD**, used
+intermittently), run it as a container instead of under pm2. The container
+caps its own CPU and RAM, carries its own 2 GB swap file, and can be put to
+sleep with one command so the other apps get the resources back.
+
+```bash
+git clone <your-repo-url> ~/resurreccion
+cd ~/resurreccion
+nano .env             # OWNER_PASSWORD_HASH, AUTH_SECRET, MODEL_API_KEY,
+                      # COOKIE_SECURE=true — full list in ENV_VARS.md.
+                      # Hash: python -m app.scripts.set_password
+docker compose up -d  # build + start, capped at 2 CPUs / 5 GB
+```
+
+`.env` must exist before `docker compose up` (compose reads it via
+`env_file`). It is gitignored and never committed.
+
+What `docker-compose.yml` sets:
+
+| Setting | Value | Meaning |
+|---|---|---|
+| `mem_limit` / `cpus` | `5g` / `2` | The container can never take more, no matter what the browser does |
+| `memswap_limit` | `7g` | 5 GB RAM + the 2 GB swap file |
+| `cap_add: SYS_ADMIN` | — | Lets the entrypoint create/enable the 2 GB swap file **inside** the container (on its own disk, gone with the container). Without this cap the app still starts, just without swap |
+| `ports` | `127.0.0.1:7860` | Loopback only — the public edge is the reverse proxy below |
+| `stop_grace_period` | `60s` | A stop is graceful: checkpoints flush, the browser closes cleanly |
+| `restart` | `unless-stopped` | Survives reboots; a slept container stays asleep |
+
+### One-command sleep and awake
+
+```bash
+sh scripts/host_sleep.sh    # graceful stop — CPU+RAM released to the other apps
+sh scripts/host_awake.sh    # start again, waits for /api/health
+```
+
+Sleep is a graceful `docker stop`: running research checkpoints and the
+session is marked interrupted. Awake boots through the normal recovery path
+— the session auto-resumes from its last checkpoint, nothing is lost. The
+SSD side (the `resurreccion-data` volume with the database, artifacts,
+browser profile with your Amazon/KDSpy logins, and the swap file) is never
+touched by sleeping.
+
+### The domain
+
+`omnivex-academy.xyz` (root) points at your other app; the subdomain points
+here:
+
+1. DNS: an **A record** `resureccion.omnivex-academy.xyz` → your VPS IP.
+2. Certificate on the VPS's reverse proxy:
+   `certbot --nginx -d resureccion.omnivex-academy.xyz`.
+3. Install `deploy/nginx-resureccion.conf` as that proxy's site config (it
+   proxies to `127.0.0.1:7860`, so nothing else needs changing), then
+   `nginx -t && systemctl reload nginx`.
+4. In `.env`, set `COOKIE_SECURE=true` and restart the container — the
+   session cookie then only travels over HTTPS.
+
+Open `https://resureccion.omnivex-academy.xyz` and sign in; the first-run
+flow (Amazon sign-in, KDSpy install) is identical to steps above.

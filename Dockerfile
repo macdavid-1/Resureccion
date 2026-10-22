@@ -25,6 +25,15 @@ ENV PYTHONUNBUFFERED=1 \
     # auto-detects root/container and adds --no-sandbox; this makes it explicit.
     BROWSER_NO_SANDBOX=true \
     BROWSER_HEADLESS=true \
+    # Right-sized for the 2-core / 5 GB container this image runs in on the
+    # VPS (see docker-compose.yml — compose overrides win if you tune there).
+    MAX_CONCURRENT_SESSIONS=1 \
+    BROWSER_CONTENT_PROCESSORS=2 \
+    BROWSER_MAX_OPEN_PAGES=4 \
+    # In-container 2 GB swap file (see scripts/docker_entrypoint.sh). Needs
+    # --cap-add SYS_ADMIN; without it the app starts without swap.
+    SWAP_ENABLED=1 \
+    SWAP_SIZE_MB=2048 \
     # Playwright browser download location (kept in-image, not in /data: a
     # browser upgrade in a new image must not clash with old binaries in the bucket)
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
@@ -91,7 +100,8 @@ COPY app/ ./app/
 COPY scripts/render_pdf.js ./scripts/render_pdf.js
 COPY static/ ./static/
 COPY run.sh ./run.sh
-RUN chmod +x run.sh
+COPY scripts/docker_entrypoint.sh ./scripts/docker_entrypoint.sh
+RUN chmod +x run.sh scripts/docker_entrypoint.sh
 
 # --- Non-root runtime user ---------------------------------------------------
 # HF Spaces runs containers as user 1000 by default; files written to /data
@@ -119,4 +129,8 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:7860/api/health || exit 1
 
+# The entrypoint enables the in-container swap file when permitted (root +
+# SYS_ADMIN), drops privileges to appuser, then execs the app. On hosts that
+# already run as uid 1000 (HF Spaces, the preview) it passes straight through.
+ENTRYPOINT ["./scripts/docker_entrypoint.sh"]
 CMD ["./run.sh"]
