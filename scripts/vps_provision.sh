@@ -137,7 +137,30 @@ case "$PY_VER" in
   *) echo "WARNING: Python $PY_VER is older than the recommended 3.11+." >&2 ;;
 esac
 
-if [ ! -x .venv/bin/python ]; then
+# Debian/Ubuntu ship ensurepip in a separate `<interpreter>-venv` package.
+# Without it `python -m venv` dies with "ensurepip is not available" and
+# leaves a half-built .venv behind — bin/python exists, bin/pip does not.
+# So the gate checks for pip too (a husk from a failed run gets rebuilt),
+# and the matching venv package is installed for the interpreter we picked
+# BEFORE creating. This must come after `apt-get update` (section 1).
+if [ ! -x .venv/bin/python ] || [ ! -x .venv/bin/pip ]; then
+  if [ -d .venv ]; then
+    say "Removing incomplete virtualenv (python present, pip missing)"
+    rm -rf .venv
+  fi
+  if [ "$PY_BIN" = "python3" ]; then
+    VENV_PKG=python3-venv   # meta-package: follows whatever python3 points at
+  else
+    VENV_PKG="${PY_BIN}-venv"   # python3.12 -> python3.12-venv
+  fi
+  # `dpkg -s` exits 0 even for a package whose files were removed but whose
+  # config remains — check the Status field, not just the exit code.
+  if command -v apt-get >/dev/null 2>&1 && \
+     ! dpkg -s "$VENV_PKG" 2>/dev/null | grep -q '^Status: install ok installed'; then
+    say "Installing $VENV_PKG (Debian/Ubuntu keeps ensurepip there)"
+    apt-get install -y --no-install-recommends "$VENV_PKG" || \
+      echo "NOTE: $VENV_PKG not installable; 'python -m venv' may fail" >&2
+  fi
   say "Creating virtualenv"
   "$PY_BIN" -m venv .venv
 fi
