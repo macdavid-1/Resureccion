@@ -48,6 +48,19 @@ say "Installing system packages"
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
+
+  # libasound2 was renamed to libasound2t64 by the 64-bit time_t transition
+  # (Ubuntu 24.04+, Debian 13+). On those releases `libasound2` is a virtual
+  # package with SEVERAL providers, so apt refuses to choose one and the
+  # whole install dies with "Package 'libasound2' has no installation
+  # candidate". Ask apt which name this distro actually ships. Must run
+  # after `apt-get update` so the package lists are present.
+  if apt-cache show libasound2t64 >/dev/null 2>&1; then
+    ALSA_PKG=libasound2t64
+  else
+    ALSA_PKG=libasound2
+  fi
+
   # Core tooling + the shared-library set Firefox/Camoufox needs at runtime
   # (GTK, DBus, X11/XCB, PulseAudio, XT). Without these the browser binary is
   # present but will not start.
@@ -56,7 +69,7 @@ if command -v apt-get >/dev/null 2>&1; then
     build-essential \
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
-    libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 "$ALSA_PKG" \
     libpango-1.0-0 libcairo2 \
     libgtk-3-0 libdbus-glib-1-2 libx11-xcb1 libxt6 libpci3 \
     fonts-liberation fonts-noto-core fonts-noto-cjk

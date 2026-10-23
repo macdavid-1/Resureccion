@@ -63,7 +63,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxfixes3 \
         libxrandr2 \
         libgbm1 \
-        libasound2 \
+        # libasound2 -> libasound2t64 on Debian 13+/Ubuntu 24.04+ (the
+        # 64-bit time_t transition): there libasound2 is a virtual package
+        # with several providers and apt refuses to install it by name.
+        $(apt-cache show libasound2t64 >/dev/null 2>&1 && echo libasound2t64 || echo libasound2) \
         libpango-1.0-0 \
         libcairo2 \
     # Node.js 22 from NodeSource (pdfkit sidecar)
