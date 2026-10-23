@@ -105,10 +105,15 @@ required:
 |---|---|
 | See status | `pm2 status` |
 | Watch logs | `pm2 logs resurreccion` |
-| Stop | `pm2 stop resurreccion` |
-| Start | `pm2 start resurreccion` |
+| Stop (stays stopped — even across a reboot) | `pm2 stop resurreccion && pm2 save` |
+| Start (stays running — even across a reboot) | `pm2 start resurreccion && pm2 save` |
 | Restart after a config change | `pm2 restart resurreccion` |
 | Start automatically on boot | `pm2 startup` (run the command it prints, once) |
+
+The `pm2 save` half is not optional: pm2 resurrects the **saved** list on
+boot, so a plain `pm2 stop` would be undone by the next reboot and the app
+would wake itself. `pm2 save` is what makes your stop (or start) stick
+across reboots.
 
 ## How it survives trouble
 
@@ -145,9 +150,9 @@ Tune or disable in `.env`: `BACKUP_ENABLED`, `BACKUP_INTERVAL_HOURS`,
 **Restore** (replaces the live database with a snapshot):
 
 ```bash
-pm2 stop resurreccion
+pm2 stop resurreccion && pm2 save
 cp ~/resurreccion-data/backups/resurreccion-<TIMESTAMP>-<id>.db ~/resurreccion-data/resurreccion.db
-pm2 start resurreccion
+pm2 start resurreccion && pm2 save
 ```
 
 **Copy them off the box.** Same-disk snapshots survive corruption and
