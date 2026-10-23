@@ -71,7 +71,7 @@ See `docker-compose.yml` for the full 2-core / 5 GB sizing (memory/CPU caps,
 local-only port, in-container swap), `scripts/host_sleep.sh` /
 `scripts/host_awake.sh` for the one-command sleep/awake lifecycle, and
 `deploy/nginx-resureccion.conf` for the reverse-proxy block behind
-`resureccion.omnivex-academy.xyz`.
+`resurreccion.omnivex-academy.xyz`.
 
 ## Research integrity thresholds (Stage 4)
 

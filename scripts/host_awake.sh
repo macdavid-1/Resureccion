@@ -17,7 +17,7 @@ i=0
 while [ "$i" -lt "$TRIES" ]; do
     if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
         echo "Awake and healthy at http://127.0.0.1:${PORT}"
-        echo "Public URL (once DNS + proxy are set): https://resureccion.omnivex-academy.xyz"
+        echo "Public URL (once DNS + proxy are set): https://resurreccion.omnivex-academy.xyz"
         exit 0
     fi
     i=$((i + 1))

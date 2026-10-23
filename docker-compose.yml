@@ -22,7 +22,7 @@ services:
     cpus: 2
     ports:
       # Local only: the host's reverse proxy owns the public edge
-      # (resureccion.omnivex-academy.xyz → 127.0.0.1:7860).
+      # (resurreccion.omnivex-academy.xyz → 127.0.0.1:7860).
       - "127.0.0.1:7860:7860"
     volumes:
       - resurreccion-data:/data    # SQLite DB, artifacts, browser profile (SSD)

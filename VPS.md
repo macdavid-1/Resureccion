@@ -9,6 +9,14 @@ to match whatever it runs on.
 
 ## What runs on the box
 
+The public path, end to end:
+
+```
+you ──HTTPS──> Cloudflare ──> Caddy :80/:443 ──> pm2 ──> run.sh ──> uvicorn (:7860)
+                (proxy)       (certificates,      (one                      )
+                              renewed by itself)   process)
+```
+
 One app, in one process, supervised by pm2:
 
 ```
@@ -18,6 +26,10 @@ pm2  ──>  run.sh  ──>  uvicorn (Python)
               ├─ makes sure Node deps exist (PDF export sidecar)
               └─ makes sure the Camoufox browser binary is downloaded
 ```
+
+Caddy is installed and configured by the deploy script. It proxies to the
+app without changing anything about how the app runs — same port, same
+process, same pm2 supervision.
 
 The browser is **inside** the app process, not a separate service. That is why
 there is exactly one process, and why pm2 is supervising it rather than
@@ -40,7 +52,9 @@ That is the entire deploy. It runs, in order:
 
 1. **Provisions the host** — Python, Node (for the PDF sidecar), the browser's
    system libraries, a **4 GB swap file** with low swappiness, the virtualenv,
-   **pm2** registered to start on boot, and the **Camoufox browser binary**.
+   **pm2** registered to start on boot, the **Camoufox browser binary**, and
+   **Caddy** — the reverse proxy that serves your domain over HTTPS with
+   automatically renewed certificates.
 2. **Creates `.env`** with generated secrets: your login password (asked for
    on the terminal; generated and printed once when headless) and a random
    `AUTH_SECRET`. An existing `.env` is never overwritten.
@@ -49,8 +63,8 @@ That is the entire deploy. It runs, in order:
 4. **Installs the PDF sidecar's Node dependencies.**
 5. **Starts the app under pm2**, saves the process list, and registers the
    boot hook so it survives a reboot.
-6. **Waits for `/api/health`**, then prints the URL — or fails loudly with the
-   exact command to look at.
+6. **Waits for `/api/health`**, checks the domain through Cloudflare, then
+   prints the URL — or fails loudly with the exact command to look at.
 
 Re-running it is the **update path**: it is idempotent, re-provisions whatever
 is missing, leaves `.env` alone, and restarts the app.
@@ -60,7 +74,8 @@ Flags are forwarded to the provisioner:
 | Flag | Effect |
 |---|---|
 | `--no-swap` | Leave the host's existing swap alone |
-| `--with-ufw` | Also enable the firewall: SSH + port 7860 only |
+| `--with-ufw` | Also enable the firewall: SSH + 80 + 443 + 7860 |
+| `--domain=<host>` | Serve a different domain (default `resurreccion.omnivex-academy.xyz`) |
 
 The firewall is **off by default** so you cannot accidentally lock yourself
 out. `--with-ufw` detects your SSH port first and allows it before enabling.
@@ -89,7 +104,9 @@ Full list: `ENV_VARS.md`.
 Everything the research browser needs is set up from Settings — no shell
 required:
 
-1. Open `http://<your-server-ip>:7860` and sign in.
+1. Open `http://<your-server-ip>:7860` — or
+   `https://resurreccion.omnivex-academy.xyz` once the domain section below
+   is set up — and sign in.
 2. **Amazon authentication → Sign in.** A live browser streams to your phone;
    complete the sign-in (captcha/OTP included), then Close. Cookies persist in
    the shared profile, so every future run is already signed in.
@@ -98,6 +115,84 @@ required:
    sign-in and license activation.
 4. **AI model** should read `XiaomiMiMo/MiMo-V2.6-Flash ready`. If it says the
    key is missing, add `MODEL_API_KEY` to `.env` and `pm2 restart resurreccion`.
+
+## Your domain and HTTPS (Caddy + Cloudflare)
+
+`https://resurreccion.omnivex-academy.xyz` is served by **Caddy**, which the
+deploy script installs and keeps running:
+
+- It proxies to the app on `127.0.0.1:7860` — the app itself is unchanged.
+- It obtains a **Let's Encrypt certificate** on its own — the validation
+  request arrives through Cloudflare's proxy on port 80 — and renews it
+  automatically, forever. No certbot, no renew cron.
+- It **starts on boot** via systemd, alongside pm2's boot hook: after a
+  reboot both come back by themselves (Caddy answers 502 for the few
+  seconds until the app is up, then serves normally).
+- Live research traffic — SSE traces, live view frames, long model calls —
+  passes through unbuffered; Caddy streams responses by default, and
+  Cloudflare proxies WebSockets and event streams without any extra setup.
+
+### After pulling changes, run this on the VPS
+
+```bash
+cd ~/resurreccion        # the directory you cloned into
+git pull
+sudo sh scripts/vps_deploy.sh
+```
+
+It installs Caddy if missing, writes `/etc/caddy/Caddyfile` (a config that
+is not ours is backed up to `Caddyfile.pre-resurreccion` first, never
+deleted), restarts what needs restarting, verifies the app on `:7860` and
+the domain end to end, and prints the URL. `.env` is never touched.
+
+### Cloudflare settings
+
+The DNS record already exists and is **proxied** (orange cloud). What
+matters:
+
+| Setting | Value | Why |
+|---|---|---|
+| DNS | A record `resurreccion.omnivex-academy.xyz` → VPS IP, **proxied** | hides the origin IP |
+| SSL/TLS mode | **Full (strict)** | Caddy presents a real Let's Encrypt certificate; strict validates it. On *Flexible*, switch — Flexible + Caddy's http→https redirect can loop. |
+| Ports | 80 and 443 proxied (the default) | Let's Encrypt's HTTP-01 check comes in on port 80 |
+
+No other Cloudflare setting needs changing.
+
+### Verify
+
+```bash
+systemctl status caddy                       # active (running)
+curl -fsSk --resolve resurreccion.omnivex-academy.xyz:443:127.0.0.1 \
+     https://resurreccion.omnivex-academy.xyz/api/health   # via Caddy directly
+curl -fsS https://resurreccion.omnivex-academy.xyz/api/health  # through Cloudflare
+journalctl -u caddy -n 50                    # certificate issues, if any
+```
+
+### Make the session cookie HTTPS-only (optional)
+
+Once you always use the https domain:
+
+```bash
+nano ~/resurreccion/.env      # add a line: COOKIE_SECURE=true
+pm2 restart resurreccion && pm2 save
+```
+
+Skip this if you still sign in over `http://<ip>:7860` — a `Secure` cookie
+is not sent over plain http, so that login would stop working.
+
+### If the domain does not load
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Cloudflare 502/504 | the app is down | `pm2 status`, `pm2 logs resurreccion` |
+| Cloudflare 521/522 | nothing answering on the VPS | `systemctl status caddy` |
+| Redirect loop | Cloudflare SSL mode is *Flexible* | set it to **Full (strict)** |
+| `journalctl -u caddy` shows certificate errors | the HTTP-01 check never reached Caddy | record must be proxied, port 80 open (`--with-ufw` allows it); if "Always Use HTTPS" is on, turn it off until the first certificate is issued |
+| Port 7860 open to the internet | no firewall | rerun with `--with-ufw` |
+
+To serve a different hostname later:
+`sudo sh scripts/vps_deploy.sh --domain=other.example.com`. If you change
+`PORT` in `.env`, change the port in `/etc/caddy/Caddyfile` to match.
 
 ## 5. Day-to-day commands
 
@@ -188,6 +283,7 @@ Change them in `.env` if your machine differs.
 pm2 logs resurreccion          # most errors show up here
 pm2 status                    # is it online, or restarting?
 curl -fsS http://127.0.0.1:7860/api/health
+systemctl status caddy         # is the reverse proxy up?
 ```
 
 A blank page or a browser error usually means a compile or import error is
@@ -259,14 +355,18 @@ touched by sleeping.
 `omnivex-academy.xyz` (root) points at your other app; the subdomain points
 here:
 
-1. DNS: an **A record** `resureccion.omnivex-academy.xyz` → your VPS IP.
+1. DNS: an **A record** `resurreccion.omnivex-academy.xyz` → your VPS IP.
 2. Certificate on the VPS's reverse proxy:
-   `certbot --nginx -d resureccion.omnivex-academy.xyz`.
+   `certbot --nginx -d resurreccion.omnivex-academy.xyz`.
 3. Install `deploy/nginx-resureccion.conf` as that proxy's site config (it
    proxies to `127.0.0.1:7860`, so nothing else needs changing), then
    `nginx -t && systemctl reload nginx`.
 4. In `.env`, set `COOKIE_SECURE=true` and restart the container — the
    session cookie then only travels over HTTPS.
 
-Open `https://resureccion.omnivex-academy.xyz` and sign in; the first-run
+Open `https://resurreccion.omnivex-academy.xyz` and sign in; the first-run
 flow (Amazon sign-in, KDSpy install) is identical to steps above.
+
+If Resurrección owns the whole VPS under pm2 (the main setup above), you
+don't need any of this — Caddy handles the domain automatically. See
+*Your domain and HTTPS* above.

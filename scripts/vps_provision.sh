@@ -5,6 +5,7 @@
 #   sudo sh scripts/vps_provision.sh              # full provisioning
 #   sudo sh scripts/vps_provision.sh --no-swap    # keep the host's own swap
 #   sudo sh scripts/vps_provision.sh --with-ufw   # also lock the firewall
+#   sudo sh scripts/vps_provision.sh --domain=X   # serve domain X instead
 #
 # What it does, in order:
 #   1. installs system packages (python, node for the PDF sidecar, browser libs)
@@ -13,6 +14,9 @@
 #   3. builds the project virtualenv and installs Python deps
 #   4. installs pm2 and makes it start on boot
 #   5. downloads the Camoufox browser binary
+#   6. reverse proxy (Caddy): HTTPS for your domain, certificates renewed
+#      automatically, service started on boot
+#   7. optional firewall (SSH + 80 + 443 + app port)
 #
 # It does NOT touch your secrets. Put OWNER_PASSWORD_HASH, AUTH_SECRET and
 # MODEL_API_KEY in the project's .env file yourself (see VPS.md) — this script
@@ -24,14 +28,21 @@ PROJECT_DIR=$(pwd)
 
 NO_SWAP=0
 WANT_UFW=0
+# Domain the reverse proxy serves. --domain= overrides; deploy forwards it.
+APP_DOMAIN="resurreccion.omnivex-academy.xyz"
 for arg in "$@"; do
   case "$arg" in
     --no-swap)  NO_SWAP=1 ;;
     --with-ufw) WANT_UFW=1 ;;
-    -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
+    --domain=*) APP_DOMAIN="${arg#--domain=}" ;;
+    -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
     *)          echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+if [ -z "$APP_DOMAIN" ]; then
+  echo "--domain= needs a value, e.g. --domain=app.example.com" >&2
+  exit 2
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This script needs root for packages and swap. Re-run with sudo." >&2
@@ -187,18 +198,115 @@ say "Ensuring the Camoufox browser binary is present"
   echo "WARNING: camoufox fetch failed (usually no network). run.sh will retry at boot." >&2
 
 # ---------------------------------------------------------------------------
-# 6. Optional firewall
+# 6. Reverse proxy — HTTPS for the domain (Caddy)
+# ---------------------------------------------------------------------------
+# Caddy terminates HTTPS and proxies to the app on 127.0.0.1:7860. It
+# obtains and renews its own Let's Encrypt certificate — the validation
+# request arrives through Cloudflare's proxy on port 80 — and its systemd
+# service starts on boot. Everything here is deliberately non-fatal: a
+# proxy problem must never stop the app itself from coming up.
+say "Setting up the reverse proxy (Caddy)"
+
+caddy_install() {
+  command -v caddy >/dev/null 2>&1 && return 0
+  # Distro package first — nothing extra to trust.
+  if apt-cache show caddy >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends caddy && return 0
+  fi
+  # Not in this release's archives (e.g. Ubuntu < 24.04): official repo.
+  # https://caddyserver.com/docs/install#debian-ubuntu-raspbian
+  say "Adding the official Caddy apt repository"
+  KEYRING=/usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$KEYRING.new" \
+    || { rm -f "$KEYRING.new"; return 1; }
+  gpg --dearmor < "$KEYRING.new" > "$KEYRING" || { rm -f "$KEYRING.new"; return 1; }
+  rm -f "$KEYRING.new"
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    -o /etc/apt/sources.list.d/caddy-stable.list || return 1
+  chmod o+r "$KEYRING" /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y --no-install-recommends caddy
+}
+
+# A web server already holding :80/:443 (nginx?) would block caddy — worth
+# saying out loud while caddy is still absent.
+if ! command -v caddy >/dev/null 2>&1 \
+   && ss -lnt 2>/dev/null | grep -qE ':(80|443)[[:space:]]'; then
+  echo "NOTE: something is already listening on :80/:443 — if caddy fails" >&2
+  echo "      to start, stop that service first (systemctl status)" >&2
+fi
+
+if caddy_install; then
+  CADDYFILE=/etc/caddy/Caddyfile
+  # Never clobber a config we did not write: keep one backup, then install
+  # ours (the pristine package placeholder gets the same treatment).
+  if [ -f "$CADDYFILE" ] && ! grep -q '# Managed by Resurreccion' "$CADDYFILE"; then
+    say "Existing $CADDYFILE is not ours — keeping a copy at $CADDYFILE.pre-resurreccion"
+    # Preserve exactly what is about to be replaced — unless that exact
+    # content is already stored (no churn on re-runs). One generation.
+    if [ ! -f "$CADDYFILE.pre-resurreccion" ] \
+       || ! cmp -s "$CADDYFILE" "$CADDYFILE.pre-resurreccion"; then
+      cp "$CADDYFILE" "$CADDYFILE.pre-resurreccion" 2>/dev/null || true
+    fi
+  fi
+  NEW_CFG=$(mktemp)
+  cat > "$NEW_CFG" <<CEOF
+# Managed by Resurreccion — scripts/vps_provision.sh writes this file.
+# To serve a different host, re-run the deploy script with --domain=<host>.
+# The app keeps listening on 127.0.0.1:7860 — match PORT in .env if you
+# change it there.
+$APP_DOMAIN {
+    reverse_proxy 127.0.0.1:7860
+}
+CEOF
+  CADDY_CHANGED=0
+  if cmp -s "$NEW_CFG" "$CADDYFILE" 2>/dev/null; then
+    : # identical — nothing to do
+  elif mkdir -p /etc/caddy && install -m 644 "$NEW_CFG" "$CADDYFILE"; then
+    CADDY_CHANGED=1
+  else
+    echo "WARNING: could not write $CADDYFILE — https://$APP_DOMAIN will not work" >&2
+  fi
+  rm -f "$NEW_CFG"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable caddy >/dev/null 2>&1 \
+      || echo "NOTE: could not enable caddy on boot — run: systemctl enable caddy" >&2
+    if [ "$CADDY_CHANGED" -eq 1 ]; then
+      systemctl restart caddy >/dev/null 2>&1 || true
+    else
+      systemctl start caddy >/dev/null 2>&1 || true
+    fi
+    sleep 1
+    if systemctl is-active --quiet caddy; then
+      say "Caddy is up: https://$APP_DOMAIN -> 127.0.0.1:7860"
+    else
+      echo "WARNING: caddy is not running — check: journalctl -u caddy -n 30" >&2
+    fi
+  else
+    echo "NOTE: no systemd here — start it manually:" >&2
+    echo "      caddy run --config /etc/caddy/Caddyfile" >&2
+  fi
+else
+  echo "WARNING: Caddy could not be installed — the app still runs on" >&2
+  echo "         127.0.0.1:7860, but https://$APP_DOMAIN needs a proxy." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Optional firewall
 # ---------------------------------------------------------------------------
 if [ "$WANT_UFW" -eq 1 ]; then
-  say "Locking the firewall (SSH + app port only)"
+  say "Locking the firewall (SSH + HTTP/HTTPS + app port)"
   SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
   SSH_PORT=${SSH_PORT:-22}
   ufw allow "${SSH_PORT}/tcp" >/dev/null   # never lock yourself out
-  ufw allow 7860/tcp >/dev/null            # Resurrección
+  ufw allow 80/tcp >/dev/null              # Caddy: HTTPS + certificate renewal
+  ufw allow 443/tcp >/dev/null             # Caddy: HTTPS
+  ufw allow 7860/tcp >/dev/null            # Resurrección (direct access)
   ufw --force enable >/dev/null
   ufw status verbose
 else
-  say "Firewall: not changed (pass --with-ufw to allow only SSH + 7860)"
+  say "Firewall: not changed (pass --with-ufw to allow only SSH + 80/443 + 7860)"
 fi
 
 # ---------------------------------------------------------------------------

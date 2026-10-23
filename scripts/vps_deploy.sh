@@ -6,8 +6,9 @@
 #
 # That is the whole thing. It provisions the host, scaffolds a .env with
 # generated secrets, creates the durable data directory the SQLite database
-# lives in, installs the PDF sidecar's Node deps, and starts the app under
-# pm2 — then waits until /api/health answers and prints the URL.
+# lives in, installs the PDF sidecar's Node deps, starts the app under pm2,
+# and puts the domain's HTTPS reverse proxy (Caddy) in front — then waits
+# until /api/health answers and prints the URL.
 #
 # Idempotent and safe to re-run: it is also the update path. Re-running it
 # pulls the latest code state you already have, re-provisions whatever is
@@ -15,7 +16,9 @@
 #
 # Flags are forwarded to scripts/vps_provision.sh:
 #   --no-swap    keep the host's existing swap
-#   --with-ufw   also enable the firewall (SSH + app port only)
+#   --with-ufw   also enable the firewall (SSH + 80 + 443 + app port)
+#   --domain=X   serve https://X with the reverse proxy
+#                (default: resurreccion.omnivex-academy.xyz)
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -23,6 +26,15 @@ PROJECT_DIR=$(pwd)
 
 APP_PORT=7860
 PM2_APP=resurreccion
+
+# Domain the reverse proxy serves — only used for checks and output here;
+# the provisioner parses the same flag and writes the Caddyfile.
+APP_DOMAIN="resurreccion.omnivex-academy.xyz"
+for arg in "$@"; do
+  case "$arg" in
+    --domain=*) APP_DOMAIN="${arg#--domain=}" ;;
+  esac
+done
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
@@ -209,8 +221,29 @@ if [ "$READY" -ne 1 ]; then
   exit 1
 fi
 
+# Reverse proxy checks — non-fatal: the app is already proven healthy
+# above. The first hits Caddy directly (bypassing DNS and Cloudflare), the
+# second is the real end-to-end path through Cloudflare's edge.
+if command -v caddy >/dev/null 2>&1; then
+  say "Checking https://$APP_DOMAIN"
+  if curl -fsSk --max-time 10 --resolve "$APP_DOMAIN:443:127.0.0.1" \
+      "https://$APP_DOMAIN/api/health" >/dev/null 2>&1; then
+    printf '  Via Caddy:      OK\n'
+  else
+    printf 'NOTE: Caddy did not answer https://%s yet (certificate still issuing?).\n' "$APP_DOMAIN" >&2
+    printf '      check: systemctl status caddy ; journalctl -u caddy -n 30\n' >&2
+  fi
+  if curl -fsS --max-time 10 "https://$APP_DOMAIN/api/health" >/dev/null 2>&1; then
+    printf '  Via Cloudflare: OK — the domain works end to end\n'
+  else
+    printf 'NOTE: https://%s not reachable through Cloudflare yet.\n' "$APP_DOMAIN" >&2
+    printf '      See VPS.md "Your domain and HTTPS" (SSL mode must be Full (strict)).\n' >&2
+  fi
+fi
+
 say "Deployed and healthy"
-printf '  URL:      http://<your-server-ip>:%s\n' "$APP_PORT"
+printf '  URL:      https://%s\n' "$APP_DOMAIN"
+printf '  Direct:   http://<your-server-ip>:%s (no TLS — diagnostics only)\n' "$APP_PORT"
 printf '  Login:    the password you chose (or the one printed above)\n'
 printf '  Database: %s\n' "$DATA_DIR"
 printf '  Logs:     pm2 logs %s\n' "$PM2_APP"
