@@ -22,6 +22,21 @@ Set these in the deployment platform's environment settings (never commit real v
 | `PORT` | no | `7860` | HTTP port |
 | `LOG_LEVEL` | no | `info` | Uvicorn log level |
 
+## Automatic backups
+
+The live database is crash-safe (WAL + `synchronous=FULL`); snapshots cover
+the other half — disk/volume loss and corruption. Every interval the database
+is copied with SQLite `VACUUM INTO` (consistent online copy, no downtime),
+verified with `PRAGMA quick_check` before it is published, and pruned to the
+newest N. See `app/backup.py`; restore steps are in `VPS.md`.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `BACKUP_ENABLED` | no | `true` | Set `false` to disable snapshots entirely |
+| `BACKUP_INTERVAL_HOURS` | no | `24` | Hours between snapshots (min 1) |
+| `BACKUP_KEEP` | no | `14` | Snapshots to retain (min 1); older ones are pruned automatically |
+| `BACKUP_DIR` | no | `$DATA_DIR/backups` | Where snapshots are written — point this at another mount to keep backups off the data disk |
+
 ## Research model (Stage 3 — required for research runs)
 
 The agent reasons, orchestrates, reads screenshots, and emits JSON actions

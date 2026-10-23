@@ -126,6 +126,43 @@ misconfiguration fails loudly instead of restarting forever.
 restart, a session that was running resumes from its last checkpoint; nothing
 already gathered is lost.
 
+## Automatic backups
+
+Crash-safe is not disk-safe, so the app snapshots the database itself. Every
+`BACKUP_INTERVAL_HOURS` (default **24 h**) it copies the live SQLite database
+with `VACUUM INTO` — a consistent online copy, no downtime — verifies it with
+`PRAGMA quick_check`, and keeps the newest **14** (`BACKUP_KEEP`). A failed or
+corrupt snapshot is deleted and logged (`[backup] …` in `pm2 logs`), never
+kept as a false sense of safety. Snapshots land in:
+
+```
+~/resurreccion-data/backups/resurreccion-<UTC timestamp>-<id>.db
+```
+
+Tune or disable in `.env`: `BACKUP_ENABLED`, `BACKUP_INTERVAL_HOURS`,
+`BACKUP_KEEP`, `BACKUP_DIR` (full list: `ENV_VARS.md`).
+
+**Restore** (replaces the live database with a snapshot):
+
+```bash
+pm2 stop resurreccion
+cp ~/resurreccion-data/backups/resurreccion-<TIMESTAMP>-<id>.db ~/resurreccion-data/resurreccion.db
+pm2 start resurreccion
+```
+
+**Copy them off the box.** Same-disk snapshots survive corruption and
+accidental deletes, not a dead SSD. A daily cron keeps them somewhere else:
+
+```bash
+crontab -e
+# every day at 03:15, copy snapshots to another machine/drive:
+15 3 * * * rsync -a --quiet ~/resurreccion-data/backups/ user@otherhost:~/resurreccion-backups/
+```
+
+For the Docker path the same applies: data lives in the `resurreccion-data`
+volume, snapshots in `/data/backups` inside it — rsync from the host via
+`docker cp`, or set `BACKUP_DIR` to a bind-mounted host directory.
+
 ## Fitting the browser to your box
 
 The browser is the only thing that can runaway, so it is the only thing you

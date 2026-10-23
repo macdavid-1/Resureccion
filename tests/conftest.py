@@ -23,6 +23,7 @@ def config(tmp_path: Path) -> Config:
     cfg.uploads_dir = cfg.data_dir / "uploads"
     cfg.exports_dir = cfg.data_dir / "exports"
     cfg.reports_dir = cfg.data_dir / "reports"
+    cfg.backups_dir = cfg.data_dir / "backups"
     cfg.browser_profiles_dir = cfg.data_dir / "browser_profiles"
     cfg.browser_downloads_dir = cfg.data_dir / "browser_downloads"
     cfg.kdspy_extension_path = cfg.data_dir / "extensions" / "kdspy"

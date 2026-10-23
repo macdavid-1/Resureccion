@@ -218,6 +218,19 @@ class Config:
         self.browser_login_window_seconds = _int_env("BROWSER_LOGIN_WINDOW_SECONDS", 900)
         self.browser_login_window_secret = os.environ.get("BROWSER_LOGIN_SECRET", "").strip()
 
+        # --- automatic backups --------------------------------------------------
+        # Crash-safe (WAL+FULL in db.py) is not disk-safe: snapshots via
+        # VACUUM INTO into backups_dir on an interval, verified + pruned.
+        # See app/backup.py and the Backups section of VPS.md.
+        self.backups_dir = Path(
+            os.environ.get("BACKUP_DIR", str(self.data_dir / "backups"))
+        ).expanduser().resolve()
+        self.backup_enabled = os.environ.get("BACKUP_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        self.backup_interval_hours = max(1, _int_env("BACKUP_INTERVAL_HOURS", 24))
+        self.backup_keep = max(1, _int_env("BACKUP_KEEP", 14))
+
         # --- serving -----------------------------------------------------------
         self.host = os.environ.get("HOST", "0.0.0.0")
         self.port = _int_env("PORT", 7860)
@@ -235,6 +248,7 @@ class Config:
             self.browser_profiles_dir / "kdspy",  # shared research profile
             self.exports_dir,
             self.reports_dir,
+            self.backups_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 

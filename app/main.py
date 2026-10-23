@@ -12,6 +12,7 @@ from app.agent import AgentStateStore
 from app.amazon_auth import AmazonAuthManager
 from app.artifacts import ArtifactStore
 from app.autonomy import AutonomySupervisor
+from app.backup import BackupManager
 from app.claims import ClaimStore
 from app.integrity import IntegrityAssessmentStore
 from app.live_view import LiveViewStore
@@ -191,7 +192,16 @@ def create_app() -> FastAPI:
                 print(f"[recording] recovered {len(rec_recovered)} interrupted recording(s)", flush=True)
         except Exception as exc:
             print(f"[recording] boot recovery error: {exc}", flush=True)
+        # Automatic DB snapshots (VACUUM INTO, verified + pruned). Started
+        # after boot recovery so startup IO stays focused on recovery; fails
+        # loud in logs but never blocks boot or research.
+        app.state.backups = BackupManager(db, config)
+        app.state.backups.start()
         yield
+        try:
+            await app.state.backups.stop()
+        except Exception:
+            pass
         try:
             if getattr(app.state, "relay", None):
                 await app.state.relay.stop()
