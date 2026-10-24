@@ -47,7 +47,17 @@ class Config:
 
         # --- single-user auth -------------------------------------------------
         self.owner_username = os.environ.get("OWNER_USERNAME", "owner").strip()
+        # OWNER_PASSWORD is the human-facing knob: set it to the literal
+        # password typed at the sign-in screen and the scrypt hash is derived
+        # below at boot (the users row is re-synced from env on every start,
+        # so .env wins after a restart). It takes precedence over
+        # OWNER_PASSWORD_HASH when both are set — a stale hash silently
+        # locking the owner out of their own single-user app is exactly the
+        # failure this prevents: the owner edits a password line, not a hash.
+        self.owner_password = os.environ.get("OWNER_PASSWORD", "").strip()
         self.owner_password_hash = os.environ.get("OWNER_PASSWORD_HASH", "").strip()
+        if self.owner_password:
+            self.owner_password_hash = self._hash_owner_password(self.owner_password)
         self.auth_secret = os.environ.get("AUTH_SECRET", "").strip()
         self.auth_session_ttl_hours = _int_env("SESSION_TTL_HOURS", 24 * 7)
         self.auth_cookie_name = "resurreccion_session"
@@ -252,12 +262,36 @@ class Config:
         ):
             d.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _hash_owner_password(password: str) -> str:
+        # Deferred import: app.security imports app.config at module level, so
+        # a top-level import here would be circular.
+        from app.security import hash_password
+
+        return hash_password(password)
+
+    @staticmethod
+    def _looks_like_scrypt_hash(value: str) -> bool:
+        parts = value.split("$")
+        return len(parts) == 3 and parts[0] == "scrypt" and all(parts[1:])
+
     def validate_auth(self) -> None:
         """Fail loudly at boot if single-user auth isn't configured."""
         problems: list[str] = []
+        if not self.owner_username:
+            problems.append(
+                "OWNER_USERNAME is empty. Set it, or remove the line to use 'owner'."
+            )
         if not self.owner_password_hash:
             problems.append(
-                "OWNER_PASSWORD_HASH is not set. Generate one with: "
+                "OWNER_PASSWORD (the login password) is not set. Set it to the password "
+                "you want to sign in with, or generate OWNER_PASSWORD_HASH with: "
+                "python -m app.scripts.set_password"
+            )
+        elif not self._looks_like_scrypt_hash(self.owner_password_hash):
+            problems.append(
+                "OWNER_PASSWORD_HASH is not a scrypt hash — did you paste the password "
+                "itself into that line? Set OWNER_PASSWORD instead, or regenerate with: "
                 "python -m app.scripts.set_password"
             )
         if not self.auth_secret:

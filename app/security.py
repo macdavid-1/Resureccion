@@ -112,7 +112,20 @@ class AuthService:
             row = conn.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()
         if row is None:
             return False
-        return verify_password(password, row["password_hash"])
+        stored = row["password_hash"] or ""
+        if not stored.startswith("scrypt$"):
+            # Not a mistyped password — a misconfigured box (most often the
+            # plaintext password pasted into OWNER_PASSWORD_HASH). Nothing the
+            # owner types can ever match it, so report the misconfiguration
+            # instead of a bare 401 that reads like a wrong guess and burns
+            # their failed-attempt budget.
+            raise AuthError(
+                "Stored password hash is malformed. Set OWNER_PASSWORD in .env to the "
+                "password you want to sign in with (or regenerate OWNER_PASSWORD_HASH "
+                "with python -m app.scripts.set_password), then restart the app.",
+                status=500,
+            )
+        return verify_password(password, stored)
 
     # ---------------------------------------------------------------- verify
     def verify_token(self, token: str) -> bool:

@@ -27,8 +27,9 @@ services:
     volumes:
       - resurreccion-data:/data    # SQLite DB, artifacts, browser profile (SSD)
     env_file:
-      # Secrets live here, never in git: OWNER_PASSWORD_HASH, AUTH_SECRET,
-      # MODEL_API_KEY — and COOKIE_SECURE=true for the HTTPS domain.
+      # Secrets live here, never in git: OWNER_PASSWORD (or
+      # OWNER_PASSWORD_HASH), AUTH_SECRET, MODEL_API_KEY — and
+      # COOKIE_SECURE=true for the HTTPS domain.
       - .env
     environment:
       MAX_CONCURRENT_SESSIONS: "1" # one research session on this box

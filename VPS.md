@@ -84,8 +84,9 @@ out. `--with-ufw` detects your SSH port first and allows it before enabling.
 
 `.env` (next to `run.sh`) is where your secrets live. It is loaded
 automatically when the app boots and is never committed to git. The deploy
-script already wrote your login password, `AUTH_SECRET`, `DATA_DIR` and the
-model settings into it; the one thing you may still need to add is the API key:
+script already wrote your login password hash, `AUTH_SECRET`, `DATA_DIR` and
+the model settings into it; the one thing you may still need to add is the API
+key:
 
 ```bash
 nano ~/resurreccion/.env     # set MODEL_API_KEY=<your DeepInfra key>
@@ -96,6 +97,10 @@ The default model is **MiMo-V2.6-Flash** (`XiaomiMiMo/MiMo-V2.6-Flash`), a
 thinking model on DeepInfra. Anything in `.env` overrides the values in
 `ecosystem.config.cjs`, so you can tune the app without touching the pm2 file.
 Full list: `ENV_VARS.md`.
+
+Prefer editing a plain password instead of a hash? Replace the
+`OWNER_PASSWORD_HASH=...` line with `OWNER_PASSWORD=<the password>` — the app
+hashes it at boot (quote the value if it contains `$` or spaces).
 
 **Do not put `.env` in git.** It is already ignored.
 
@@ -316,9 +321,9 @@ sleep with one command so the other apps get the resources back.
 ```bash
 git clone <your-repo-url> ~/resurreccion
 cd ~/resurreccion
-nano .env             # OWNER_PASSWORD_HASH, AUTH_SECRET, MODEL_API_KEY,
+nano .env             # OWNER_PASSWORD, AUTH_SECRET, MODEL_API_KEY,
                       # COOKIE_SECURE=true — full list in ENV_VARS.md.
-                      # Hash: python -m app.scripts.set_password
+                      # (Or OWNER_PASSWORD_HASH via: python -m app.scripts.set_password)
 docker compose up -d  # build + start, capped at 2 CPUs / 5 GB
 ```
 

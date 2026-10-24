@@ -9,6 +9,10 @@ import pytest
 
 os.environ.setdefault("OWNER_USERNAME", "owner")
 os.environ.setdefault("OWNER_PASSWORD_HASH", "scrypt$00$00")  # placeholder; tests build their own
+# OWNER_PASSWORD (the plaintext env knob) overrides the hash above in Config.
+# The shell injects the project .env into every command's environment, so an
+# ambient OWNER_PASSWORD would override the test hash and fail every login test.
+os.environ.pop("OWNER_PASSWORD", None)
 
 from app.config import Config
 from app.db import Database
@@ -47,6 +51,7 @@ def client(monkeypatch, tmp_path):
     """Authenticated-ready FastAPI TestClient with fresh DATA_DIR."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OWNER_USERNAME", "owner")
+    monkeypatch.delenv("OWNER_PASSWORD", raising=False)
     from app.security import hash_password
 
     monkeypatch.setenv("OWNER_PASSWORD_HASH", hash_password("hunter2"))

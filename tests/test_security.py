@@ -79,6 +79,54 @@ def test_expired_token_rejected(auth, db) -> None:
     assert not auth.verify_token(token)
 
 
+class TestPlaintextPasswordEnv:
+    """OWNER_PASSWORD — the .env line the owner actually edits.
+
+    The app used to read only OWNER_PASSWORD_HASH, so a .env carrying the
+    username and password (the natural thing to write) logged nobody in:
+    every attempt 401'd and the UI showed a generic "Sign in required".
+    """
+
+    def test_password_env_derives_a_usable_hash(self, monkeypatch) -> None:
+        from app.config import Config
+
+        monkeypatch.setenv("OWNER_PASSWORD", "correct horse")
+        monkeypatch.delenv("OWNER_PASSWORD_HASH", raising=False)
+        assert verify_password("correct horse", Config().owner_password_hash)
+
+    def test_password_wins_over_a_stale_hash(self, monkeypatch) -> None:
+        from app.config import Config
+
+        stale = hash_password("old-generated")
+        monkeypatch.setenv("OWNER_PASSWORD_HASH", stale)
+        monkeypatch.setenv("OWNER_PASSWORD", "what I actually type")
+        cfg = Config()
+        assert cfg.owner_password_hash != stale
+        assert verify_password("what I actually type", cfg.owner_password_hash)
+
+    def test_end_to_end_login_with_env_credentials(self, db, monkeypatch) -> None:
+        from app.config import Config
+
+        monkeypatch.setenv("OWNER_USERNAME", "mac_david")
+        monkeypatch.setenv("OWNER_PASSWORD", "correct horse")
+        monkeypatch.delenv("OWNER_PASSWORD_HASH", raising=False)
+        service = AuthService(db, Config())
+        service.ensure_user()
+        token = service.login("mac_david", "correct horse")
+        assert service.verify_token(token)
+
+    def test_malformed_stored_hash_fails_with_actionable_error(self, db, config) -> None:
+        """Plaintext pasted into OWNER_PASSWORD_HASH: nothing can ever match
+        it, so fail as a server misconfiguration (500), not as a wrong guess."""
+        config.owner_password_hash = "correct horse"  # not a scrypt hash
+        service = AuthService(db, config)
+        service.ensure_user()
+        with pytest.raises(AuthError) as exc:
+            service.login("owner", "correct horse")
+        assert exc.value.status == 500
+        assert "OWNER_PASSWORD" in str(exc.value)
+
+
 class TestCookieSecureFlag:
     """COOKIE_SECURE=true behind TLS (the HTTPS custom domain) must mark the
     session cookie Secure; the plain-http preview must stay cookie-compatible."""

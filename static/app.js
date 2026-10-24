@@ -29,7 +29,10 @@
 
   async function api(path, opts = {}) {
     const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) } });
-    if (res.status === 401) { showLogin(); throw new Error("Sign in required"); }
+    // A 401 on the login call itself IS the answer ("Invalid credentials",
+    // "Too many failed attempts", or a server-misconfiguration message);
+    // routing it through the generic path hid why sign-in actually failed.
+    if (res.status === 401 && !opts.isLogin) { showLogin(); throw new Error("Sign in required"); }
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail ?? detail; } catch {}
@@ -1263,6 +1266,7 @@
       try {
         const data = await api("/api/auth/login", {
           method: "POST",
+          isLogin: true,
           body: JSON.stringify({ username: $("#login-username").value, password: $("#login-password").value }),
         });
         localStorage.setItem(TOKEN_KEY, data.token);

@@ -8,7 +8,8 @@ Set these in the deployment platform's environment settings (never commit real v
 |---|---|---|---|
 | `DATA_DIR` | yes | `./data` | Persistent storage root — must map to the durable bucket |
 | `OWNER_USERNAME` | no | `owner` | Single authorized user |
-| `OWNER_PASSWORD_HASH` | **yes** | — | scrypt hash; generate with `python -m app.scripts.set_password` |
+| `OWNER_PASSWORD` | no | — | The login password as plain text — the simplest option: the app derives the scrypt hash at boot. Use this **or** `OWNER_PASSWORD_HASH`; if both are set, `OWNER_PASSWORD` wins |
+| `OWNER_PASSWORD_HASH` | **yes**¹ | — | scrypt hash; generate with `python -m app.scripts.set_password` |
 | `AUTH_SECRET` | **yes** | — | Long random string for auth session salting |
 | `SESSION_TTL_HOURS` | no | `168` | Auth session lifetime |
 | `COOKIE_SECURE` | no | `false` | Set `true` when served over HTTPS (custom domain behind TLS) — the session cookie then only travels over https |
@@ -21,6 +22,10 @@ Set these in the deployment platform's environment settings (never commit real v
 | `CHECKPOINT_INTERVAL_SECONDS` | no | `120` | Periodic checkpoint cadence |
 | `PORT` | no | `7860` | HTTP port |
 | `LOG_LEVEL` | no | `info` | Uvicorn log level |
+
+¹ Skip `OWNER_PASSWORD_HASH` when `OWNER_PASSWORD` is set. Quote either value
+in `.env` if it contains spaces or shell special characters (`$`, backticks):
+`OWNER_PASSWORD='my $trong password'`.
 
 ## Automatic backups
 
