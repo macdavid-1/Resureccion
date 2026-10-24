@@ -120,9 +120,13 @@ class BackupManager:
         """Keep the newest backup_keep snapshots; delete older ones."""
         backups = self.config.backups_dir
         pattern = f"{self.config.db_path.stem}-*.db"
+        # Tie-break by name: the name embeds a UTC timestamp, so on filesystems
+        # with coarse mtime granularity (files created in the same second share
+        # an mtime) the newest snapshot is still chosen deterministically
+        # instead of falling back to arbitrary directory order.
         snaps = sorted(
             (p for p in backups.glob(pattern) if p.is_file()),
-            key=lambda p: p.stat().st_mtime,
+            key=lambda p: (p.stat().st_mtime, p.name),
             reverse=True,
         )
         keep = self.config.backup_keep
