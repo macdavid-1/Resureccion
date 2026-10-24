@@ -20,7 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import asdict
+import random
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -215,7 +216,7 @@ def stable_fingerprint_path(config: Config) -> Path:
     return config.browser_profiles_dir / "kdspy_fingerprint.json"
 
 
-def _load_cached_fingerprint(path: Path) -> "Fingerprint | None":
+def _load_cached_fingerprint(path: Path) -> "Fingerprint | dict[str, Any] | None":
     """Read the cached fingerprint and fully re-type its nested dataclasses.
 
     ``asdict`` flattens NavigatorFingerprint/ScreenFingerprint/VideoCard into
@@ -231,6 +232,12 @@ def _load_cached_fingerprint(path: Path) -> "Fingerprint | None":
         return None
     if not CAMOUFOX_AVAILABLE:
         return None
+    # Written when the engine returned a plain dict (newer, fpgen-era
+    # camoufox): that schema cannot be retyped into browserforge's dataclass
+    # — the field sets diverged — so if retyping fails, the raw dict IS the
+    # installed engine's native shape: keep it rather than regenerate and
+    # rotate the research identity on every restart.
+    native = data.pop("_resurreccion_native", None) is not None
     from browserforge.fingerprints import (
         NavigatorFingerprint,
         ScreenFingerprint,
@@ -247,6 +254,8 @@ def _load_cached_fingerprint(path: Path) -> "Fingerprint | None":
         rest = {k: v for k, v in data.items() if k not in ("navigator", "screen", "videoCard")}
         return Fingerprint(navigator=navigator, screen=fp_screen, videoCard=video_card, **rest)
     except TypeError:
+        if native:
+            return data  # engine-native dict: the stable identity wins
         # Field set drift between library versions → regenerate.
         return None
 
@@ -259,7 +268,48 @@ def _persist_fingerprint(path: Path, fp_dict: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def load_or_generate_fingerprint(config: Config) -> "Fingerprint":
+def _generate_identity_fingerprint() -> "Fingerprint | dict[str, Any]":
+    """Generate an identity fingerprint on whichever camoufox is installed.
+
+    Engine generations disagree about ``os``:
+
+    * <= 0.5.6 (browserforge) accepts a LIST of OS alternatives;
+    * 0.5.8 (fpgen) turns that list into a predicate its constraint matcher
+      evaluates to nothing — ``InvalidConstraints: yielded no possible
+      values for "os"`` — while accepting a single OS value.
+
+    The identity needs exactly ONE platform (the cache freezes it forever),
+    so try the single choices first — both engines accept those — then the
+    list form, then the engine default. Shuffling keeps "the first
+    generation picks one" from deterministically picking the same family.
+    """
+    order = list(DEFAULT_OS_CHOICES)
+    random.shuffle(order)
+    errors: list[str] = []
+    for candidate in (*order, list(DEFAULT_OS_CHOICES), None):
+        try:
+            return (
+                generate_fingerprint()
+                if candidate is None
+                else generate_fingerprint(os=candidate)
+            )
+        except Exception as exc:  # engine API drift — try the next form
+            errors.append(f"{candidate!r}: {exc}")
+    raise RuntimeError(
+        "fingerprint generation failed in every supported form: " + " | ".join(errors)
+    )
+
+
+def _fingerprint_payload(fp: Any) -> dict[str, Any]:
+    """JSON for the cache. Dict-shaped engine output is marked so the loader
+    can tell a newer engine's native schema (keep it) from browserforge
+    field drift (regenerate)."""
+    if is_dataclass(fp):
+        return asdict(fp)
+    return {"_resurreccion_native": 1, **dict(fp)}
+
+
+def load_or_generate_fingerprint(config: Config) -> "Fingerprint | dict[str, Any]":
     """Profile-stable identity: generate once, cache as JSON, reuse forever.
 
     Reusing the same fingerprint across restarts is the point: a research
@@ -273,8 +323,8 @@ def load_or_generate_fingerprint(config: Config) -> "Fingerprint":
     cached = _load_cached_fingerprint(path)
     if cached is not None:
         return cached
-    fp = generate_fingerprint(os=list(DEFAULT_OS_CHOICES))
-    _persist_fingerprint(path, asdict(fp))
+    fp = _generate_identity_fingerprint()
+    _persist_fingerprint(path, _fingerprint_payload(fp))
     return fp
 
 

@@ -186,3 +186,104 @@ def test_firefox_ua_helper() -> None:
     ua = ce.firefox_ua("131.0", "windows")
     assert ua.startswith("Mozilla/5.0 (Windows NT 10.0")
     assert "Firefox/131.0" in ua
+
+
+class TestEngineGenerationCompat:
+    """camoufox <=0.5.6 (browserforge) and 0.5.8+ (fpgen) disagree about the
+    ``os`` argument and about the return shape. The engine layer must keep
+    producing a stable identity on BOTH, without version sniffing."""
+
+    # fpgen-era shape: lacks the fields browserforge requires, so retyping
+    # it into a dataclass raises TypeError (missing userAgentData, ...).
+    FPGEN_DICT = {
+        "navigator": {
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; rv:130.0) Gecko Firefox/130.0",
+            "platform": "Win32",
+            "webdriver": False,
+        },
+        "screen": {"width": 1920, "height": 1080},
+    }
+
+    @pytest.fixture()
+    def calls(self, monkeypatch: pytest.MonkeyPatch):
+        """Record every os argument generate_fingerprint receives."""
+        state = {"n": 0, "os": []}
+
+        def fake_generate(os=None, **kw):
+            state["n"] += 1
+            state["os"].append(os)
+            return dict(self.FPGEN_DICT)
+
+        monkeypatch.setattr(ce, "generate_fingerprint", fake_generate)
+        return state
+
+    def test_single_os_is_tried_first(
+        self, cfg: Config, calls: dict
+    ) -> None:
+        """0.5.8 dies on the multi-choice predicate but accepts a single OS:
+        the wrapper must reach for single values first, succeeding on the
+        very first attempt on both engine generations."""
+        fp = ce.load_or_generate_fingerprint(cfg)
+        assert isinstance(fp, dict)
+        assert calls["n"] == 1
+        assert isinstance(calls["os"][0], str)  # never the rejected list form
+        assert calls["os"][0] in ce.DEFAULT_OS_CHOICES
+
+    def test_falls_back_list_then_engine_default(
+        self, monkeypatch: pytest.MonkeyPatch, cfg: Config
+    ) -> None:
+        """An engine that refuses single values still gets the list form; one
+        that refuses both still gets a fingerprint (engine default)."""
+        seen: list[object] = []
+
+        def fake_generate(os=None, **kw):
+            seen.append(os)
+            if isinstance(os, (str, list)):
+                raise ValueError("only the bare call works")
+            return dict(self.FPGEN_DICT)
+
+        monkeypatch.setattr(ce, "generate_fingerprint", fake_generate)
+        fp = ce.load_or_generate_fingerprint(cfg)
+        assert isinstance(fp, dict)
+        assert [type(s).__name__ for s in seen] == ["str", "str", "list", "NoneType"]
+
+    def test_dict_result_is_marked_and_identity_is_stable(
+        self, cfg: Config, calls: dict
+    ) -> None:
+        """Dict-era output must round-trip through the cache WITHOUT
+        regenerating — otherwise the research identity would rotate on every
+        restart. The marker is what tells field drift (regenerate) apart from
+        the newer engine's native schema (keep)."""
+        first = ce.load_or_generate_fingerprint(cfg)
+        path = ce.stable_fingerprint_path(cfg)
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["_resurreccion_native"] == 1
+        bare = {k: v for k, v in on_disk.items() if k != "_resurreccion_native"}
+        assert bare == first  # payload = the engine's dict + the marker only
+
+        again = ce.load_or_generate_fingerprint(cfg)
+        assert calls["n"] == 1  # cache hit — no second generation
+        assert again == first  # identical identity across "restarts"
+        assert "_resurreccion_native" not in again  # popped before hand-off
+
+    def test_unmarked_field_drift_regenerates(
+        self, monkeypatch: pytest.MonkeyPatch, cfg: Config
+    ) -> None:
+        """An unmarked cache that cannot be retyped is field drift from an
+        older library version → regenerate, exactly as before."""
+        path = ce.stable_fingerprint_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"navigator": {"platform": "Win32"}, "screen": {"width": 1}}),
+            encoding="utf-8",
+        )
+        state = {"n": 0}
+
+        def fake_generate(os=None, **kw):
+            state["n"] += 1
+            return dict(self.FPGEN_DICT)
+
+        monkeypatch.setattr(ce, "generate_fingerprint", fake_generate)
+        fp = ce.load_or_generate_fingerprint(cfg)
+        assert isinstance(fp, dict)
+        assert state["n"] == 1  # regenerated because the cache was unusable
