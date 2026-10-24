@@ -15,6 +15,9 @@ dependencies = [
     "imageio-ffmpeg>=0.4.9",
     "playwright>=1.42",
     "camoufox[geoip]>=0.5.6",
+    # Imported directly by app/camoufox_engine.py — declare it instead of
+    # relying on camoufox pulling it in transitively.
+    "browserforge",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]

@@ -308,7 +308,17 @@ pm2 restart resurreccion
 ```
 
 `run.sh` runs the same script before uvicorn on every boot, so a restart
-alone also heals it — the manual command is just faster to watch.
+alone also heals it — the manual command is just faster to watch. The script
+clears half-installed leftovers first (an interrupted download makes pip
+report "already satisfied" while the code is missing) and prints the real
+import error if the package still won't load. If it says the virtualenv is
+the problem, rebuild it with the idempotent provisioner — it never touches
+`.env`:
+
+```bash
+sudo sh scripts/vps_provision.sh
+pm2 restart resurreccion
+```
 
 If logs show a memory kill, lower `BROWSER_MAX_OPEN_PAGES` and
 `BROWSER_CONTENT_PROCESSORS` in `.env`, then `pm2 restart resurreccion`.
