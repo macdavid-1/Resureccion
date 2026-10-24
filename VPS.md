@@ -292,12 +292,23 @@ systemctl status caddy         # is the reverse proxy up?
 ```
 
 A blank page or a browser error usually means a compile or import error is
-blocking startup — the logs will name it. If the browser specifically fails
-with "official/stable is not installed", the binary was not downloaded:
+blocking startup — the logs will name it. Browser failures have two exact
+causes, and one command fixes both — it installs the Camoufox Python package
+if it is missing (a hand-built virtualenv can lack it) and downloads the
+browser binary if it is missing (a fresh box has no cache):
+
+| Symptom | Missing piece |
+|---|---|
+| Toast: "camoufox is not installed" | The Python package — every browser path (Amazon sign-in, KDSpy, research) fails at launch |
+| Error: "official/stable is not installed" | The browser binary — the package is there but never fetched |
 
 ```bash
 .venv/bin/python scripts/camoufox_ensure.py
+pm2 restart resurreccion
 ```
+
+`run.sh` runs the same script before uvicorn on every boot, so a restart
+alone also heals it — the manual command is just faster to watch.
 
 If logs show a memory kill, lower `BROWSER_MAX_OPEN_PAGES` and
 `BROWSER_CONTENT_PROCESSORS` in `.env`, then `pm2 restart resurreccion`.

@@ -292,7 +292,9 @@ class BrowserManager:
                 self._engine_note = "camoufox engine requested but the camoufox package is not installed"
                 raise BrowserManagerError(
                     "camoufox is not installed. Resurrección runs Camoufox only — "
-                    "fix: pip install 'camoufox[geoip]' && camoufox fetch"
+                    "fix: run `python scripts/camoufox_ensure.py` (installs the package "
+                    "and fetches the browser; run.sh also does this at every boot), "
+                    "or pip install 'camoufox[geoip]' && camoufox fetch"
                 )
             self._engine_note = None
             try:
