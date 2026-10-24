@@ -1184,7 +1184,18 @@
       }
     });
 
-    $("#set-amazon-open").addEventListener("click", () => openInteractive("amazon_signin", "us"));
+    $("#set-amazon-open").addEventListener("click", async () => {
+      // Target the marketplace that actually needs the owner: the durable
+      // auth state records which domain the last check or research wall was
+      // seen on, so this sign-in lands on THAT store (Amazon sessions are
+      // per-domain) instead of always amazon.com.
+      let marketplace = "us";
+      try {
+        const st = await api("/api/browser/auth/amazon");
+        marketplace = st?.auth?.detail?.marketplace || "us";
+      } catch {}
+      openInteractive("amazon_signin", marketplace);
+    });
     $("#kdspy-pick-zip").addEventListener("click", () => $("#kdspy-zip-input").click());
     $("#kdspy-pick-files").addEventListener("click", () => $("#kdspy-files-input").click());
     $("#kdspy-pick-xpi").addEventListener("click", () => $("#kdspy-xpi-input").click());

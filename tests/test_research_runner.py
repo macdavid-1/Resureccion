@@ -421,6 +421,32 @@ async def test_auth_pause_lands_in_durable_paused_status(db, config, session):
 
 
 @pytest.mark.asyncio
+async def test_run_shows_live_phase_and_accumulates_elapsed(db, config, session):
+    """Two truths the owner was confused by: the session row must show the
+    phase that is RUNNING (it previously stayed 'initializing' until phase 1
+    finished while the event feed already said "Entering Phase 1"), and
+    elapsed_seconds must actually accumulate so the sessions card doesn't
+    read 0:00 while the detail view ticks."""
+    sessions = SessionStore(db, config)
+    model = ScriptedModel(PHASE_OUTPUTS)
+    seen: list[str] = []
+    orig_call = model.call
+
+    async def spy(*a: Any, **k: Any) -> Any:
+        seen.append(sessions.require(session).phase)
+        return await orig_call(*a, **k)
+
+    model.call = spy  # type: ignore[method-assign]
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    s = sessions.require(session)
+    assert "discovery" in seen  # visible WHILE phase 1 runs, not after
+    assert s.status == "completed"
+    assert s.phase == "synthesis"  # final mapped phase — not stuck at initializing
+    assert s.elapsed_seconds > 0  # the list card reads this directly
+
+
+@pytest.mark.asyncio
 async def test_unconfigured_model_pauses_session(db, config, session):
     sessions = SessionStore(db, config)
 

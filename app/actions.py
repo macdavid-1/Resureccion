@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
-from app.amazon_auth import AmazonAuthManager
+from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
 from app.browser_manager import BrowserManager, BrowserManagerError
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.events import EventLog
@@ -108,8 +108,33 @@ class ActionExecutor:
         except Exception:
             return  # classification is best-effort; never break research on it
         if check.status in ("login_required", "captcha_required", "otp_required"):
+            # Persist the wall (status + marketplace) on the durable auth
+            # store: the owner's Sign-in button reads it to target the RIGHT
+            # marketplace. Without this every sign-in went to amazon.com no
+            # matter which domain the agent actually stalled on — and Amazon
+            # sessions are per-domain, so the wall looked permanently stuck
+            # even after a perfectly successful sign-in. Best-effort
+            # bookkeeping: it must never block the pause itself.
+            try:
+                self.amazon_auth.auth_store.set(
+                    ACCOUNT_AMAZON,
+                    self.amazon_auth.profile,
+                    check.status,
+                    {
+                        "via": "research_wall",
+                        "url": scrub_url(check.url),
+                        "marketplace": str((check.detail or {}).get("marketplace") or ""),
+                    },
+                )
+            except Exception:
+                pass
+            mkt_code = str((check.detail or {}).get("marketplace") or "")
+            mkt = AMAZON_MARKETPLACES.get(mkt_code)
+            where = f" on {mkt.domain}" if mkt is not None else ""
             raise AuthPauseRequired(
-                f"manual authentication required ({check.status})",
+                f"sign-in wall ({check.status}){where} — open Settings → "
+                "Amazon authentication → Sign in (it targets that marketplace), "
+                "then Resume",
                 detail=check.to_dict(),
             )
 

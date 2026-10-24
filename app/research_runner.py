@@ -184,6 +184,10 @@ class ResearchRunner:
         self._owner_note_lines: list[str] = []
         self._owner_notes_loaded_for: str | None = None
         self._timings: dict[str, TimingTracker] = {}
+        # Live elapsed tick per session (see _tick_elapsed): the sessions list
+        # renders elapsed_seconds directly, so it must be folded in while the
+        # run is actually running.
+        self._elapsed_last: dict[str, float] = {}
         self.executor = executor or ActionExecutor(
             config,
             browser,
@@ -255,6 +259,21 @@ class ResearchRunner:
             self._timings[session_id] = t
         return t
 
+    def _tick_elapsed(self, session_id: str) -> None:
+        """Fold live running time into the durable elapsed_seconds counter.
+
+        The sessions list reads elapsed_seconds directly, so without this
+        tick the card read 0:00 for a whole run while only the detail view
+        faked a timer from updated_at. The baseline is set when the run
+        starts and run()'s finally flushes the final slice on every exit
+        path; nothing accumulates while the session is paused.
+        """
+        now = time.monotonic()
+        last = self._elapsed_last.get(session_id)
+        self._elapsed_last[session_id] = now
+        if last is not None:
+            self.sessions.accumulate_elapsed(session_id, now - last)
+
     # ---------------------------------------------------------- usage/cost
     def _record_model_usage(self, session_id: str, reply: Any) -> None:
         """Checkpoint this session's cumulative token/cost usage (durable).
@@ -297,6 +316,7 @@ class ResearchRunner:
         every failure path ends in a durable session status."""
         session = self.sessions.require(session_id)
         session_started = time.monotonic()
+        self._elapsed_last[session_id] = session_started
         try:
             self.sessions.update(session_id, status="running", error=None)
             # Idempotent: after a crash/resume the agent state row already
@@ -360,6 +380,15 @@ class ResearchRunner:
                         self.events.append(session_id, level="info", actor="system", action="paused_by_owner", detail={"phase": phase})
                         self.trace.record(session_id, KIND_PHASE, f"Paused by owner before {PHASE_TITLES.get(phase, phase)}")
                         return
+                    # Show the phase that is RUNNING now: the row starts at
+                    # 'initializing' and previously only advanced AFTER a
+                    # phase finished, so the whole first phase displayed as
+                    # "Initializing" on the list and detail views while the
+                    # event feed already said "Entering Phase 1".
+                    self.sessions.update(
+                        session_id,
+                        phase=SESSION_PHASE_BY_METHOD_PHASE.get(phase, "exploration"),
+                    )
                     output = await self._run_phase(
                         session_id, session, phase, phase_outputs, session_started
                     )
@@ -432,6 +461,8 @@ class ResearchRunner:
         except Exception as exc:
             self._fail(session_id, exc)
         finally:
+            self._tick_elapsed(session_id)  # flush the final slice on every exit path
+            self._elapsed_last.pop(session_id, None)
             await self.model.aclose()
 
     # ------------------------------------------------------------------ phases
@@ -493,6 +524,7 @@ class ResearchRunner:
             timing.elapsed_seconds = time.monotonic() - phase_start
             timing.session_elapsed_seconds = time.monotonic() - session_started
             timing.attempts_since_progress = stall
+            self._tick_elapsed(session_id)
 
             # --- owner message pickup (non-interrupting) -----------------
             # Checked on EVERY iteration, before the prompt is built: whatever

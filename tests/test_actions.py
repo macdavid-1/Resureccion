@@ -54,19 +54,31 @@ class FakeArtifacts:
         return A()
 
 
+class _StubAuthStore:
+    """Captures the durable auth write the research-wall handler makes."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str, str, dict]] = []
+
+    def set(self, account: str, profile: str, status: str, detail: dict | None = None) -> None:
+        self.writes.append((account, profile, status, detail or {}))
+
+
 class StubAuthManager:
     """Records which marketplace the auth-wall check used."""
 
     def __init__(self) -> None:
         self.checked_marketplace: str | None = None
         self.raise_pause = False
+        self.profile = "kdspy"
+        self.auth_store = _StubAuthStore()
 
     async def _classify_page(self, page: Any, marketplace: Any) -> AuthCheck:
         self.checked_marketplace = marketplace.code
         if self.raise_pause:
             return AuthCheck(
                 "captcha_required", page.url, "t",
-                {"reason": "test"},
+                {"reason": "test", "marketplace": marketplace.code},
             )
         return AuthCheck("unknown", page.url, "t", {})
 
@@ -170,6 +182,32 @@ async def test_auth_pause_raised_on_captcha(wired):
             session_id="s1", action="search_marketplace",
             args={"query": "x", "screenshot": False},
         )
+
+
+@pytest.mark.asyncio
+async def test_auth_wall_names_marketplace_and_persists_state(wired):
+    """The pause must name the wall's domain — a bare "login_required" left
+    the owner guessing where to sign in — and the durable auth store must
+    record the wall's marketplace, because the Settings Sign-in button
+    targets it. Previously every sign-in went to amazon.com whatever domain
+    the agent stalled on: Amazon sessions are per-domain, so a perfectly
+    successful sign-in still left login_required everywhere else."""
+    executor, auth, *_ = wired
+    auth.raise_pause = True
+    with pytest.raises(AuthPauseRequired) as ei:
+        await executor.execute(
+            session_id="s1", action="search_marketplace",
+            args={"query": "x", "screenshot": False},
+        )
+    msg = str(ei.value)
+    assert "captcha_required" in msg
+    assert AMAZON_MARKETPLACES["us"].domain in msg  # where the wall is
+    assert "Settings" in msg  # and what to do about it
+    assert auth.auth_store.writes, "the wall must land in the durable store"
+    account, profile, status, detail = auth.auth_store.writes[-1]
+    assert (account, profile, status) == ("amazon", "kdspy", "captcha_required")
+    assert detail["via"] == "research_wall"
+    assert detail["marketplace"] == "us"
 
 
 @pytest.mark.asyncio

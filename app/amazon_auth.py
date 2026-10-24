@@ -309,13 +309,17 @@ class AmazonAuthManager:
             self.windows.set_status(window_id, WINDOW_COMPLETED, {"verified": True})
             self.auth_store.set(
                 ACCOUNT_AMAZON, self.profile, AUTH_CONFIRMED,
-                {"via": "manual_login_window"},
+                {"via": "manual_login_window", "marketplace": marketplace.code},
             )
         else:
             # Keep the window open (owner may still be mid-flow) but record.
             self.auth_store.set(
                 ACCOUNT_AMAZON, self.profile, check.status,
-                {"via": "manual_login_window", "verification": check.status},
+                {
+                    "via": "manual_login_window",
+                    "verification": check.status,
+                    "marketplace": marketplace.code,
+                },
             )
             if window.expires_at < _now_iso():
                 self.windows.set_status(window_id, WINDOW_EXPIRED)

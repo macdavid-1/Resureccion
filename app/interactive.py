@@ -80,6 +80,31 @@ AMAZON_SIGNIN_URL = (
 )
 
 
+def amazon_signin_url(marketplace: Marketplace) -> str:
+    """The canonical /ap/signin openid form for THIS marketplace's domain.
+
+    Amazon sessions are per-domain. A US-only form signed the owner into
+    amazon.com even when the agent's wall was on amazon.co.uk — the sign-in
+    "succeeded" while every other marketplace kept reading login_required.
+    return_to stays on the wall's own domain; amazon.com keeps the proven
+    byte-identical form above.
+    """
+    if marketplace.domain == "amazon.com":
+        return AMAZON_SIGNIN_URL
+    from urllib.parse import quote
+
+    base = f"https://www.{marketplace.domain}/"
+    identity = "http://specs.openid.net/auth/2.0/identifier_select"
+    query = (
+        f"openid.return_to={quote(base + '?ref_=nav_custrec_signin', safe='')}"
+        f"&openid.identity={quote(identity, safe='')}"
+        "&openid.mode=checkid_setup"
+        f"&openid.claimed_id={quote(identity, safe='')}"
+        f"&openid.ns={quote('http://specs.openid.net/auth/2.0', safe='')}"
+    )
+    return f"https://www.{marketplace.domain}/ap/signin?{query}"
+
+
 class InteractiveError(Exception):
     pass
 
@@ -315,7 +340,9 @@ class InteractiveSessionManager:
             self._watch_amazon_signin(session)
         )
 
-    def _persist_auth_status(self, auth: AmazonAuthManager, status: str, url: str) -> None:
+    def _persist_auth_status(
+        self, auth: AmazonAuthManager, status: str, url: str, mkt: Any = None
+    ) -> None:
         """Write the durable auth status, but only when it actually changed.
 
         The watcher classifies up to once a second; the durable store is for
@@ -326,11 +353,17 @@ class InteractiveSessionManager:
         if status == self._last_written_auth_status and status != AUTH_CONFIRMED:
             return
         self._last_written_auth_status = status
+        detail: dict[str, Any] = {"via": "interactive_signin", "url": scrub_url(url)}
+        if mkt is not None:
+            # Which store this status was observed on — the Settings Sign-in
+            # button targets it, so the next wall gets a sign-in on its own
+            # domain instead of always amazon.com.
+            detail["marketplace"] = mkt.code
         auth.auth_store.set(
             ACCOUNT_AMAZON,
             auth.profile,
             status,
-            {"via": "interactive_signin", "url": scrub_url(url)},
+            detail,
         )
 
     async def _watch_amazon_signin(self, session: "InteractiveSession") -> None:
@@ -357,14 +390,16 @@ class InteractiveSessionManager:
             url = (getattr(page, "url", "") or "")
             if not url or "amazon." not in urlparse(url).netloc.lower():
                 return
+            # Domain-first: a /ap/signin URL still identifies its marketplace,
+            # so the login_required write carries WHICH store needs the owner.
+            mkt = marketplace_from_url(url)
             path = urlparse(url).path.lower()
             if any(mark in path for mark in self._AMAZON_SIGNIN_MARKS):
                 # Still inside the sign-in/captcha/OTP flow — reflect that
                 # unless a confirmed state is already recorded.
                 if auth.current_state().status != AUTH_CONFIRMED:
-                    self._persist_auth_status(auth, AUTH_LOGIN_REQUIRED, url)
+                    self._persist_auth_status(auth, AUTH_LOGIN_REQUIRED, url, mkt)
                 return
-            mkt = marketplace_from_url(url)
             if mkt is None:
                 return
             # Bounded: a hung page must never pin the watcher task forever
@@ -372,7 +407,7 @@ class InteractiveSessionManager:
             check = await asyncio.wait_for(auth.classify_live(page, mkt), timeout=12.0)
             if check.status == AUTH_CONFIRMED:
                 self._last_written_auth_status = None  # completion is always recorded
-                self._persist_auth_status(auth, AUTH_CONFIRMED, url)
+                self._persist_auth_status(auth, AUTH_CONFIRMED, url, mkt)
             elif (
                 auth.current_state().status == AUTH_CONFIRMED
                 and check.status in (AUTH_UNKNOWN, AUTH_LOGIN_REQUIRED)
@@ -382,7 +417,7 @@ class InteractiveSessionManager:
                 # chrome). Confirmed until a real sign-in form is the page.
                 return
             else:
-                self._persist_auth_status(auth, check.status, url)
+                self._persist_auth_status(auth, check.status, url, mkt)
         except Exception:
             pass  # detection must never break the interactive session
 
@@ -417,9 +452,11 @@ class InteractiveSessionManager:
         page = await self.browser.new_page(interactive=True)
         try:
             if purpose == "amazon_signin":
-                # The canonical /ap/signin form: no homepage detour, no
-                # reliance on the homepage's sign-in affordances.
-                await self.browser.navigate(page, AMAZON_SIGNIN_URL)
+                # The canonical /ap/signin form on THIS marketplace's domain:
+                # no homepage detour, no reliance on the homepage's sign-in
+                # affordances, and no bouncing to amazon.com (Amazon sessions
+                # are per-domain — see amazon_signin_url).
+                await self.browser.navigate(page, amazon_signin_url(mkt))
             elif purpose == "kdspy_setup":
                 # The KDSpy subscription sign-in lives on the member portal —
                 # start there, not on the kdspy.com landing page.
