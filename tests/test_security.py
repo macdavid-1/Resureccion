@@ -125,6 +125,13 @@ class TestPlaintextPasswordEnv:
             service.login("owner", "correct horse")
         assert exc.value.status == 500
         assert "OWNER_PASSWORD" in str(exc.value)
+        # Even with a WRONG username on top (the VPS also had no
+        # OWNER_USERNAME line) the misconfiguration must surface — the
+        # username comparison used to short-circuit into a generic 401.
+        with pytest.raises(AuthError) as exc:
+            service.login("nobody", "whatever")
+        assert exc.value.status == 500
+        assert "OWNER_PASSWORD" in str(exc.value)
 
 
 class TestCookieSecureFlag:

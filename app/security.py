@@ -92,7 +92,23 @@ class AuthService:
             self._failed_attempts = [t for t in self._failed_attempts if now - t < self._window_seconds]
             if len(self._failed_attempts) >= self._max_attempts:
                 raise AuthError("Too many failed attempts; wait a few minutes", status=429)
-        if username != self.config.owner_username or not self._check_password(password):
+        # Credential shape BEFORE the username comparison. A stored value that
+        # cannot possibly verify (most often a plaintext password pasted into
+        # OWNER_PASSWORD_HASH) is a server misconfiguration, not a wrong guess:
+        # report it as one — and never let a wrong/missing OWNER_USERNAME
+        # short-circuit `or` into hiding it behind a generic 401. As a bonus
+        # the message can only appear if the running app actually read that
+        # misconfiguration from its environment, so it doubles as a live
+        # check that the environment file is being loaded at all.
+        stored = self._stored_hash()
+        if not stored.startswith("scrypt$"):
+            raise AuthError(
+                "Stored password hash is malformed. Set OWNER_PASSWORD in .env to the "
+                "password you want to sign in with (or regenerate OWNER_PASSWORD_HASH "
+                "with python -m app.scripts.set_password), then restart the app.",
+                status=500,
+            )
+        if username != self.config.owner_username or not verify_password(password, stored):
             with self._lock:
                 self._failed_attempts.append(now)
             raise AuthError("Invalid credentials", status=401)
@@ -107,25 +123,11 @@ class AuthService:
             )
         return token
 
-    def _check_password(self, password: str) -> bool:
+    def _stored_hash(self) -> str:
+        """The owner's stored password hash, or "" when no user row exists."""
         with self.db.read() as conn:
             row = conn.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()
-        if row is None:
-            return False
-        stored = row["password_hash"] or ""
-        if not stored.startswith("scrypt$"):
-            # Not a mistyped password — a misconfigured box (most often the
-            # plaintext password pasted into OWNER_PASSWORD_HASH). Nothing the
-            # owner types can ever match it, so report the misconfiguration
-            # instead of a bare 401 that reads like a wrong guess and burns
-            # their failed-attempt budget.
-            raise AuthError(
-                "Stored password hash is malformed. Set OWNER_PASSWORD in .env to the "
-                "password you want to sign in with (or regenerate OWNER_PASSWORD_HASH "
-                "with python -m app.scripts.set_password), then restart the app.",
-                status=500,
-            )
-        return verify_password(password, stored)
+        return (row["password_hash"] if row else None) or ""
 
     # ---------------------------------------------------------------- verify
     def verify_token(self, token: str) -> bool:
