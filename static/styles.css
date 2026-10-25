@@ -436,6 +436,10 @@ details.sect > .sect-body { padding: 2px 14px 14px; border-top: 1px solid var(--
 .set-row.set-col { flex-direction: column; align-items: stretch; gap: 8px; }
 .set-k { font-size: 0.88rem; }
 .set-d { font-size: 0.74rem; color: var(--text-3); margin-top: 2px; line-height: 1.4; }
+/* Seven differentiated Amazon sign-ins — one button per marketplace,
+   labeled with its base domain. */
+.set-signins { display: flex; flex-wrap: wrap; gap: 6px; }
+.set-signins .signin-mkt { letter-spacing: 0.01em; }
 
 /* ---------- interactive remote browser overlay ---------- */
 .rbrowser {
@@ -463,12 +467,27 @@ details.sect > .sect-body { padding: 2px 14px 14px; border-top: 1px solid var(--
   cursor: pointer; touch-action: manipulation; min-height: 32px;
 }
 .rb-tab.active { border-color: var(--accent); color: var(--text); background: rgba(18,7,218,0.14); }
-.rb-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.rb-stage { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .rb-frame-wrap {
   position: relative; flex: 1; min-height: 0;
-  display: grid; place-items: center; background: #05060a; overflow: hidden;
+  background: #05060a; overflow: auto; -webkit-overflow-scrolling: touch;
 }
-.rb-frame-wrap img { width: 100%; height: auto; max-height: 100%; object-fit: contain; touch-action: none; }
+/* Full-PC frame: fits the width at 100%; zooming (JS width > 100%) makes
+   the wrap scrollable so the owner can pan every corner of the page. */
+.rb-frame-wrap img {
+  display: block; width: 100%; max-height: 100%;
+  object-fit: contain; margin: 0 auto; touch-action: none;
+}
+/* Zoom pill — floats over the frame's top-right, outside the scrolling wrap
+   so panning never carries it off-screen. */
+.rb-zoom {
+  position: absolute; top: 10px; right: 10px; z-index: 6;
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(5, 6, 10, 0.78); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 8px;
+}
+.rb-zoom span { font-size: 0.74rem; color: var(--text-3); min-width: 42px; text-align: center; }
+.rb-zoom button { padding: 2px 10px; font-weight: 600; }
 .rb-off {
   position: absolute; inset: 0; display: grid; place-items: center;
   color: var(--text-3); font-size: 0.84rem; text-align: center; padding: 20px;

@@ -75,8 +75,9 @@ class FakeBrowser:
         self._context.pages.append(self.page)
         return self.page
 
-    async def new_page(self, *, interactive: bool = False) -> FakePage:
+    async def new_page(self, *, interactive: bool = False, mobile: bool = True) -> FakePage:
         self.launched += 1
+        self.last_mobile = mobile  # what the real manager was asked for
         # Mirror the real BrowserManager: every new_page hands back a FRESH
         # page (the previous context's pages stay closed after a relaunch),
         # and protected pages carry the marker attribute the eviction/busy
@@ -197,6 +198,42 @@ async def test_signin_opens_on_the_wall_marketplace_not_always_us(
     s = await manager.start(purpose="amazon_signin", marketplace="uk")
     assert s.status == "open"
     assert "amazon.co.uk" in s.last_url
+
+
+@pytest.mark.asyncio
+async def test_signin_opens_full_pc_viewport_not_phone(
+    manager: InteractiveSessionManager,
+) -> None:
+    """Amazon sign-in opens FULL PC size (the owner zooms/pans/scrolls in
+    the viewer); other interactive purposes keep the 1:1 phone layout."""
+    await manager.start(purpose="amazon_signin", marketplace="de")
+    assert manager.browser.last_mobile is False
+    await manager.complete(outcome="completed")
+
+    await manager.start(purpose="kdspy_setup")
+    assert manager.browser.last_mobile is True
+
+
+def test_signin_options_are_seven_with_base_domains() -> None:
+    """Settings offers exactly seven differentiated sign-ins, each labeled
+    with its real base domain (single source of truth: the catalog)."""
+    from app.marketplace import signin_marketplaces
+
+    domains = [m.domain for m in signin_marketplaces()]
+    assert domains == [
+        "amazon.com",
+        "amazon.co.uk",
+        "amazon.de",
+        "amazon.ca",
+        "amazon.com.au",
+        "amazon.in",
+        "amazon.fr",
+    ]
+
+
+def test_full_pc_viewport_defaults() -> None:
+    cfg = Config()
+    assert (cfg.browser_viewport_w, cfg.browser_viewport_h) == (1920, 1080)
 
 
 @pytest.mark.asyncio

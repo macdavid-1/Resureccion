@@ -194,6 +194,13 @@ class Config:
         # Explicit relay bearer token; when unset, one is generated once and
         # stored atomically under DATA_DIR (never committed anywhere).
         self.relay_token = os.environ.get("RELAY_TOKEN", "").strip()
+        # Research pages (and desktop-class Amazon sign-in pages) render at
+        # an explicit full-PC viewport: every screenshot shows the whole
+        # desktop layout — no fold cutoffs for the AI's scraping or the
+        # owner's live view — instead of whatever size the spoofed window
+        # happened to get at launch.
+        self.browser_viewport_w = _int_env("BROWSER_VIEWPORT_W", 1920)
+        self.browser_viewport_h = _int_env("BROWSER_VIEWPORT_H", 1080)
         # Interactive (owner-driven) sessions open pages at a phone-class
         # viewport: the owner taps the live stream from a phone, so a 1:1
         # page scale keeps every control full-size and taps land exactly.

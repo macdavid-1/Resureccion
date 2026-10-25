@@ -837,9 +837,10 @@
   // ---------- interactive remote browser (sign-in / KDSpy setup) ----------
   const rb = {
     session: null, timer: null, pollTimer: null, busy: false, signedInNotified: false,
+    zoom: 1,
   };
 
-  const RB_HINT_DEFAULT = "Tap the page to click · keyboard opens for text fields";
+  const RB_HINT_DEFAULT = "Tap to click · swipe to scroll · pinch or ＋/− to zoom";
 
   function rbShow(session) {
     rb.session = session;
@@ -848,8 +849,16 @@
     document.body.style.overflow = "hidden";
     $("#rb-url").textContent = session?.url || "—";
     $("#rb-hint").textContent = session?.purpose === "amazon_signin"
-      ? "Signing in… detected automatically when done"
+      ? "Full PC page · tap to click · swipe to scroll · pinch or ＋/− to zoom"
       : RB_HINT_DEFAULT;
+    // A fresh session starts at 100% with the frame at its top-left.
+    rb.zoom = 1;
+    const rimg = $("#rb-frame");
+    rimg.style.width = "";
+    rimg.style.maxHeight = "";
+    $("#rb-zoom-pct").textContent = "100%";
+    $("#rb-frame-wrap").scrollLeft = 0;
+    $("#rb-frame-wrap").scrollTop = 0;
     renderRbTabs();
     if (!rb.timer) rb.timer = setInterval(rbTick, 1200);
     rbTick();
@@ -939,7 +948,7 @@
                 toast("Amazon signed in — saved to the persistent profile");
               }
             } else {
-              $("#rb-hint").textContent = "Signing in… complete the steps above (captcha/OTP if asked). Detected automatically when done.";
+              $("#rb-hint").textContent = "Signing in… complete the steps above (captcha/OTP if asked) · swipe to scroll, pinch or ＋/− to zoom. Detected automatically when done.";
             }
           } catch {}
         } else {
@@ -971,12 +980,15 @@
   // Immediate visual acknowledgment between tap and the next streamed frame.
   function rbFlash(clientX, clientY) {
     const img = $("#rb-frame");
+    const wrap = $("#rb-frame-wrap");
     const r = img.getBoundingClientRect();
+    const wr = wrap.getBoundingClientRect();
     const d = document.createElement("div");
     d.className = "rb-tap";
-    d.style.left = `${clientX - r.left}px`;
-    d.style.top = `${clientY - r.top}px`;
-    $("#rb-frame-wrap").appendChild(d);
+    // The wrap scrolls when zoomed: place through its scroll origin too.
+    d.style.left = `${clientX - wr.left + wrap.scrollLeft}px`;
+    d.style.top = `${clientY - wr.top + wrap.scrollTop}px`;
+    wrap.appendChild(d);
     setTimeout(() => d.remove(), 420);
   }
 
@@ -989,8 +1001,49 @@
     refreshSettings();
   }
 
+  // ---------- zoom: full-PC pages watched on a phone screen ----------
+  const RB_ZOOM_STEPS = [0.5, 0.75, 1, 1.5, 2, 3, 4];
+
+  function rbApplyZoom(z, anchorX, anchorY) {
+    const img = $("#rb-frame"), wrap = $("#rb-frame-wrap");
+    z = Math.max(RB_ZOOM_STEPS[0], Math.min(RB_ZOOM_STEPS[RB_ZOOM_STEPS.length - 1], z));
+    const wr = wrap.getBoundingClientRect();
+    if (anchorX == null) {
+      anchorX = wr.left + wr.width / 2;
+      anchorY = wr.top + wr.height / 2;
+    }
+    // Keep the image point under the anchor pinned while the scale changes.
+    const before = img.getBoundingClientRect();
+    const contentX = anchorX - before.left;
+    const contentY = anchorY - before.top;
+    const ratio = rb.zoom ? z / rb.zoom : 1;
+    rb.zoom = z;
+    img.style.width = (100 * z) + "%";
+    img.style.maxHeight = z > 1 ? "none" : "100%";
+    const after = img.getBoundingClientRect();
+    wrap.scrollLeft += (after.left + contentX * ratio) - anchorX;
+    wrap.scrollTop += (after.top + contentY * ratio) - anchorY;
+    $("#rb-zoom-pct").textContent = Math.round(z * 100) + "%";
+  }
+
+  function rbStepZoom(dir) {
+    const steps = RB_ZOOM_STEPS;
+    const target = dir > 0
+      ? steps.find((s) => s > rb.zoom + 1e-6)
+      : [...steps].reverse().find((s) => s < rb.zoom - 1e-6);
+    if (target != null) rbApplyZoom(target);
+  }
+
   function rbBind() {
     $("#rb-back").addEventListener("click", rbDone);
+    $("#rb-zoom-in").addEventListener("click", () => rbStepZoom(1));
+    $("#rb-zoom-out").addEventListener("click", () => rbStepZoom(-1));
+    // Ctrl/⌘+wheel zooms the viewer; a plain wheel scrolls the zoomed frame.
+    $("#rb-frame").addEventListener("wheel", (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      rbApplyZoom(rb.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
+    }, { passive: false });
     // Tap-to-click on the live frame: phone px → 1440×900 page px.
     // object-fit: contain letterboxes the JPEG inside the element box; only
     // the rendered image area accepts taps, and coordinates scale through the
@@ -1010,9 +1063,22 @@
     };
     // One pointer path: pointerup fires for touch AND mouse, replacing the
     // legacy click/touchend pair that double-fired and raced a 30ms de-dupe.
+    // Any real movement (swipe, pan, pinch) is NOT a tap: never turn the
+    // end of a gesture into a stray click on the page.
+    let downX = 0, downY = 0;
+    img.addEventListener("pointerdown", (e) => {
+      if (!e.isPrimary) return;
+      gestureMoved = false;
+      downX = e.clientX; downY = e.clientY;
+    });
+    img.addEventListener("pointermove", (e) => {
+      if (e.pointerType === "mouse" && e.buttons === 0) return;
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 14) gestureMoved = true;
+    });
     img.addEventListener("pointerup", (e) => {
       if (!e.isPrimary) return;
       e.preventDefault();
+      if (gestureMoved) { gestureMoved = false; return; }
       const now = Date.now();
       const sameSpot = Math.abs(e.clientX - lastTapX) < 28 && Math.abs(e.clientY - lastTapY) < 28;
       // Same spot within 350ms = accidental double-fire (synthetic click after
@@ -1036,15 +1102,52 @@
     });
     $$("#rbrowser .rb-key-row button").forEach((b) =>
       b.addEventListener("click", () => rbAct("key", { key: b.dataset.key })));
-    // Vertical swipe scrolls; batched per 120ms so a long flick is ONE
-    // round-trip instead of a storm competing with frame polling.
-    let touchY = null, lastScrollAt = 0, pendingDy = 0;
-    img.addEventListener("touchstart", (e) => { touchY = e.touches[0].clientY; }, { passive: true });
+    // Gestures: tap → click; one-finger swipe → remote scroll at 100%
+    // (batched per 120ms so a long flick is ONE round-trip instead of a
+    // storm competing with frame polling) or local pan while zoomed;
+    // two-finger pinch → zoom around the pinch midpoint.
+    let touchY = null, touchX = null, lastScrollAt = 0, pendingDy = 0;
+    let pinch = null;
+    gestureMoved = false;
+    img.addEventListener("touchstart", (e) => {
+      gestureMoved = false;
+      if (e.touches.length === 2) {
+        const [a, b] = e.touches;
+        pinch = {
+          d: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1,
+          z: rb.zoom,
+        };
+        touchY = null; touchX = null;
+        return;
+      }
+      touchY = e.touches[0].clientY;
+      touchX = e.touches[0].clientX;
+    }, { passive: true });
     img.addEventListener("touchmove", (e) => {
+      if (pinch && e.touches.length === 2) {
+        const [a, b] = e.touches;
+        const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1;
+        rbApplyZoom(
+          pinch.z * (d / pinch.d),
+          (a.clientX + b.clientX) / 2,
+          (a.clientY + b.clientY) / 2,
+        );
+        gestureMoved = true;
+        return;
+      }
       if (touchY === null || e.touches.length !== 1) return;
-      const y = e.touches[0].clientY;
+      const x = e.touches[0].clientX, y = e.touches[0].clientY;
+      if (Math.abs(x - (touchX ?? x)) + Math.abs(y - touchY) > 14) gestureMoved = true;
+      if (rb.zoom > 1) {
+        // Zoomed: the drag pans the frame locally — no remote round-trip.
+        const wrap = $("#rb-frame-wrap");
+        wrap.scrollLeft -= x - (touchX ?? x);
+        wrap.scrollTop -= y - touchY;
+        touchX = x; touchY = y;
+        return;
+      }
       pendingDy += touchY - y;
-      touchY = y;
+      touchX = x; touchY = y;
       const now = Date.now();
       if (Math.abs(pendingDy) > 24 && now - lastScrollAt >= 120) {
         rbAct("scroll", { dy: Math.round(pendingDy * 2) });
@@ -1052,7 +1155,10 @@
         lastScrollAt = now;
       }
     }, { passive: true });
-    img.addEventListener("touchend", () => { touchY = null; }, { passive: true });
+    img.addEventListener("touchend", (e) => {
+      if (e.touches.length < 2) pinch = null;
+      if (e.touches.length === 0) { touchY = null; touchX = null; }
+    }, { passive: true });
   }
 
   async function openInteractive(purpose, marketplace) {
@@ -1076,13 +1182,33 @@
         c.textContent = ok ? "ready" : warn ? "attention" : "—";
         c.className = `chip ${ok ? "completed" : warn ? "paused" : ""}`;
       };
+      // Seven differentiated Sign-in buttons — one per marketplace, each
+      // labeled with its base domain. Served by the catalog endpoint so the
+      // frontend can never drift from the real domains.
+      const mktByCode = {};
+      try {
+        const opts = await api("/api/browser/auth/amazon/signin-options");
+        const list = opts.options || [];
+        list.forEach((o) => { mktByCode[o.code] = o.domain; });
+        const wrap = $("#set-amazon-signins");
+        wrap.innerHTML = list.map((o) =>
+          `<button class="btn small signin-mkt" data-mkt="${esc(o.code)}" title="Sign in to ${esc(o.name)}">${esc(o.domain)}</button>`
+        ).join("");
+        wrap.querySelectorAll(".signin-mkt").forEach((b) =>
+          b.addEventListener("click", () => openInteractive("amazon_signin", b.dataset.mkt)));
+      } catch {}
       if (az) {
         const ok = az.auth?.status === "authenticated";
+        // Where the owner actually signed in (marker survives later walls).
+        const signedCode = az.auth?.detail?.signed_in_marketplace
+          || (ok ? az.auth?.detail?.marketplace : "") || "";
+        const signedDomain = mktByCode[signedCode] || "";
         $("#set-amazon-state").textContent =
-          ok ? "Signed in — persistent profile active" :
+          ok ? (signedDomain
+            ? `Signed in on ${signedDomain} — sessions are per-domain; sign in on any store you research`
+            : "Signed in — persistent profile active") :
           az.auth?.status ? `Status: ${az.auth.status}` : "Not signed in yet";
         setChip("#set-amazon-chip", ok, !!az.auth?.status && !ok);
-        $("#set-amazon-open").textContent = ok ? "Re-sign in" : "Sign in";
       }
       if (kd) {
         const st = kd.extension?.status;
@@ -1184,18 +1310,6 @@
       }
     });
 
-    $("#set-amazon-open").addEventListener("click", async () => {
-      // Target the marketplace that actually needs the owner: the durable
-      // auth state records which domain the last check or research wall was
-      // seen on, so this sign-in lands on THAT store (Amazon sessions are
-      // per-domain) instead of always amazon.com.
-      let marketplace = "us";
-      try {
-        const st = await api("/api/browser/auth/amazon");
-        marketplace = st?.auth?.detail?.marketplace || "us";
-      } catch {}
-      openInteractive("amazon_signin", marketplace);
-    });
     $("#kdspy-pick-zip").addEventListener("click", () => $("#kdspy-zip-input").click());
     $("#kdspy-pick-files").addEventListener("click", () => $("#kdspy-files-input").click());
     $("#kdspy-pick-xpi").addEventListener("click", () => $("#kdspy-xpi-input").click());

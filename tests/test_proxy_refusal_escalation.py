@@ -50,6 +50,8 @@ def _cfg(**over) -> SimpleNamespace:
         "browser_default_timeout_seconds": 5,
         "browser_interactive_viewport_w": 390,
         "browser_interactive_viewport_h": 844,
+        "browser_viewport_w": 1920,
+        "browser_viewport_h": 1080,
         "browser_max_open_pages": 4,
     }
     base.update(over)

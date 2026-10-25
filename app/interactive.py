@@ -428,8 +428,9 @@ class InteractiveSessionManager:
         this, the owner taps the button, the stream keeps showing the old
         page, and the login form sits invisible in a hidden tab. Every popup
         becomes a switchable tab, auto-focuses, and joins the session so
-        complete() closes it too. Popups get the same phone emulation so every
-        tab the owner sees stays 1:1 tappable.
+        complete() closes it too. Popups follow their session's class: phone
+        emulation for KDSpy-setup tabs (1:1 tappable), full-PC desktop for
+        Amazon sign-in tabs (the owner zooms/pans in the viewer).
         """
         def _on_popup(popup: Any) -> None:
             if session.status != "open":
@@ -439,7 +440,7 @@ class InteractiveSessionManager:
                 session.active = len(session.pages) - 1  # auto-focus the new tab
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self.browser.apply_mobile_emulation(popup))
+                    loop.create_task(self._emulate_popup(session, popup))
                 except Exception:
                     pass
                 self._watch_popups(session, popup)
@@ -448,8 +449,29 @@ class InteractiveSessionManager:
         except Exception:
             pass
 
+    async def _emulate_popup(self, session: InteractiveSession, popup: Any) -> None:
+        """Apply the session's viewport class to a popup tab (best-effort)."""
+        if session.purpose == "amazon_signin":
+            # Desktop-class: same full-PC viewport as the main sign-in tab.
+            try:
+                await popup.set_viewport_size({
+                    "width": self.config.browser_viewport_w,
+                    "height": self.config.browser_viewport_h,
+                })
+            except Exception:
+                pass
+            return
+        try:
+            await self.browser.apply_mobile_emulation(popup)
+        except Exception:
+            pass
+
     async def _open_page(self, mkt: Marketplace, purpose: str) -> Any:
-        page = await self.browser.new_page(interactive=True)
+        # Amazon sign-in opens FULL PC size (the owner zooms/pans/scrolls in
+        # the viewer); every other purpose keeps the 1:1 phone layout.
+        page = await self.browser.new_page(
+            interactive=True, mobile=(purpose != "amazon_signin")
+        )
         try:
             if purpose == "amazon_signin":
                 # The canonical /ap/signin form on THIS marketplace's domain:

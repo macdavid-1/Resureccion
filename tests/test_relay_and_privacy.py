@@ -541,7 +541,7 @@ def test_settings_panel_wired() -> None:
 
     html = Path("static/index.html").read_text()
     js = Path("static/app.js").read_text()
-    for kept in ("set-amazon-open", "set-amazon-state", "set-kdspy-open", "set-model-chip"):
+    for kept in ("set-amazon-signins", "set-amazon-state", "set-kdspy-open", "set-model-chip"):
         assert f'id="{kept}"' in html, f"{kept} must remain in Settings"
     removed = (
         "set-relay-enable", "set-relay-test", "set-relay-token-btn", "set-relay-state",

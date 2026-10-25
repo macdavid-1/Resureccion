@@ -341,6 +341,8 @@ async def test_midflight_proxy_death_recovers_and_retries(monkeypatch) -> None:
         browser_default_timeout_seconds=5,
         browser_interactive_viewport_w=390,
         browser_interactive_viewport_h=844,
+        browser_viewport_w=1920,
+        browser_viewport_h=1080,
         browser_max_open_pages=4,
     )
     mgr = bm.BrowserManager(cfg, kdspy=_kdspy_fake(), evidence=SimpleNamespace(), relay=None)

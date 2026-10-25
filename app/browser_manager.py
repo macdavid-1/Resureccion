@@ -383,13 +383,17 @@ class BrowserManager:
         self._context = None
 
     # ------------------------------------------------------------------ pages
-    async def new_page(self, *, interactive: bool = False) -> Any:
+    async def new_page(self, *, interactive: bool = False, mobile: bool = True) -> Any:
         """Open a tracked page in the shared context (bounded pool).
 
         `interactive=True` marks the page as owner-controlled (sign-in/setup);
         protected pages are never chosen as eviction victims when the research
-        page pool needs space. Interactive pages open at a phone-class viewport
-        so the owner's taps map 1:1 and every control stays full-size.
+        page pool needs space. `mobile=True` (interactive only) opens a
+        phone-class viewport with touch/mobile identity for 1:1 tapping;
+        `mobile=False` opens a full-PC viewport with the profile's desktop
+        identity (Amazon sign-in — the viewer gives the owner zoom/scroll).
+        Research pages always get the explicit full-PC viewport so screenshots
+        never cut the desktop layout off.
         """
         ctx = await self._ensure_context()
         # Respect the 2-core budget: keep at most browser_max_open_pages live,
@@ -410,21 +414,38 @@ class BrowserManager:
         page = await ctx.new_page()
         if interactive:
             page._resurreccion_protected = True
-            # Owner-driven pages emulate a REAL PHONE (viewport, touch, mobile
-            # UA at every layer) — the shared context stays desktop for
+        # Viewport policy: research pages and desktop-class owner pages get
+        # an explicit full-PC viewport (1920×1080 by default) — screenshots
+        # show the whole desktop layout, with no fold cutoffs for the AI's
+        # scraping or the owner watching the live view. Only phone-class
+        # interactive pages (KDSpy setup etc.) emulate a phone.
+        phone_class = interactive and mobile
+        try:
+            # Playwright-managed viewport survives cross-document
+            # navigations; set it first so layout is always deterministic.
+            await page.set_viewport_size(
+                {
+                    "width": self.config.browser_interactive_viewport_w,
+                    "height": self.config.browser_interactive_viewport_h,
+                }
+                if phone_class
+                else {
+                    "width": self.config.browser_viewport_w,
+                    "height": self.config.browser_viewport_h,
+                }
+            )
+        except Exception:
+            pass  # page may already be closing; context default is a safe fallback
+        if phone_class:
+            # Owner-driven phone pages emulate a REAL PHONE (viewport, touch,
+            # mobile UA at every layer) — the shared context stays desktop for
             # research pages. This is what makes the whole screen accurately
             # responsive: the owner taps a 1:1 page where every control is
             # full-size and sites serve their touch layouts.
             try:
-                # Playwright-managed viewport survives cross-document
-                # navigations; set it first so layout is always phone-class.
-                await page.set_viewport_size({
-                    "width": self.config.browser_interactive_viewport_w,
-                    "height": self.config.browser_interactive_viewport_h,
-                })
                 await camoufox_engine.apply_interactive_emulation(self.config, page)
             except Exception:
-                pass  # page may already be closing; desktop viewport is a safe fallback
+                pass
         page.set_default_timeout(self.config.browser_default_timeout_seconds * 1000)
         self._touch()
         return page

@@ -219,8 +219,10 @@
             </div>
             <div class="row" style="align-items:center; gap:8px">
               <span class="chip" id="set-amazon-chip">—</span>
-              <button class="btn small" id="set-amazon-open">Sign in</button>
             </div>
+            <!-- Seven differentiated sign-ins, one per marketplace, each
+                 labeled with its base domain (rendered from the catalog). -->
+            <div class="set-signins" id="set-amazon-signins"></div>
           </div>
           <div class="set-row set-col">
             <div>
@@ -317,6 +319,13 @@
     <div class="rb-frame-wrap" id="rb-frame-wrap">
       <img id="rb-frame" alt="Remote browser">
       <div class="rb-off" id="rb-off">Starting remote browser…</div>
+    </div>
+    <!-- Zoom for full-PC-size pages viewed on a phone: buttons or pinch.
+         Scroll/pan is the frame itself (swipe when zoomed out). -->
+    <div class="rb-zoom" id="rb-zoom">
+      <button class="btn small" id="rb-zoom-out" aria-label="Zoom out">−</button>
+      <span id="rb-zoom-pct">100%</span>
+      <button class="btn small" id="rb-zoom-in" aria-label="Zoom in">＋</button>
     </div>
     <div class="rb-hint" id="rb-hint">Tap the page to click · keyboard opens for text fields</div>
   </div>

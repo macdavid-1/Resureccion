@@ -6,10 +6,12 @@ real persistent Chromium through BrowserManager and EvidenceCollector. Raw
 pages are never stored — only structured, redacted evidence.
 
 Auth safety: after any navigation the page is classified (sign-in wall,
-CAPTCHA, OTP challenge) using AmazonAuthManager's DOM heuristics. If manual
-owner intervention is required, the runner pauses the session safely
-(`waiting_recovery` agent state, `paused_auth` runner status) instead of
-corrupting research state.
+CAPTCHA, OTP challenge) using AmazonAuthManager's DOM heuristics. Sign-in is
+OPTIONAL — a login wall is skipped as a failed action and the model decides
+what to do without that page (never a backend blocker: the durable auth
+state can be wrong, per-domain). Only CAPTCHA/OTP, which need the owner's
+hands, pause the session safely (`waiting_recovery` agent state,
+`paused_auth` runner status) instead of corrupting research state.
 
 Every executed action is journaled to the event log with redacted detail.
 """
@@ -21,7 +23,6 @@ from urllib.parse import quote_plus, urlparse
 
 from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
 from app.browser_manager import BrowserManager, BrowserManagerError
-from app.browser_store import AUTH_CONFIRMED
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.events import EventLog
 from app.marketplace import (
@@ -101,34 +102,18 @@ class ActionExecutor:
         return mkt
 
     # ------------------------------------------------------------------ guards
-    def _signed_in_marketplace(self) -> str:
-        """Where the owner has actually completed sign-in ("" = never).
-
-        Stored durably by `BrowserAuthStore.set` as `signed_in_marketplace`
-        and carried across every later status write — Amazon sessions are
-        per-domain, so a login_required observed on amazon.co.uk says nothing
-        about a sign-in completed on amazon.com.
-        """
-        try:
-            state = self.amazon_auth.auth_store.get(
-                ACCOUNT_AMAZON, self.amazon_auth.profile
-            )
-        except Exception:
-            return ""
-        if state is None:
-            return ""
-        detail = state.detail or {}
-        marker = str(detail.get("signed_in_marketplace") or "")
-        if marker:
-            return marker
-        # Legacy confirmed states predate the marker: fall back to where the
-        # confirmed observation happened.
-        if state.status == AUTH_CONFIRMED:
-            return str(detail.get("marketplace") or "")
-        return ""
-
     async def _check_auth_wall(self, page: Any, session_id: str | None = None) -> None:
-        """Pause (or skip) research when a sign-in/CAPTCHA wall is detected."""
+        """Never block on sign-in; pause only for CAPTCHA/OTP.
+
+        Sign-in is OPTIONAL by design: the owner may not sign in at all, and
+        the durable auth state can be wrong (Amazon sessions are per-domain,
+        the store can read login_required while the page actually shows
+        reviews). So a login wall is never a backend decision — the page is
+        skipped as a failed action and the MODEL decides what to do without
+        it (skip review mining, or keep going with the evidence that is
+        visible). CAPTCHA/OTP are different: they block every page and need
+        the owner's hands, so those still pause the session safely.
+        """
         try:
             mkt = marketplace_from_url(page.url or "") or self.next_marketplace()
             check = await self.amazon_auth._classify_page(page, mkt)
@@ -137,15 +122,11 @@ class ActionExecutor:
         if check.status not in ("login_required", "captcha_required", "otp_required"):
             return
         wall_code = str((check.detail or {}).get("marketplace") or "")
-        signed_in = self._signed_in_marketplace()
         # Persist the wall (status + marketplace) on the durable auth
-        # store: the owner's Sign-in button reads it to target the RIGHT
-        # marketplace. Without this every sign-in went to amazon.com no
-        # matter which domain the agent actually stalled on — and Amazon
-        # sessions are per-domain, so the wall looked permanently stuck
-        # even after a perfectly successful sign-in. Best-effort
-        # bookkeeping: it must never block the pause itself. (The durable
-        # signed-in marker inside detail is preserved by the store itself.)
+        # store: the owner's Sign-in buttons read it to show which store
+        # last needed them. Best-effort bookkeeping only — it must never
+        # block the flow itself. (The durable signed-in marker inside
+        # detail is preserved by the store itself.)
         try:
             self.amazon_auth.auth_store.set(
                 ACCOUNT_AMAZON,
@@ -161,18 +142,11 @@ class ActionExecutor:
             pass
         mkt_obj = AMAZON_MARKETPLACES.get(wall_code)
         where = f" on {mkt_obj.domain}" if mkt_obj is not None else ""
-        # The owner signs in once (say on amazon.com); Amazon sessions are
-        # per-domain, so every OTHER marketplace keeps showing its own
-        # sign-in wall. After a completed sign-in those walls must not stop
-        # research: skip the page — a failed action the agent routes around —
-        # and keep going. The wall on the marketplace they DO sign in on
-        # still pauses: that one means the session itself expired.
-        if (
-            check.status == "login_required"
-            and signed_in
-            and wall_code
-            and wall_code != signed_in
-        ):
+        if check.status == "login_required":
+            # Skip, never pause: sign-in is the owner's choice, not a
+            # research blocker. The failed action is journaled so the model
+            # sees WHY the page produced nothing and decides whether to
+            # drop that source (e.g. review mining) or route around it.
             if session_id is not None:
                 try:
                     self.events.append(
@@ -182,20 +156,21 @@ class ActionExecutor:
                         action="sign_in_wall_skipped",
                         detail={
                             "marketplace": wall_code,
-                            "signed_in_on": signed_in,
                             "url": scrub_url(check.url),
                         },
                     )
                 except Exception:
                     pass
             raise ActionError(
-                f"sign-in wall ({check.status}){where} — page skipped: the owner "
-                f"signs in on {signed_in}, so research continues without pausing"
+                f"sign-in wall ({check.status}){where} — page skipped: sign-in is "
+                "optional, so continue with the evidence that IS visible "
+                "(you decide what, if anything, to skip)"
             )
+        domain = mkt_obj.domain if mkt_obj is not None else "the marketplace"
         raise AuthPauseRequired(
-            f"sign-in wall ({check.status}){where} — open Settings → "
-            "Amazon authentication → Sign in (it targets that marketplace); "
-            "research resumes automatically when the sign-in completes",
+            f"Amazon {check.status}{where} — open Settings → Amazon "
+            f"authentication → Sign in on {domain}; research resumes "
+            "automatically when the sign-in completes",
             detail=check.to_dict(),
         )
 

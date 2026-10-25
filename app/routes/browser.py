@@ -24,6 +24,7 @@ from app.marketplace import (
     MarketplaceError,
     get_marketplace,
     resolve_plan,
+    signin_marketplaces,
 )
 from app.redact import redact
 from app.routes.deps import require_owner_sync
@@ -103,6 +104,22 @@ async def shutdown(request: Request) -> dict:
 async def amazon_auth_state(request: Request) -> dict:
     _auth(request)
     return {"auth": _amazon_auth(request).current_state().to_dict()}
+
+
+@router.get("/auth/amazon/signin-options")
+async def amazon_signin_options(request: Request) -> dict:
+    """The seven marketplaces Settings offers a Sign-in button for.
+
+    Base domains come from the catalog (never hardcoded in the frontend), so
+    a button can never open the wrong store.
+    """
+    _auth(request)
+    return {
+        "options": [
+            {"code": m.code, "name": m.name, "domain": m.domain, "base_url": m.base_url}
+            for m in signin_marketplaces()
+        ]
+    }
 
 
 @router.post("/auth/amazon/check")

@@ -57,6 +57,21 @@ AMAZON_MARKETPLACES: dict[str, Marketplace] = {
 }
 
 
+# The seven marketplaces with their own Sign-in entry in Settings. Amazon
+# sessions are per-domain: even though one account can sign in everywhere,
+# each domain keeps its own session, so the owner picks exactly where to
+# sign in. Labeled with their base domains in the UI so there is no doubt
+# which store a button opens. US/UK/DE are the named priorities; CA + AU are
+# the codebase's always-relevant core, IN is the English-language market,
+# and FR completes the major-European set.
+SIGNIN_MARKETPLACES: tuple[str, ...] = ("us", "uk", "de", "ca", "au", "in", "fr")
+
+
+def signin_marketplaces() -> list[Marketplace]:
+    """The marketplaces offered for owner sign-in, in display order."""
+    return [AMAZON_MARKETPLACES[c] for c in SIGNIN_MARKETPLACES]
+
+
 def get_marketplace(code_or_domain: str) -> Marketplace:
     """Look up a marketplace by code ('us') or domain ('amazon.com')."""
     key = (code_or_domain or "").strip().lower()

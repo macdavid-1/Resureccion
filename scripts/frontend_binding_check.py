@@ -64,7 +64,13 @@ def main() -> int:
         check("static_cache import/render", False, str(exc))
 
     # 2. Handlers exist in app.js.
-    for needle in ("function bindKdspyUpload", "function rbBind", '("#set-amazon-open").addEventListener', '("#set-kdspy-open").addEventListener'):
+    for needle in (
+        "function bindKdspyUpload",
+        "function rbBind",
+        '(".signin-mkt")',  # seven per-marketplace Amazon sign-in buttons
+        '("#rb-zoom-in").addEventListener',
+        '("#set-kdspy-open").addEventListener',
+    ):
         check(f"app.js defines {needle!r}", needle in js)
 
     # 3. Bindings are actually invoked at boot.
@@ -73,9 +79,10 @@ def main() -> int:
 
     # 4. The HTML contains the controls those handlers bind to.
     for dom_id in (
-        "set-amazon-open", "set-kdspy-open", "kdspy-pick-zip", "kdspy-pick-files",
+        "set-amazon-signins", "set-kdspy-open", "kdspy-pick-zip", "kdspy-pick-files",
         "kdspy-zip-input", "kdspy-files-input", "kdspy-upload-row",
         "rbrowser", "rb-frame", "rb-back", "rb-send", "rb-text",
+        "rb-zoom-in", "rb-zoom-out", "rb-zoom-pct",
     ):
         check(f"index.html contains #{dom_id}", f'id="{dom_id}"' in html)
 

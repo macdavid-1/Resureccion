@@ -289,33 +289,81 @@ async def test_login_wall_on_other_marketplace_is_skipped_after_signin(db, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_login_wall_on_signedin_marketplace_still_pauses(db, tmp_path):
-    """The marketplace the owner actually signs in on still pauses: a wall
-    there means the session itself expired."""
+async def test_login_wall_on_signedin_marketplace_still_skips(db, tmp_path):
+    """Sign-in is optional: even the marketplace the owner signed in on
+    never pauses on a login wall — the page is skipped and the model
+    routes around it (the durable auth state can be wrong per-domain)."""
     from app.browser_store import AUTH_CONFIRMED, BrowserAuthStore
 
     store = BrowserAuthStore(db)
     store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})
     executor, *_ = _wall_executor(db, tmp_path, store, "login_required", "us")
 
-    with pytest.raises(AuthPauseRequired) as ei:
-        await executor.execute(
-            session_id="s1", action="open_category", args={"path": "/gp/x"}
-        )
-    assert "amazon.com" in str(ei.value)
-    assert "Settings" in str(ei.value)
+    result = await executor.execute(
+        session_id="s1", action="open_category", args={"path": "/gp/x"}
+    )
+    assert not result.ok
+    assert "skipped" in (result.error or "")
 
 
 @pytest.mark.asyncio
-async def test_login_wall_without_any_signin_still_pauses(db, tmp_path):
-    """Never signed in → pause with onboarding instructions (unchanged)."""
+async def test_login_wall_without_any_signin_never_pauses(db, tmp_path):
+    """The owner may never sign in at all: research must not block on it.
+    The wall skips as a failed action and the MODEL decides whether to
+    drop a source (e.g. review mining) — the backend never decides from
+    an auth state that can be wrong."""
+    from app.browser_store import AUTH_LOGIN_REQUIRED, BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    # Durable state even claims login_required — irrelevant to the decision.
+    store.set("amazon", "kdspy", AUTH_LOGIN_REQUIRED, {"marketplace": "uk"})
+    executor, events, _ = _wall_executor(db, tmp_path, store, "login_required", "uk")
+
+    result = await executor.execute(
+        session_id="s1", action="open_category", args={"path": "/gp/x"}
+    )
+    assert not result.ok
+    assert "sign-in is optional" in (result.error or "")
+    assert any(e.action == "sign_in_wall_skipped" for e in events.tail("s1"))
+
+
+@pytest.mark.asyncio
+async def test_read_reviews_not_gated_by_backend_auth_state(db, tmp_path):
+    """Review mining is the AI's call: when the reviews page renders
+    (no wall), read_reviews must capture them even though the durable auth
+    store says login_required — the backend must never pre-block reviews
+    from a state that can be wrong."""
+    from app.browser_store import AUTH_LOGIN_REQUIRED, BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    store.set("amazon", "kdspy", AUTH_LOGIN_REQUIRED, {"marketplace": "us"})
+    executor, *_ = _wall_executor(db, tmp_path, store, "login_required", "us")
+    # The wall stub always reports login_required — swap it for a classifier
+    # that sees a normal page (reviews visible, no wall).
+    executor.amazon_auth = StubAuthManager()
+    executor.amazon_auth.auth_store = store
+
+    result = await executor.execute(
+        session_id="s1", action="read_reviews", args={"asin": "B0TEST1234"}
+    )
+    assert result.ok, "visible reviews must be captured regardless of auth state"
+    assert result.summary.startswith("captured")
+
+
+@pytest.mark.asyncio
+async def test_captcha_wall_still_pauses_for_owner(db, tmp_path):
+    """CAPTCHA/OTP genuinely block every page and need the owner's hands —
+    those still pause (with the marketplace domain + Settings guidance)."""
     from app.browser_store import BrowserAuthStore
 
     store = BrowserAuthStore(db)
-    executor, *_ = _wall_executor(db, tmp_path, store, "login_required", "uk")
+    executor, *_ = _wall_executor(db, tmp_path, store, "captcha_required", "de")
 
     with pytest.raises(AuthPauseRequired) as ei:
         await executor.execute(
             session_id="s1", action="open_category", args={"path": "/gp/x"}
         )
-    assert "Settings" in str(ei.value)
+    msg = str(ei.value)
+    assert "captcha_required" in msg
+    assert "amazon.de" in msg
+    assert "Settings" in msg
