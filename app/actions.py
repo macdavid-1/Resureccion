@@ -21,6 +21,7 @@ from urllib.parse import quote_plus, urlparse
 
 from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
 from app.browser_manager import BrowserManager, BrowserManagerError
+from app.browser_store import AUTH_CONFIRMED
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.events import EventLog
 from app.marketplace import (
@@ -100,43 +101,103 @@ class ActionExecutor:
         return mkt
 
     # ------------------------------------------------------------------ guards
-    async def _check_auth_wall(self, page: Any) -> None:
-        """Pause the research safely if a sign-in/CAPTCHA wall is detected."""
+    def _signed_in_marketplace(self) -> str:
+        """Where the owner has actually completed sign-in ("" = never).
+
+        Stored durably by `BrowserAuthStore.set` as `signed_in_marketplace`
+        and carried across every later status write — Amazon sessions are
+        per-domain, so a login_required observed on amazon.co.uk says nothing
+        about a sign-in completed on amazon.com.
+        """
+        try:
+            state = self.amazon_auth.auth_store.get(
+                ACCOUNT_AMAZON, self.amazon_auth.profile
+            )
+        except Exception:
+            return ""
+        if state is None:
+            return ""
+        detail = state.detail or {}
+        marker = str(detail.get("signed_in_marketplace") or "")
+        if marker:
+            return marker
+        # Legacy confirmed states predate the marker: fall back to where the
+        # confirmed observation happened.
+        if state.status == AUTH_CONFIRMED:
+            return str(detail.get("marketplace") or "")
+        return ""
+
+    async def _check_auth_wall(self, page: Any, session_id: str | None = None) -> None:
+        """Pause (or skip) research when a sign-in/CAPTCHA wall is detected."""
         try:
             mkt = marketplace_from_url(page.url or "") or self.next_marketplace()
             check = await self.amazon_auth._classify_page(page, mkt)
         except Exception:
             return  # classification is best-effort; never break research on it
-        if check.status in ("login_required", "captcha_required", "otp_required"):
-            # Persist the wall (status + marketplace) on the durable auth
-            # store: the owner's Sign-in button reads it to target the RIGHT
-            # marketplace. Without this every sign-in went to amazon.com no
-            # matter which domain the agent actually stalled on — and Amazon
-            # sessions are per-domain, so the wall looked permanently stuck
-            # even after a perfectly successful sign-in. Best-effort
-            # bookkeeping: it must never block the pause itself.
-            try:
-                self.amazon_auth.auth_store.set(
-                    ACCOUNT_AMAZON,
-                    self.amazon_auth.profile,
-                    check.status,
-                    {
-                        "via": "research_wall",
-                        "url": scrub_url(check.url),
-                        "marketplace": str((check.detail or {}).get("marketplace") or ""),
-                    },
-                )
-            except Exception:
-                pass
-            mkt_code = str((check.detail or {}).get("marketplace") or "")
-            mkt = AMAZON_MARKETPLACES.get(mkt_code)
-            where = f" on {mkt.domain}" if mkt is not None else ""
-            raise AuthPauseRequired(
-                f"sign-in wall ({check.status}){where} — open Settings → "
-                "Amazon authentication → Sign in (it targets that marketplace), "
-                "then Resume",
-                detail=check.to_dict(),
+        if check.status not in ("login_required", "captcha_required", "otp_required"):
+            return
+        wall_code = str((check.detail or {}).get("marketplace") or "")
+        signed_in = self._signed_in_marketplace()
+        # Persist the wall (status + marketplace) on the durable auth
+        # store: the owner's Sign-in button reads it to target the RIGHT
+        # marketplace. Without this every sign-in went to amazon.com no
+        # matter which domain the agent actually stalled on — and Amazon
+        # sessions are per-domain, so the wall looked permanently stuck
+        # even after a perfectly successful sign-in. Best-effort
+        # bookkeeping: it must never block the pause itself. (The durable
+        # signed-in marker inside detail is preserved by the store itself.)
+        try:
+            self.amazon_auth.auth_store.set(
+                ACCOUNT_AMAZON,
+                self.amazon_auth.profile,
+                check.status,
+                {
+                    "via": "research_wall",
+                    "url": scrub_url(check.url),
+                    "marketplace": wall_code,
+                },
             )
+        except Exception:
+            pass
+        mkt_obj = AMAZON_MARKETPLACES.get(wall_code)
+        where = f" on {mkt_obj.domain}" if mkt_obj is not None else ""
+        # The owner signs in once (say on amazon.com); Amazon sessions are
+        # per-domain, so every OTHER marketplace keeps showing its own
+        # sign-in wall. After a completed sign-in those walls must not stop
+        # research: skip the page — a failed action the agent routes around —
+        # and keep going. The wall on the marketplace they DO sign in on
+        # still pauses: that one means the session itself expired.
+        if (
+            check.status == "login_required"
+            and signed_in
+            and wall_code
+            and wall_code != signed_in
+        ):
+            if session_id is not None:
+                try:
+                    self.events.append(
+                        session_id,
+                        level="warn",
+                        actor="system",
+                        action="sign_in_wall_skipped",
+                        detail={
+                            "marketplace": wall_code,
+                            "signed_in_on": signed_in,
+                            "url": scrub_url(check.url),
+                        },
+                    )
+                except Exception:
+                    pass
+            raise ActionError(
+                f"sign-in wall ({check.status}){where} — page skipped: the owner "
+                f"signs in on {signed_in}, so research continues without pausing"
+            )
+        raise AuthPauseRequired(
+            f"sign-in wall ({check.status}){where} — open Settings → "
+            "Amazon authentication → Sign in (it targets that marketplace); "
+            "research resumes automatically when the sign-in completes",
+            detail=check.to_dict(),
+        )
 
     # ------------------------------------------------------------------ actions
     async def execute(
@@ -175,7 +236,7 @@ class ActionExecutor:
         mkt = self._marketplace_for(args)
         page = await self.browser.open_marketplace(mkt, _SEARCH_PATH.format(query=quote_plus(query)))
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_search_results(
                 page, session_id=session_id, marketplace=mkt, query=query,
                 max_items=int(args.get("max_items", 20)),
@@ -201,7 +262,7 @@ class ActionExecutor:
             path = "/" + path
         page = await self.browser.open_marketplace(mkt, path)
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_page_state(
                 page, session_id=session_id, note=f"category {path} on {mkt.code}"
             )
@@ -217,7 +278,7 @@ class ActionExecutor:
         mkt = self._marketplace_for(args)
         page = await self.browser.open_marketplace(mkt, "/gp/bestsellers/books")
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_page_state(
                 page, session_id=session_id, note=f"bestsellers {mkt.code}"
             )
@@ -233,7 +294,7 @@ class ActionExecutor:
         mkt = self._marketplace_for(args)
         page = await self.browser.open_marketplace(mkt, "/gp/new-releases/books")
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_page_state(
                 page, session_id=session_id, note=f"new releases {mkt.code}"
             )
@@ -295,7 +356,7 @@ class ActionExecutor:
             url_path = f"/dp/{asin}"
         page = await self.browser.open_marketplace(mkt, url_path)
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_product_page(
                 page, session_id=session_id, marketplace=mkt,
                 screenshot=bool(args.get("screenshot", True)),
@@ -317,7 +378,7 @@ class ActionExecutor:
             mkt, f"/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&reviewerType=all_reviews"
         )
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             reviews = await _extract_reviews(page)
             record = self.collector.evidence_store.create(
                 session_id=session_id,
@@ -342,7 +403,7 @@ class ActionExecutor:
         mkt = self._marketplace_for(args)
         page = await self.browser.open_marketplace(mkt, f"/dp/{asin}")
         try:
-            await self._check_auth_wall(page)
+            await self._check_auth_wall(page, session_id)
             items = await _extract_carousel(page)
             record = self.collector.evidence_store.create(
                 session_id=session_id,

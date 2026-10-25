@@ -266,3 +266,42 @@ class AutonomySupervisor:
         self.checkpoints.save(session_id, "heartbeat", {
             "phase": phase, "note": note[:200], "at": iso_now(),
         })
+
+
+def resume_auth_paused_sessions(state: Any) -> list[str]:
+    """Auto-resume sessions paused solely for Amazon authentication.
+
+    Wired (in main.py) to `BrowserAuthStore.on_confirmed`: the moment a
+    sign-in completes, every session waiting on `authentication required: ...`
+    continues on its own. The owner signed in BECAUSE the session stopped —
+    making them find the Resume button again is pure friction. Any other pause
+    (model, browser, owner) and any failure are left exactly as they were.
+    """
+    resumed: list[str] = []
+    try:
+        sessions: SessionStore = state.sessions
+        candidates = sessions.list(include_terminal=False)
+    except Exception:
+        return resumed
+    for s in candidates:
+        try:
+            if s.status != "paused":
+                continue
+            if not str(s.error or "").startswith("authentication required"):
+                continue
+            sessions.bump_resume(s.id)
+            sessions.update(s.id, status="queued", error=None)
+            state.jobs.create_job(s.id, kind="research_resume", payload={})
+            state.autonomy.mark(
+                s.id, "queued", detail={"note": "auto-resumed after sign-in"}
+            )
+            state.runners.start(s.id)
+            state.events.append(
+                s.id, level="info", actor="system",
+                action="auto_resumed_after_signin",
+                detail={"note": "Amazon sign-in completed — research continues"},
+            )
+            resumed.append(s.id)
+        except Exception:
+            continue  # one session must never block the rest
+    return resumed

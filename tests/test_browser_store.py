@@ -48,6 +48,40 @@ def test_auth_state_redacts_detail(db) -> None:
     assert d["detail"]["reason"] == "form"
 
 
+def test_auth_state_carries_signin_marker_across_walls(db) -> None:
+    """The durable "owner has signed in" marker must survive later walls.
+
+    Amazon sessions are per-domain: a login_required observed on amazon.co.uk
+    after a sign-in on amazon.com must NOT erase the fact that the sign-in
+    happened — the wall-skip logic reads this marker.
+    """
+    store = BrowserAuthStore(db)
+    store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})
+    store.set("amazon", "kdspy", AUTH_LOGIN_REQUIRED, {"marketplace": "uk"})
+    state = store.get("amazon", "kdspy")
+    assert state.status == AUTH_LOGIN_REQUIRED
+    assert state.detail["signed_in_marketplace"] == "us"
+    assert state.detail["signed_in_at"]
+    # Even a detail-less reset carries the marker forward.
+    store.set("amazon", "kdspy", AUTH_UNKNOWN)
+    state = store.get("amazon", "kdspy")
+    assert state.detail["signed_in_marketplace"] == "us"
+
+
+def test_on_confirmed_fires_once_per_signin_transition(db) -> None:
+    """on_confirmed is the auto-resume trigger: exactly once per transition
+    into confirmed — not on re-detections, not on later walls."""
+    store = BrowserAuthStore(db)
+    fired: list[int] = []
+    store.on_confirmed = lambda: fired.append(1)
+    store.set("amazon", "kdspy", AUTH_UNKNOWN)
+    assert fired == []
+    store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})
+    store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})  # re-detect
+    store.set("amazon", "kdspy", AUTH_LOGIN_REQUIRED, {"marketplace": "uk"})
+    assert len(fired) == 1
+
+
 def test_extension_store_upsert(db) -> None:
     store = ExtensionStore(db)
     store.upsert("kdspy", "kdspy", status=EXT_INSTALLED, version="4.0")

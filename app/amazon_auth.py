@@ -254,7 +254,14 @@ class AmazonAuthManager:
         if check.status != AUTH_CONFIRMED:
             return self.auth_store.set(
                 ACCOUNT_AMAZON, self.profile, check.status,
-                {"via": "cookie_import", "verification": check.status},
+                {
+                    "via": "cookie_import",
+                    "verification": check.status,
+                    # Where the pasted cookies were verified: this is a real
+                    # sign-in on that marketplace and feeds the durable
+                    # signed-in marker used to skip other domains' walls.
+                    "marketplace": marketplace.code,
+                },
             )
         return self.current_state()
 

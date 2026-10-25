@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.agent import AgentStateStore
 from app.amazon_auth import AmazonAuthManager
 from app.artifacts import ArtifactStore
-from app.autonomy import AutonomySupervisor
+from app.autonomy import AutonomySupervisor, resume_auth_paused_sessions
 from app.backup import BackupManager
 from app.claims import ClaimStore
 from app.integrity import IntegrityAssessmentStore
@@ -148,6 +148,11 @@ def create_app() -> FastAPI:
             events=app.state.events,
             errors=app.state.errors,
             state=app.state,
+        )
+        # A completed sign-in resumes research that paused waiting for it:
+        # the owner signed in precisely because the session stopped.
+        app.state.browser_auth.on_confirmed = (
+            lambda: resume_auth_paused_sessions(app.state)
         )
         app.state.recorder = SessionRecorder(
             db,

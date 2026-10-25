@@ -46,7 +46,7 @@ class RunnerRegistry:
         self._tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------ build
-    def _build_runner(self) -> ResearchRunner:
+    def _build_runner(self, session_id: str) -> ResearchRunner:
         st = self.state
         from app.model_client import ModelClient
 
@@ -73,6 +73,8 @@ class RunnerRegistry:
             trace=getattr(st, "trace", None),
             supervisor=getattr(st, "autonomy", None),
             owner_messages=getattr(st, "owner_messages", None),
+            live_view=getattr(st, "live_view", None),
+            live_session_id=session_id,
         )
 
     # ------------------------------------------------------------------ spawn
@@ -96,7 +98,7 @@ class RunnerRegistry:
             raise RunnerRegistryError(
                 f"cannot start research for session in status {session.status!r}"
             )
-        runner = self._build_runner()
+        runner = self._build_runner(session_id)
         self._runners[session_id] = runner
         task = asyncio.create_task(runner.run(session_id))
         self._tasks[session_id] = task

@@ -10,7 +10,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from app.db import Database
 from app.redact import redact
@@ -153,6 +153,10 @@ class BrowserEvidence:
 class BrowserAuthStore:
     def __init__(self, db: Database) -> None:
         self.db = db
+        # Fired (outside the DB transaction) on the transition INTO
+        # AUTH_CONFIRMED — main.py wires it to auto-resume research that
+        # paused waiting for exactly this sign-in.
+        self.on_confirmed: Callable[[], None] | None = None
 
     def set(
         self,
@@ -164,6 +168,22 @@ class BrowserAuthStore:
         if status not in AUTH_STATUSES:
             raise ValueError(f"invalid auth status {status!r}")
         now = iso_now()
+        # The durable "owner has signed in (on this marketplace)" marker lives
+        # in detail and is CARRIED across every later status write: Amazon
+        # sessions are per-domain, so a login_required observed on amazon.co.uk
+        # must never erase the fact that the sign-in happened on amazon.com.
+        prev = self.get(account, profile)
+        prev_detail = dict(prev.detail) if prev is not None else {}
+        new_detail = dict(detail or {})
+        for key in ("signed_in_marketplace", "signed_in_at"):
+            if key in prev_detail:
+                new_detail.setdefault(key, prev_detail[key])
+        if status == AUTH_CONFIRMED:
+            mkt = str(new_detail.get("marketplace") or "")
+            if mkt:
+                # Latest confirmed sign-in records where it happened.
+                new_detail["signed_in_marketplace"] = mkt
+            new_detail.setdefault("signed_in_at", now)
         with self.db.tx() as conn:
             conn.execute(
                 """
@@ -174,9 +194,19 @@ class BrowserAuthStore:
                     detail = excluded.detail,
                     updated_at = excluded.updated_at
                 """,
-                (_new_id(), account, profile, status, json.dumps(detail or {}), now, now),
+                (_new_id(), account, profile, status, json.dumps(new_detail), now, now),
             )
-        return self.get(account, profile)  # type: ignore[return-value]
+        state = self.get(account, profile)
+        confirmed_now = (
+            status == AUTH_CONFIRMED
+            and (prev is None or prev.status != AUTH_CONFIRMED)
+        )
+        if confirmed_now and self.on_confirmed is not None:
+            try:
+                self.on_confirmed()
+            except Exception:
+                pass  # auto-resume must never break the sign-in response
+        return state  # type: ignore[return-value]
 
     def get(self, account: str, profile: str) -> AuthState | None:
         with self.db.read() as conn:

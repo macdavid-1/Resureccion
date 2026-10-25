@@ -505,7 +505,7 @@ async def test_registry_enforces_concurrency(db, config, session):
         })(),
     )
     # Patch the builder to avoid real ModelClient/browser wiring.
-    registry._build_runner = lambda: make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))  # type: ignore[assignment]
+    registry._build_runner = lambda _sid: make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))  # type: ignore[assignment]
     # The API route marks the session queued before spawning a runner.
     SessionStore(db, config).update(session, status="queued")
     registry.start(session)
@@ -834,3 +834,164 @@ def test_build_user_prompt_includes_pivot_directive():
     )
     assert "STRATEGIC PIVOT" in pivoted
     assert "explore a different parent market" in pivoted
+
+
+# ============================================ live view + sign-in auto-resume
+
+
+class _FakeLiveView:
+    def __init__(self) -> None:
+        self.puts: list[tuple[str, bytes]] = []
+
+    def put(self, sid: str, jpeg: bytes, *, url: str = "", title: str = "") -> None:
+        self.puts.append((sid, jpeg))
+
+
+@pytest.mark.asyncio
+async def test_research_screenshots_feed_live_view(db, config, session, monkeypatch):
+    """Regression: the runner built its EvidenceCollector WITHOUT the
+    live-view store, so the LIVE tab never received a single frame while
+    research ran — the owner could only watch manual recordings."""
+    import app.live_view as lv_mod
+    from app.autonomy import AutonomySupervisor
+    from app.trace import ActivityTrace
+
+    events = EventLog(db)
+    sessions = SessionStore(db, config)
+    supervisor = AutonomySupervisor(
+        db, config, sessions=sessions, events=events,
+        errors=ErrorStateStore(db), checkpoints=CheckpointStore(db),
+    )
+    lv = _FakeLiveView()
+    runner = ResearchRunner(
+        db, config,
+        sessions=sessions, agent=AgentStateStore(db, events), events=events,
+        errors=ErrorStateStore(db), checkpoints=CheckpointStore(db),
+        candidates=CandidateStore(db), evidence=EvidenceStore(db),
+        observations=ObservationStore(db), opportunities=OpportunityStore(db),
+        artifacts=ArtifactStore(db, config), browser=FakeBrowser(),  # type: ignore[arg-type]
+        browser_evidence=BrowserEvidenceStore(db),
+        browser_auth=type("BAS", (), {})(),
+        model=ScriptedModel(PHASE_OUTPUTS),  # type: ignore[arg-type]
+        runner_config=RunnerConfig(),
+        trace=ActivityTrace(db),
+        supervisor=supervisor,
+        live_view=lv,
+        live_session_id=session,
+    )
+    collector = runner.executor.collector
+    assert collector._live_view is lv
+    assert collector._live_session() == session
+
+    # An actual research screenshot must push a frame FOR THIS SESSION.
+    monkeypatch.setattr(lv_mod, "downscale_jpeg", lambda png: b"jpeg-frame")
+    await collector.capture_page_state(runner.browser.page, session_id=session, note="n")
+    assert lv.puts, "the live-view ring received no frame"
+    assert lv.puts[0][0] == session
+
+
+def test_registry_wires_live_view_into_runner(db, config, monkeypatch):
+    """The production construction path (RunnerRegistry._build_runner) must
+    pass the live-view store AND the runner's own session id through."""
+    import app.model_client as mc
+
+    sentinel = object()
+    events = EventLog(db)
+    errors = ErrorStateStore(db)
+    state = type("S", (), {
+        "sessions": SessionStore(db, config),
+        "agent": AgentStateStore(db, events),
+        "events": events,
+        "errors": errors,
+        "checkpoints": CheckpointStore(db),
+        "candidates": CandidateStore(db),
+        "evidence": EvidenceStore(db),
+        "observations": ObservationStore(db),
+        "opportunities": OpportunityStore(db),
+        "artifacts": ArtifactStore(db, config),
+        "browser_manager": FakeBrowser(),
+        "browser_evidence": BrowserEvidenceStore(db),
+        "browser_auth": type("BAS", (), {})(),
+        "live_view": sentinel,
+    })()
+    registry = RunnerRegistry(
+        db, config, sessions=SessionStore(db, config), events=events,
+        errors=errors, state=state,
+    )
+    monkeypatch.setattr(mc, "ModelClient", lambda cfg, ev: ScriptedModel(PHASE_OUTPUTS))
+    runner = registry._build_runner("sess-live-42")
+    collector = runner.executor.collector
+    assert collector._live_view is sentinel
+    assert collector._live_session() == "sess-live-42"
+
+
+def test_resume_auth_paused_sessions_only_touches_auth_pauses():
+    """The sign-in hook resumes ONLY sessions waiting on authentication —
+    owner pauses, model pauses and running sessions stay untouched, and one
+    failing session never blocks the rest."""
+    from types import SimpleNamespace
+
+    from app.autonomy import resume_auth_paused_sessions
+
+    class Sess:
+        def __init__(self, sid: str, status: str, error: str | None) -> None:
+            self.id = sid
+            self.status = status
+            self.error = error
+
+    auth_paused = Sess(
+        "a", "paused",
+        "authentication required: sign-in wall (login_required) on amazon.co.uk",
+    )
+    owner_paused = Sess("b", "paused", "paused by owner")
+    running = Sess("c", "running", None)
+
+    class Sessions:
+        def __init__(self) -> None:
+            self.bumped: list[str] = []
+            self.updated: list[tuple[str, dict]] = []
+
+        def list(self, include_terminal: bool = False):
+            return [auth_paused, owner_paused, running]
+
+        def bump_resume(self, sid: str) -> None:
+            self.bumped.append(sid)
+
+        def update(self, sid: str, **kw: Any) -> None:
+            self.updated.append((sid, kw))
+
+    class Runners:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        def start(self, sid: str) -> None:
+            self.started.append(sid)
+
+    jobs: list[tuple[str, str]] = []
+    marks: list[tuple[str, str]] = []
+    evs: list[str] = []
+    sessions = Sessions()
+    runners = Runners()
+    state = SimpleNamespace(
+        sessions=sessions,
+        runners=runners,
+        jobs=SimpleNamespace(
+            create_job=lambda sid, kind, payload: jobs.append((sid, kind))
+        ),
+        autonomy=SimpleNamespace(
+            mark=lambda sid, status, detail: marks.append((sid, status))
+        ),
+        events=SimpleNamespace(
+            append=lambda sid, **kw: evs.append(kw["action"])
+        ),
+    )
+
+    resumed = resume_auth_paused_sessions(state)
+
+    assert resumed == ["a"]
+    assert sessions.bumped == ["a"]
+    assert sessions.updated == [("a", {"status": "queued", "error": None})]
+    assert runners.started == ["a"]
+    assert jobs == [("a", "research_resume")]
+    assert marks == [("a", "queued")]
+    assert evs == ["auto_resumed_after_signin"]

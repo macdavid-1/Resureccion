@@ -148,6 +148,8 @@ class ResearchRunner:
         assessments: IntegrityAssessmentStore | None = None,
         trace: ActivityTrace | None = None,
         supervisor: Any = None,
+        live_view: Any = None,
+        live_session_id: str | None = None,
     ) -> None:
         self.db = db
         self.config = config
@@ -191,7 +193,18 @@ class ResearchRunner:
         self.executor = executor or ActionExecutor(
             config,
             browser,
-            EvidenceCollector(browser, browser_evidence, artifacts),
+            EvidenceCollector(
+                browser,
+                browser_evidence,
+                artifacts,
+                # Live view: every research screenshot also refreshes the
+                # bounded live-view ring so the owner can watch the browser
+                # (and this session's navigation) from their phone.
+                live_view=live_view,
+                live_view_session_provider=(
+                    (lambda: live_session_id) if live_view else None
+                ),
+            ),
             _RunnerAuth(config, browser, browser_auth, LoginWindowStore(db)),
             events,
         )

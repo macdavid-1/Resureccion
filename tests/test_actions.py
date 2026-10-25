@@ -226,3 +226,96 @@ async def test_wait_action_bounded(wired):
     result = await executor.execute(session_id="s1", action="wait", args={"seconds": 0.01})
     assert result.ok
     assert time.monotonic() - started < 1.0
+
+
+# ---------------------------------------- signed-in marker / wall skipping
+class _WallAuthManager:
+    """Auth manager whose classification always reports a fixed wall."""
+
+    def __init__(self, auth_store: Any, status: str, marketplace: str) -> None:
+        self.auth_store = auth_store
+        self.profile = "kdspy"
+        self._status = status
+        self._mkt = marketplace
+
+    async def _classify_page(self, page: Any, marketplace: Any) -> AuthCheck:
+        return AuthCheck(self._status, page.url, "t", {"marketplace": self._mkt})
+
+
+def _wall_executor(db, tmp_path, auth_store: Any, status: str, marketplace: str):
+    cfg = Config()
+    cfg.data_dir = tmp_path / "d"
+    cfg.ensure_dirs()
+    events = EventLog(db)
+    with db.tx() as conn:
+        conn.execute(
+            "INSERT INTO research_sessions (id, name, status, mode, created_at, updated_at, last_activity_at) "
+            "VALUES ('s1', 'n', 'running', 'auto', '2025-01-01', '2025-01-01', '2025-01-01')"
+        )
+    browser = FakeBrowser()
+    collector = EvidenceCollector(browser, BrowserEvidenceStore(db), FakeArtifacts())
+    auth = _WallAuthManager(auth_store, status, marketplace)
+    executor = ActionExecutor(cfg, browser, collector, auth, events)  # type: ignore[arg-type]
+    executor.set_marketplaces([AMAZON_MARKETPLACES["us"], AMAZON_MARKETPLACES["uk"]])
+    return executor, events, auth_store
+
+
+@pytest.mark.asyncio
+async def test_login_wall_on_other_marketplace_is_skipped_after_signin(db, tmp_path):
+    """The owner signs in once (say on amazon.com); Amazon sessions are
+    per-domain, so every OTHER marketplace keeps showing its own sign-in
+    wall. After a completed sign-in those walls must not pause research:
+    the page is skipped and research continues."""
+    from app.browser_store import (
+        AUTH_CONFIRMED,
+        AUTH_LOGIN_REQUIRED,
+        BrowserAuthStore,
+    )
+
+    store = BrowserAuthStore(db)
+    store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})
+    executor, events, _ = _wall_executor(db, tmp_path, store, "login_required", "uk")
+
+    result = await executor.execute(
+        session_id="s1", action="open_category", args={"path": "/gp/x"}
+    )
+    assert not result.ok
+    assert "skipped" in (result.error or "")
+    assert any(e.action == "sign_in_wall_skipped" for e in events.tail("s1"))
+    # The wall write must NOT erase the durable signed-in marker.
+    state = store.get("amazon", "kdspy")
+    assert state.status == AUTH_LOGIN_REQUIRED
+    assert state.detail["signed_in_marketplace"] == "us"
+
+
+@pytest.mark.asyncio
+async def test_login_wall_on_signedin_marketplace_still_pauses(db, tmp_path):
+    """The marketplace the owner actually signs in on still pauses: a wall
+    there means the session itself expired."""
+    from app.browser_store import AUTH_CONFIRMED, BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    store.set("amazon", "kdspy", AUTH_CONFIRMED, {"marketplace": "us"})
+    executor, *_ = _wall_executor(db, tmp_path, store, "login_required", "us")
+
+    with pytest.raises(AuthPauseRequired) as ei:
+        await executor.execute(
+            session_id="s1", action="open_category", args={"path": "/gp/x"}
+        )
+    assert "amazon.com" in str(ei.value)
+    assert "Settings" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_login_wall_without_any_signin_still_pauses(db, tmp_path):
+    """Never signed in → pause with onboarding instructions (unchanged)."""
+    from app.browser_store import BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    executor, *_ = _wall_executor(db, tmp_path, store, "login_required", "uk")
+
+    with pytest.raises(AuthPauseRequired) as ei:
+        await executor.execute(
+            session_id="s1", action="open_category", args={"path": "/gp/x"}
+        )
+    assert "Settings" in str(ei.value)
