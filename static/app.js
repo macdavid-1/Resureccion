@@ -849,7 +849,7 @@
     document.body.style.overflow = "hidden";
     $("#rb-url").textContent = session?.url || "—";
     $("#rb-hint").textContent = session?.purpose === "amazon_signin"
-      ? "Full PC page · tap to click · swipe to scroll · pinch or ＋/− to zoom"
+      ? "Root domain — find and tap the site's own Sign in link · swipe to scroll, pinch or ＋/− to zoom"
       : RB_HINT_DEFAULT;
     // A fresh session starts at 100% with the frame at its top-left.
     rb.zoom = 1;
@@ -948,7 +948,7 @@
                 toast("Amazon signed in — saved to the persistent profile");
               }
             } else {
-              $("#rb-hint").textContent = "Signing in… complete the steps above (captcha/OTP if asked) · swipe to scroll, pinch or ＋/− to zoom. Detected automatically when done.";
+              $("#rb-hint").textContent = "Tap the site's own Sign in link to begin (captcha/OTP if asked) · swipe to scroll, pinch or ＋/− to zoom. Detected automatically when done.";
             }
           } catch {}
         } else {
@@ -1116,6 +1116,8 @@
         pinch = {
           d: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1,
           z: rb.zoom,
+          midX: (a.clientX + b.clientX) / 2,
+          midY: (a.clientY + b.clientY) / 2,
         };
         touchY = null; touchX = null;
         return;
@@ -1127,11 +1129,17 @@
       if (pinch && e.touches.length === 2) {
         const [a, b] = e.touches;
         const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1;
-        rbApplyZoom(
-          pinch.z * (d / pinch.d),
-          (a.clientX + b.clientX) / 2,
-          (a.clientY + b.clientY) / 2,
-        );
+        const midX = (a.clientX + b.clientX) / 2;
+        const midY = (a.clientY + b.clientY) / 2;
+        const wrap = $("#rb-frame-wrap");
+        // Two-finger drag PANS the zoomed frame with the fingers — left,
+        // right, up, down — so nothing stays cut off at any zoom level.
+        wrap.scrollLeft -= midX - pinch.midX;
+        wrap.scrollTop -= midY - pinch.midY;
+        // …and the pinch scales around the live midpoint, keeping the
+        // content that was under the fingers under them.
+        rbApplyZoom(pinch.z * (d / pinch.d), midX, midY);
+        pinch.midX = midX; pinch.midY = midY;
         gestureMoved = true;
         return;
       }
@@ -1139,7 +1147,8 @@
       const x = e.touches[0].clientX, y = e.touches[0].clientY;
       if (Math.abs(x - (touchX ?? x)) + Math.abs(y - touchY) > 14) gestureMoved = true;
       if (rb.zoom > 1) {
-        // Zoomed: the drag pans the frame locally — no remote round-trip.
+        // Zoomed: the drag pans the frame locally (both axes) — no remote
+        // round-trip, so the swipe reaches every edge of the wide frame.
         const wrap = $("#rb-frame-wrap");
         wrap.scrollLeft -= x - (touchX ?? x);
         wrap.scrollTop -= y - touchY;
@@ -1157,7 +1166,14 @@
     }, { passive: true });
     img.addEventListener("touchend", (e) => {
       if (e.touches.length < 2) pinch = null;
-      if (e.touches.length === 0) { touchY = null; touchX = null; }
+      if (e.touches.length === 0) {
+        touchY = null; touchX = null;
+      } else {
+        // A finger remains after a pinch lifts: re-anchor it, or the next
+        // pan would jump by the stale pre-pinch delta.
+        touchY = e.touches[0].clientY;
+        touchX = e.touches[0].clientX;
+      }
     }, { passive: true });
   }
 

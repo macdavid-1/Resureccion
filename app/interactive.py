@@ -66,43 +66,10 @@ ACTION_LIMITS: dict[str, dict[str, int]] = {
 # (WordPress/wlfrom bounces only add a hop that can break under egress churn).
 KDSPY_LOGIN_URL = "https://www.publishingaltitude.com/member/"
 
-# Amazon's real sign-in form (the classic openid identifier_select flow).
-# Opening the homepage first costs a tap and can land on region variants;
-# this URL is the canonical form on every marketplace.
-AMAZON_SIGNIN_URL = (
-    "https://www.amazon.com/ap/signin"
-    "?openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_custrec_signin"
-    "&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
-    "&openid.assoc_handle=usflex"
-    "&openid.mode=checkid_setup"
-    "&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
-    "&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
-)
-
-
-def amazon_signin_url(marketplace: Marketplace) -> str:
-    """The canonical /ap/signin openid form for THIS marketplace's domain.
-
-    Amazon sessions are per-domain. A US-only form signed the owner into
-    amazon.com even when the agent's wall was on amazon.co.uk — the sign-in
-    "succeeded" while every other marketplace kept reading login_required.
-    return_to stays on the wall's own domain; amazon.com keeps the proven
-    byte-identical form above.
-    """
-    if marketplace.domain == "amazon.com":
-        return AMAZON_SIGNIN_URL
-    from urllib.parse import quote
-
-    base = f"https://www.{marketplace.domain}/"
-    identity = "http://specs.openid.net/auth/2.0/identifier_select"
-    query = (
-        f"openid.return_to={quote(base + '?ref_=nav_custrec_signin', safe='')}"
-        f"&openid.identity={quote(identity, safe='')}"
-        "&openid.mode=checkid_setup"
-        f"&openid.claimed_id={quote(identity, safe='')}"
-        f"&openid.ns={quote('http://specs.openid.net/auth/2.0', safe='')}"
-    )
-    return f"https://www.{marketplace.domain}/ap/signin?{query}"
+# NOTE: no pre-built /ap/signin form URL — the sign-in session opens each
+# marketplace's ROOT DOMAIN and the owner finds the site's own Sign in link
+# themselves (their explicit preference; deep-linking the form also fought
+# regional variants).
 
 
 class InteractiveError(Exception):
@@ -474,11 +441,12 @@ class InteractiveSessionManager:
         )
         try:
             if purpose == "amazon_signin":
-                # The canonical /ap/signin form on THIS marketplace's domain:
-                # no homepage detour, no reliance on the homepage's sign-in
-                # affordances, and no bouncing to amazon.com (Amazon sessions
-                # are per-domain — see amazon_signin_url).
-                await self.browser.navigate(page, amazon_signin_url(mkt))
+                # Root domain and nothing else: the owner finds and taps the
+                # site's own Sign in link themselves (their explicit choice —
+                # no pre-built form URL). Amazon sessions are per-domain, so
+                # it's THIS marketplace's homepage — never a bounce to
+                # amazon.com.
+                await self.browser.navigate(page, f"{mkt.base_url}/")
             elif purpose == "kdspy_setup":
                 # The KDSpy subscription sign-in lives on the member portal —
                 # start there, not on the kdspy.com landing page.

@@ -174,30 +174,25 @@ async def test_start_opens_amazon_page_on_persistent_profile(manager: Interactiv
 
 
 @pytest.mark.asyncio
-async def test_signin_opens_on_the_wall_marketplace_not_always_us(
+async def test_signin_opens_root_domain_of_the_wall_marketplace(
     manager: InteractiveSessionManager,
 ) -> None:
-    """Amazon sessions are per-domain: the sign-in form must open on the
-    marketplace that needs the owner. The old US-only URL signed the owner
-    into amazon.com even when the agent's wall was on amazon.co.uk, so every
-    other marketplace kept reading login_required after a "successful"
-    sign-in — the exact "I signed in but the app still says login required"
-    report."""
-    from app.interactive import AMAZON_SIGNIN_URL, amazon_signin_url
+    """Root domain and nothing else: the owner finds and taps the site's
+    own Sign in link from the homepage — no pre-built /ap/signin form URL.
+    Amazon sessions are per-domain, so the homepage must be THIS
+    marketplace: the old US-only flow signed the owner into amazon.com even
+    when the wall was on amazon.co.uk, leaving every other store reading
+    login_required after a "successful" sign-in."""
     from app.marketplace import AMAZON_MARKETPLACES
 
-    us = amazon_signin_url(AMAZON_MARKETPLACES["us"])
-    uk = amazon_signin_url(AMAZON_MARKETPLACES["uk"])
-    assert us == AMAZON_SIGNIN_URL  # the proven US form stays byte-identical
-    assert uk.startswith("https://www.amazon.co.uk/ap/signin?")
-    assert "return_to=https%3A%2F%2Fwww.amazon.co.uk" in uk  # localized target
-    assert "amazon.com" not in uk  # never bounce the owner back to the US store
+    home = AMAZON_MARKETPLACES["uk"].base_url + "/"
+    assert home == "https://www.amazon.co.uk/"  # root domain, nothing else
 
-    # End-to-end through _open_page: the interactive session must actually
-    # navigate to the wall's domain.
     s = await manager.start(purpose="amazon_signin", marketplace="uk")
     assert s.status == "open"
-    assert "amazon.co.uk" in s.last_url
+    assert s.last_url == home
+    assert "/ap/" not in s.last_url  # never deep-link the sign-in form
+    assert "amazon.com" not in s.last_url  # never bounce to the US store
 
 
 @pytest.mark.asyncio
