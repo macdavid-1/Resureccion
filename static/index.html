@@ -320,12 +320,14 @@
       <img id="rb-frame" alt="Remote browser">
       <div class="rb-off" id="rb-off">Starting remote browser…</div>
     </div>
-    <!-- Zoom for full-PC-size pages viewed on a phone: buttons or pinch.
-         Scroll/pan is the frame itself (swipe when zoomed out). -->
+    <!-- Draggable control pill: page scroll ▲▼ outermost, zoom − % ＋ in
+         the center. Drag it anywhere so it never covers a tap target. -->
     <div class="rb-zoom" id="rb-zoom">
+      <button class="btn small" id="rb-page-up" aria-label="Scroll page up">▲</button>
       <button class="btn small" id="rb-zoom-out" aria-label="Zoom out">−</button>
       <span id="rb-zoom-pct">100%</span>
       <button class="btn small" id="rb-zoom-in" aria-label="Zoom in">＋</button>
+      <button class="btn small" id="rb-page-down" aria-label="Scroll page down">▼</button>
     </div>
     <div class="rb-hint" id="rb-hint">Tap the page to click · keyboard opens for text fields</div>
   </div>

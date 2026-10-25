@@ -69,6 +69,8 @@ def main() -> int:
         "function rbBind",
         '(".signin-mkt")',  # seven per-marketplace Amazon sign-in buttons
         '("#rb-zoom-in").addEventListener',
+        '("#rb-page-up").addEventListener',
+        '("#rb-page-down").addEventListener',
         '("#set-kdspy-open").addEventListener',
     ):
         check(f"app.js defines {needle!r}", needle in js)
@@ -83,6 +85,7 @@ def main() -> int:
         "kdspy-zip-input", "kdspy-files-input", "kdspy-upload-row",
         "rbrowser", "rb-frame", "rb-back", "rb-send", "rb-text",
         "rb-zoom-in", "rb-zoom-out", "rb-zoom-pct",
+        "rb-page-up", "rb-page-down",
     ):
         check(f"index.html contains #{dom_id}", f'id="{dom_id}"' in html)
 

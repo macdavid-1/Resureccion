@@ -1036,14 +1036,64 @@
 
   function rbBind() {
     $("#rb-back").addEventListener("click", rbDone);
-    $("#rb-zoom-in").addEventListener("click", () => rbStepZoom(1));
-    $("#rb-zoom-out").addEventListener("click", () => rbStepZoom(-1));
+    // The control pill is DRAGGABLE so it never sits on top of the spot the
+    // owner wants to tap (it starts over Amazon's account/sign-in links).
+    // A real drag (≥8px) suppresses the pill's buttons on release.
+    const pill = $("#rb-zoom"), stage = $("#rb-stage");
+    let pillDrag = null, pillDragMoved = false;
+    const suppressIfDragged = (fn) => () => { if (!pillDragMoved) fn(); };
+    $("#rb-zoom-in").addEventListener("click", suppressIfDragged(() => rbStepZoom(1)));
+    $("#rb-zoom-out").addEventListener("click", suppressIfDragged(() => rbStepZoom(-1)));
+    // Page up/down: scroll the REMOTE page (works at any zoom — at common
+    // zoom levels the frame itself has no vertical overflow, so dragging
+    // alone can never reach content below the fold).
+    $("#rb-page-up").addEventListener("click", suppressIfDragged(() => rbAct("scroll", { dy: -500 })));
+    $("#rb-page-down").addEventListener("click", suppressIfDragged(() => rbAct("scroll", { dy: 500 })));
     // Ctrl/⌘+wheel zooms the viewer; a plain wheel scrolls the zoomed frame.
     $("#rb-frame").addEventListener("wheel", (e) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       rbApplyZoom(rb.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
     }, { passive: false });
+    const pillMove = (e) => {
+      if (!pillDrag) return;
+      if (!pillDragMoved &&
+          Math.hypot(e.clientX - pillDrag.x0, e.clientY - pillDrag.y0) > 8) {
+        pillDragMoved = true;
+      }
+      if (!pillDragMoved) return;
+      const sr = pillDrag.sr;
+      const pw = pill.offsetWidth, ph = pill.offsetHeight;
+      const left = Math.max(0, Math.min(e.clientX - pillDrag.dx - sr.left, sr.width - pw));
+      const top = Math.max(0, Math.min(e.clientY - pillDrag.dy - sr.top, sr.height - ph));
+      pill.style.left = `${left}px`;
+      pill.style.top = `${top}px`;
+    };
+    const pillRelease = () => {
+      pillDrag = null;
+      window.removeEventListener("pointermove", pillMove);
+      window.removeEventListener("pointerup", pillRelease);
+      window.removeEventListener("pointercancel", pillRelease);
+    };
+    pill.addEventListener("pointerdown", (e) => {
+      if (!e.isPrimary) return;
+      pillDragMoved = false;
+      // Pin the pill's current spot as explicit left/top (it starts
+      // right-anchored) so the drag can override the anchor cleanly.
+      const pr = pill.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+      pill.style.left = `${pr.left - sr.left}px`;
+      pill.style.top = `${pr.top - sr.top}px`;
+      pill.style.right = "auto";
+      pillDrag = { dx: e.clientX - pr.left, dy: e.clientY - pr.top, sr,
+                   x0: e.clientX, y0: e.clientY };
+      // Window-level move/up: touch pointers are implicitly captured to the
+      // pill and mouse drags keep tracking outside it — WITHOUT explicit
+      // capture, so a plain tap still fires its button's click.
+      window.addEventListener("pointermove", pillMove);
+      window.addEventListener("pointerup", pillRelease);
+      window.addEventListener("pointercancel", pillRelease);
+    });
+    pill.addEventListener("contextmenu", (e) => e.preventDefault());
     // Tap-to-click on the live frame: phone px → 1440×900 page px.
     // object-fit: contain letterboxes the JPEG inside the element box; only
     // the rendered image area accepts taps, and coordinates scale through the
@@ -1147,11 +1197,32 @@
       const x = e.touches[0].clientX, y = e.touches[0].clientY;
       if (Math.abs(x - (touchX ?? x)) + Math.abs(y - touchY) > 14) gestureMoved = true;
       if (rb.zoom > 1) {
-        // Zoomed: the drag pans the frame locally (both axes) — no remote
-        // round-trip, so the swipe reaches every edge of the wide frame.
+        // Zoomed: horizontal drag pans the frame locally. Vertical drag
+        // pans locally while the frame has room, then CONTINUES as a remote
+        // page scroll — at common zoom levels the frame has no vertical
+        // overflow at all, so chaining is the only way a swipe can reach
+        // content below the fold.
         const wrap = $("#rb-frame-wrap");
         wrap.scrollLeft -= x - (touchX ?? x);
-        wrap.scrollTop -= y - touchY;
+        const finger = touchY - y; // >0: finger moved up → reveal lower
+        const maxTop = Math.max(0, wrap.scrollHeight - wrap.clientHeight);
+        const before = wrap.scrollTop;
+        wrap.scrollTop = Math.max(0, Math.min(before + finger, maxTop));
+        const leftover = finger - (wrap.scrollTop - before);
+        if (Math.abs(leftover) > 0.5) {
+          // Screen px → page px through the current zoom scale so the page
+          // moves at finger speed.
+          const r = img.getBoundingClientRect();
+          const natW = img.naturalWidth || r.width;
+          const sc = (r.width / natW) || 1;
+          pendingDy += leftover / sc;
+          const now = Date.now();
+          if (Math.abs(pendingDy) > 24 && now - lastScrollAt >= 120) {
+            rbAct("scroll", { dy: Math.round(pendingDy) });
+            pendingDy = 0;
+            lastScrollAt = now;
+          }
+        }
         touchX = x; touchY = y;
         return;
       }
