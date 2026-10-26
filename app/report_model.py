@@ -68,6 +68,8 @@ class ReportModel:
     consumer_intelligence: dict[str, Any] = field(default_factory=dict)
     competitors: list[dict[str, Any]] = field(default_factory=list)
     candidate_ledger: list[dict[str, Any]] = field(default_factory=list)
+    adjacent_ledger: list[dict[str, Any]] = field(default_factory=list)
+    headroom_ranking: list[dict[str, Any]] = field(default_factory=list)
     methodology_trace: list[dict[str, Any]] = field(default_factory=list)
     focus_pivots: list[dict[str, Any]] = field(default_factory=list)
     evidence_appendix: list[dict[str, Any]] = field(default_factory=list)
@@ -84,6 +86,8 @@ class ReportModel:
             "consumer_intelligence": self.consumer_intelligence,
             "competitors": self.competitors,
             "candidate_ledger": self.candidate_ledger,
+            "adjacent_ledger": self.adjacent_ledger,
+            "headroom_ranking": self.headroom_ranking,
             "methodology_trace": self.methodology_trace,
             "focus_pivots": self.focus_pivots,
             "evidence_appendix": self.evidence_appendix,
@@ -97,13 +101,20 @@ class ReportModel:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReportModel":
         m = cls()
+        list_fields = (
+            "opportunities", "competitors", "candidate_ledger",
+            "adjacent_ledger", "headroom_ranking", "methodology_trace",
+            "focus_pivots", "evidence_appendix",
+        )
         for f in (
             "schema_version", "session", "generated_at", "executive_summary",
             "opportunities", "consumer_intelligence", "competitors",
-            "candidate_ledger", "methodology_trace", "focus_pivots", "evidence_appendix",
+            "candidate_ledger", "adjacent_ledger", "headroom_ranking",
+            "methodology_trace", "focus_pivots", "evidence_appendix",
             "quality_statement", "validation",
         ):
-            setattr(m, f, data.get(f, {} if f not in ("opportunities", "competitors", "candidate_ledger", "methodology_trace", "focus_pivots", "evidence_appendix") else []))
+            default: Any = [] if f in list_fields else {}
+            setattr(m, f, data.get(f, default))
         return m
 
 
@@ -121,8 +132,12 @@ def build_report_model(
     assessments: Any | None = None,
     phase_outputs: dict[str, Any] | None = None,
     focus_pivots: list[dict[str, Any]] | None = None,
+    whitespace_by_candidate: dict[str, Any] | None = None,
+    backlog: list[dict[str, Any]] | None = None,
+    adjacency: list[dict[str, Any]] | None = None,
 ) -> ReportModel:
     """Assemble the structured report model from durable state. Deterministic."""
+    ws = dict(whitespace_by_candidate or {})
     session = sessions.require(session_id)
     cands = candidates.list(session_id, limit=300)
     opps = opportunities.list(session_id, limit=50)
@@ -200,6 +215,7 @@ def build_report_model(
             "keyword_plan": _keyword_plan(o.keywords, ev_rows),
             "category_plan": _category_plan(ev_ids, ev_rows),
             "demand_accommodation": demand_acc_by_cand.get(o.candidate_id) or {},
+            "whitespace": ws.get(o.candidate_id) or {},
             "evidence_ids": ev_ids[:24],
             "next_step": _next_step(o, best_v),
         })
@@ -224,6 +240,11 @@ def build_report_model(
         consumer_intelligence=_aggregate_consumer(cons_out),
         competitors=competitors,
         candidate_ledger=_ledger(cands),
+        adjacent_ledger=_adjacent_ledger(
+            cands, ws, opportunities_ids={o.candidate_id for o in opps},
+            backlog=backlog or [], adjacency=adjacency or [],
+        ),
+        headroom_ranking=_headroom_ranking(dossiers),
         methodology_trace=_trace(outputs),
         focus_pivots=_pivot_rows(focus_pivots),
         evidence_appendix=_evidence_appendix(ev_rows),
@@ -772,6 +793,116 @@ def _ledger(cands: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _adjacent_ledger(
+    cands: list[Any],
+    ws: dict[str, Any],
+    *,
+    opportunities_ids: set[str],
+    backlog: list[dict[str, Any]],
+    adjacency: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Surviving-but-unfunded demand: candidates the run discovered and did
+    NOT turn into an opportunity, plus capacity backlog and measured
+    adjacency neighbours. Each row carries its headroom score and evidence
+    ids so the owner can fund the next run from exactly this list."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(
+        niche: str, *, status: str, origin: str, score: dict[str, Any] | None,
+        evidence_ids: list[Any], rationale: str, marketplace: str = "",
+    ) -> None:
+        key = " ".join(str(niche or "").lower().split())
+        if not key or key in seen:
+            return
+        seen.add(key)
+        sc = score or {}
+        rows.append({
+            "niche": str(niche)[:200],
+            "status": status,
+            "marketplace": marketplace,
+            "origin": origin,
+            "whitespace": sc.get("score"),
+            "measured": bool(sc.get("measured")),
+            "evidence_ids": [str(e) for e in (evidence_ids or [])][:6],
+            "rationale": str(rationale or "")[:200],
+        })
+
+    for c in cands:
+        if c.status == "rejected" or c.id in opportunities_ids:
+            continue
+        sc = ws.get(c.id) or {}
+        _add(
+            c.niche,
+            status=c.status,
+            origin=str((c.meta or {}).get("via") or "session"),
+            score=sc,
+            evidence_ids=sc.get("evidence_ids")
+            or (c.meta or {}).get("seed_evidence_ids") or [],
+            rationale=c.rationale,
+            marketplace=c.marketplace,
+        )
+    for b in backlog:
+        if not isinstance(b, dict):
+            continue
+        _add(
+            str(b.get("niche") or ""),
+            status="backlog",
+            origin="capacity_backlog",
+            score=None,
+            evidence_ids=[],
+            rationale=str(b.get("parent") or b.get("parent_market") or b.get("reason") or ""),
+            marketplace=str(b.get("marketplace") or ""),
+        )
+    for a in adjacency:
+        if not isinstance(a, dict) or a.get("promoted"):
+            continue
+        sc = a.get("whitespace") if isinstance(a.get("whitespace"), dict) else {}
+        if not sc.get("measured"):
+            continue  # only measured neighbours are worth funding next
+        _add(
+            str(a.get("term") or ""),
+            status="measured",
+            origin="adjacency_measured",
+            score=sc,
+            evidence_ids=sc.get("evidence_ids") or a.get("evidence_ids") or [],
+            rationale=str(a.get("parent") or ""),
+            marketplace=str(a.get("marketplace") or ""),
+        )
+    rows.sort(key=lambda r: (
+        -(r["whitespace"] if isinstance(r["whitespace"], (int, float)) else -1.0),
+        r["niche"],
+    ))
+    return rows[:60]
+
+
+def _headroom_ranking(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The portfolio ordered by demand ÷ competition — an ORDERING signal
+    printed next to the confidence order, never a replacement for it."""
+    if len(dossiers) < 2:
+        return []
+    if not any((d.get("whitespace") or {}).get("score") is not None for d in dossiers):
+        return []
+    ordered = sorted(
+        dossiers,
+        key=lambda d: -(
+            float((d.get("whitespace") or {}).get("score"))
+            if (d.get("whitespace") or {}).get("score") is not None else -1.0
+        ),
+    )
+    return [
+        {
+            "rank": i,
+            "name": d.get("name"),
+            "niche": d.get("niche"),
+            "whitespace": (d.get("whitespace") or {}).get("score"),
+            "measured": bool((d.get("whitespace") or {}).get("measured")),
+            "confidence": d.get("confidence"),
+        }
+        for i, d in enumerate(ordered, 1)
+    ]
+
+
 def _trace(outputs: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for phase in PHASE_ORDER:
@@ -872,6 +1003,16 @@ def _quality_statement(
 
 
 # ------------------------------------------------------------------- helpers
+def _ws_text(ws: Any) -> str:
+    """Headroom score as prose (unmeasured is stated, never implied zero)."""
+    if not isinstance(ws, dict) or ws.get("score") is None:
+        return "unmeasured (no comparable evidence captured)"
+    d = ws.get("demand")
+    c = ws.get("competition")
+    detail = f"demand {d:.2f} ÷ competition {c:.2f}" if isinstance(d, (int, float)) and isinstance(c, (int, float)) else ""
+    return f"{float(ws['score']):.2f}" + (f" ({detail})" if detail else "")
+
+
 def _as_list(v: Any) -> list[Any]:
     if isinstance(v, list):
         return v
@@ -941,6 +1082,28 @@ def render_markdown(model: ReportModel) -> str:
             "The candidate ledger and quality statement below show what was "
             "learned and why candidates did not survive."
         )
+        a("")
+
+    # ------------------------------------------------------- headroom ranking
+    if model.headroom_ranking:
+        a("## Headroom ranking (demand ÷ competition)")
+        a("")
+        a(
+            "The same portfolio ordered by measured headroom — observed "
+            "demand divided by incumbent resistance. Deterministic ordering "
+            "from captured evidence only; it never overrides a filter, gate "
+            "or verification verdict."
+        )
+        a("")
+        a("| Rank | Opportunity | Headroom | Confidence |")
+        a("|---|---|---|---|")
+        for r in model.headroom_ranking:
+            score = r.get("whitespace")
+            score_txt = f"{float(score):.2f}" if isinstance(score, (int, float)) else "unmeasured"
+            name = str(r.get("name") or r.get("niche") or "—").replace("|", "\\|")
+            conf = r.get("confidence")
+            conf_txt = f"{int(round(float(conf) * 100))}%" if isinstance(conf, (int, float)) else "—"
+            a(f"| {r.get('rank')} | {name} | {score_txt} | {conf_txt} |")
         a("")
 
     # --------------------------------------------------- consumer intelligence
@@ -1029,6 +1192,37 @@ def render_markdown(model: ReportModel) -> str:
         for c in model.candidate_ledger:
             rat = (c.get("rationale") or "").replace("|", "\\|")
             a(f"| {c['niche']} | {c['status']} | {c.get('marketplace') or '—'} | {rat} |")
+        a("")
+
+    # ------------------------------------- adjacent opportunities (ledger)
+    if model.adjacent_ledger:
+        a("## Adjacent opportunities not yet researched")
+        a("")
+        a(
+            f"{len(model.adjacent_ledger)} market(s) this run discovered or "
+            "measured but did not fund — survivors beyond the candidate cap, "
+            "measured adjacency neighbours, and the capacity backlog. Ranked "
+            "by headroom with the evidence ids that back each row."
+        )
+        a("")
+        a(
+            "**One-click follow-up:** open this session in the dashboard and "
+            "press *Start follow-up research* — it seeds a new run with these "
+            "niches through the existing keywords mode, so each report funds "
+            "the next, deeper one."
+        )
+        a("")
+        a("| Niche | Origin | Status | Headroom | Evidence ids |")
+        a("|---|---|---|---|---|")
+        for r in model.adjacent_ledger:
+            niche = str(r.get("niche") or "—").replace("|", "\\|")
+            score = r.get("whitespace")
+            score_txt = f"{float(score):.2f}" if isinstance(score, (int, float)) else "unmeasured"
+            ev = ", ".join(str(e)[:10] for e in (r.get("evidence_ids") or [])[:3]) or "—"
+            a(
+                f"| {niche} | {r.get('origin') or 'session'} | "
+                f"{r.get('status') or '—'} | {score_txt} | {ev} |"
+            )
         a("")
 
     # ------------------------------------------------------------ methodology
@@ -1131,6 +1325,7 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
         ("Risks", "; ".join(o.get("risks") or []) or "—"),
         ("Verification status", vr.get("status", "—")),
         ("Confidence", f"{conf}%"),
+        ("Headroom (demand ÷ competition)", _ws_text(o.get("whitespace"))),
         ("Recommended next step", o.get("next_step", "—")),
     ]
     for label, value in rows:

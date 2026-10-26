@@ -41,6 +41,98 @@ class ActionError(Exception):
     pass
 
 
+# --------------------------------------------------------------------------- #
+# External (non-Amazon) research actions
+# --------------------------------------------------------------------------- #
+# A deliberately tiny allow-list. External research is injected as evidence
+# in the MIDDLE of the methodology (P4/P5/P6, plus a gated second wave in P1
+# for autonomous runs), never as its own phase: the records land in the same
+# evidence table with stable ids and flow through redact() -> claims ->
+# filters -> gates untouched. Nothing outside this list is ever navigated to
+# by an external action.
+EXTERNAL_DOMAIN_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "www.reddit.com",
+        "reddit.com",
+        "old.reddit.com",
+        "www.goodreads.com",
+        "goodreads.com",
+        "www.google.com",
+        "google.com",
+    }
+)
+
+_GOOGLE_SUGGEST_JS = """async (q) => {
+  try {
+    const res = await fetch('/complete/search?client=firefox&hl=en&q=' + encodeURIComponent(q),
+                            {headers: {'accept': 'application/json'}});
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (Array.isArray(data) && Array.isArray(data[1])) ? data[1].slice(0, 10) : [];
+  } catch (e) { return []; }
+}"""
+
+_REDDIT_RESULTS_JS = """() => {
+  const out = [];
+  const seen = new Set();
+  const push = (title, extra) => {
+    const t = (title || '').trim().replace(/\s+/g, ' ');
+    if (!t || t.length < 12 || seen.has(t)) return;
+    seen.add(t);
+    out.push(Object.assign({title: t.slice(0, 220)}, extra || {}));
+  };
+  document.querySelectorAll('a[data-testid="post-title"]').forEach((a) => {
+    const card = a.closest('a[href*="/comments/"]') || a.parentElement;
+    let ups = '';
+    if (card && card.parentElement) ups = (card.parentElement.textContent || '').match(/(\d[\d,.]*[kKmM]?)\s*upvote/)?.[1] || '';
+    push(a.textContent, {upvotes: ups});
+  });
+  if (!out.length) {
+    document.querySelectorAll('a.title, h3 a').forEach((a) => push(a.textContent, {}));
+  }
+  return out.slice(0, 20);
+}"""
+
+_GOODREADS_JS = """() => {
+  const num = (s) => {
+    const m = String(s || '').replace(/[^0-9]/g, '');
+    return m ? Number(m) : null;
+  };
+  let resultCount = null;
+  const bodyText = (document.body.innerText || '').slice(0, 20000);
+  const m = bodyText.match(/of\s+([\d,]+)\s+results/i);
+  if (m) resultCount = num(m[1]);
+  const out = [];
+  document.querySelectorAll('tr.bookish, tr[itemscope], table.tableList tr').forEach((tr) => {
+    const a = tr.querySelector('a.bookTitle');
+    if (!a) return;
+    const author = tr.querySelector('a.authorName')?.textContent?.trim() || '';
+    const meta = tr.querySelector('span.minirating')?.textContent?.trim() || '';
+    const rm = meta.match(/([0-9.]+)\s+avg rating\s*—\s*([\d,]+)\s+ratings/i);
+    out.push({
+      title: (a.textContent || '').trim().slice(0, 200),
+      author: author.slice(0, 120),
+      avg_rating: rm ? Number(rm[1]) : null,
+      ratings_count: rm ? num(rm[2]) : null,
+    });
+  });
+  return {result_count: resultCount, results: out.slice(0, 10)};
+}"""
+
+
+def _allowed_external_host(url: str) -> bool:
+    """Deny-by-default host check for external research navigation."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in EXTERNAL_DOMAIN_ALLOWLIST:
+        return True
+    return any(host.endswith("." + d) for d in EXTERNAL_DOMAIN_ALLOWLIST)
+
+
 class AuthPauseRequired(Exception):
     """Raised when a page requires manual owner intervention (login/CAPTCHA)."""
 
@@ -424,6 +516,167 @@ class ActionExecutor:
             )
         finally:
             await self.browser.close_page(page)
+
+    # ------------------------------------------------------- external sources
+    async def _open_external(self, url: str) -> Any:
+        """Open an allow-listed external page. Deny-by-default on host."""
+        if not _allowed_external_host(url):
+            raise ActionError(f"external host not allow-listed: {url}")
+        page = await self.browser.new_page()
+        try:
+            page = await self.browser.navigate(page, url)
+        except Exception:
+            try:
+                await self.browser.close_page(page)
+            except Exception:
+                pass
+            raise
+        return page
+
+    async def _external_extract(
+        self, session_id: str, *, action: str, url: str, js: str,
+        query: str, source: str, marketplace: str = "",
+    ) -> ActionResult:
+        """Shared plumbing: navigate → extract → redact → evidence → close."""
+        page = await self._open_external(url)
+        try:
+            try:
+                data = await page.evaluate(js)
+            except Exception as exc:
+                return ActionResult(
+                    action=action, ok=False, marketplace=marketplace,
+                    url=scrub_url(url), evidence_ids=[],
+                    summary=f"{source} extraction failed", error=str(exc)[:200],
+                )
+            if not isinstance(data, (dict, list)):
+                data = [] if action != "goodreads_check" else {"result_count": None, "results": []}
+            payload = {
+                "source": source,
+                "query": query,
+                "marketplace": marketplace,
+                "external": True,
+            }
+            if isinstance(data, dict):
+                payload.update(data)
+            else:
+                payload["suggestions" if action == "google_suggest" else "posts"] = data
+            empty = (
+                not payload.get("suggestions")
+                and not payload.get("posts")
+                and not payload.get("results")
+                and payload.get("result_count") in (None, 0)
+            )
+            evidence_id = ""
+            if not empty:
+                rec = self.collector.evidence_store.create(
+                    session_id=session_id,
+                    marketplace=marketplace,
+                    kind="external_demand",
+                    url=scrub_url(url),
+                    title=f"{source}: {query}"[:300],
+                    data=redact(payload),
+                )
+                evidence_id = rec.id
+            return ActionResult(
+                action=action, ok=not empty, marketplace=marketplace,
+                url=scrub_url(url), evidence_ids=[evidence_id] if evidence_id else [],
+                summary=(
+                    f"{source}: captured for {query!r}"
+                    if not empty else
+                    f"{source}: nothing extracted for {query!r} — treat this source "
+                    "as unavailable here and decide what to do without it"
+                ),
+                error=None if not empty else "empty_extraction",
+            )
+        finally:
+            try:
+                await self.browser.close_page(page)
+            except Exception:
+                pass
+
+    async def _do_google_suggest(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Un-Amazon-anchored demand phrasing (Google's suggestion stream)."""
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ActionError("google_suggest requires 'query'")
+        return await self._google_suggest(session_id, query)
+
+    async def _google_suggest(self, session_id: str, query: str) -> ActionResult:
+        page = await self._open_external("https://www.google.com/")
+        try:
+            try:
+                out = await page.evaluate(_GOOGLE_SUGGEST_JS, query)
+            except Exception as exc:
+                return ActionResult(
+                    action="google_suggest", ok=False, marketplace="", url="https://www.google.com/",
+                    evidence_ids=[], summary="google_suggest extraction failed", error=str(exc)[:200],
+                )
+            suggestions = [str(s).strip() for s in (out or []) if str(s).strip()] if isinstance(out, list) else []
+            payload = {
+                "source": "google_suggest", "query": query, "external": True,
+                "suggestions": suggestions[:10],
+            }
+            evidence_ids: list[str] = []
+            if suggestions:
+                rec = self.collector.evidence_store.create(
+                    session_id=session_id, marketplace="", kind="external_demand",
+                    url="https://www.google.com/", title=f"google_suggest: {query}"[:300],
+                    data=redact(payload),
+                )
+                evidence_ids = [rec.id]
+            return ActionResult(
+                action="google_suggest", ok=bool(suggestions), marketplace="",
+                url="https://www.google.com/", evidence_ids=evidence_ids,
+                summary=(
+                    f"{len(suggestions)} Google suggestion(s) for {query!r}"
+                    if suggestions else
+                    f"no Google suggestions for {query!r} — treat this source as "
+                    "unavailable here and decide what to do without it"
+                ),
+                error=None if suggestions else "empty_extraction",
+            )
+        finally:
+            try:
+                await self.browser.close_page(page)
+            except Exception:
+                pass
+
+    async def _do_forum_search(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Community complaint / unmet-need language (Reddit search)."""
+        from urllib.parse import quote_plus
+
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ActionError("forum_search requires 'query'")
+        urls = [
+            f"https://www.reddit.com/search/?q={quote_plus(query)}&type=posts",
+            f"https://old.reddit.com/search?q={quote_plus(query)}",
+        ]
+        last: ActionResult | None = None
+        for url in urls:
+            last = await self._external_extract(
+                session_id, action="forum_search", url=url, js=_REDDIT_RESULTS_JS,
+                query=query, source="reddit",
+            )
+            if last.ok:
+                return last
+        return last or ActionResult(
+            action="forum_search", ok=False, marketplace="", url="",
+            evidence_ids=[], summary="forum search unavailable", error="no attempt",
+        )
+
+    async def _do_goodreads_check(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Independent demand evidence: how many titles exist and how they rate."""
+        from urllib.parse import quote_plus
+
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ActionError("goodreads_check requires 'query'")
+        return await self._external_extract(
+            session_id, action="goodreads_check",
+            url=f"https://www.goodreads.com/search?q={quote_plus(query)}",
+            js=_GOODREADS_JS, query=query, source="goodreads",
+        )
 
     async def _do_capture_evidence(self, session_id: str, args: dict[str, Any]) -> ActionResult:
         page = await self.browser.new_page()

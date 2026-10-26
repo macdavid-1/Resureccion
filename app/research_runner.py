@@ -24,22 +24,31 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.actions import ActionError, ActionExecutor, AuthPauseRequired
+from app.adjacency import gather_neighbors
 from app.agent import AgentStateStore
 from app.artifacts import ArtifactStore
 from app.browser_manager import BrowserManager, BrowserManagerError
 from app.browser_store import BrowserAuthStore, BrowserEvidenceStore, LoginWindowStore
+from app.census import CategoryCensus
 from app.claims import ClaimStore, EQ_INFERENCE
 from app.config import Config
 from app.db import Database
 from app.events import EventLog
 from app.evidence_capture import EvidenceCollector
 from app.filters import CandidateFilterEngine
+from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
 from app.marketplace import Marketplace, resolve_plan, select_auto
+from app.market_memory import MarketMemoryStore, harvest_session
 from app.owner_messages import OwnerMessageStore
 from app.methodology import (
+    EXTERNAL_ACTIONS,
     P1_DISCOVERY,
+    P3_COMPETITION,
+    P4_CONSUMER,
+    P5_DEMAND,
+    P6_GAP,
     PHASE_ORDER,
     PHASE_TITLES,
     SESSION_PHASE_BY_METHOD_PHASE,
@@ -47,6 +56,7 @@ from app.methodology import (
     STALL_LIMIT,
     PhaseTiming,
     focus_pivot_directive,
+    mode_profile,
     validate_opportunity,
 )
 from app.methodology import P8_ADVERSARIAL
@@ -58,6 +68,7 @@ from app.model_client import (
 )
 from app.prompts import build_system_prompt, build_user_prompt
 from app.recovery import CheckpointStore, ErrorStateStore
+from app.redact import redact
 from app.quality_gates import QualityGateRunner
 from app.reports import ReportStore
 from app.research_data import (
@@ -92,6 +103,7 @@ from app.trace import (
     verification_text,
 )
 from app.verification import VerificationEngine, evidence_for_candidate
+from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
 
 
 @asynccontextmanager
@@ -225,6 +237,11 @@ class ResearchRunner:
         # Per-session all-time usage (prior runs merged on resume) — see
         # _record_model_usage.
         self._usage_prior: dict[str, dict] = {}
+        # Deep-discovery layers (deterministic, durable, session-scoped):
+        # whitespace scores, cross-session market memory, the adjacency log.
+        self._ws_scores: dict[str, dict[str, WhitespaceScore]] = {}
+        self._ws_evidence_count: dict[str, int] = {}
+        self.memory = MarketMemoryStore(db)
 
     # ------------------------------------------------- owner message channel
     def _take_owner_messages(self, session_id: str) -> None:
@@ -386,6 +403,13 @@ class ResearchRunner:
                 marketplace_text([m.code for m in marketplaces], marketplace_mode),
             )
 
+            # 0.5 Deterministic discovery preflight — the census (what the
+            # market actually looks like) and the autocomplete frontier (what
+            # buyers actually type), gathered BEFORE the model opines so
+            # Phase 1 reasons over measurements instead of its imagination.
+            # Durable: a resumed session reuses it and never re-walks.
+            await self._discovery_preflight(session_id, session, marketplaces)
+
             # 1-9. The methodology. The phase order is strict; the only
             # repetition is the STRATEGIC FOCUS PIVOT: when a full pass
             # (deep research + niche-down + adversarial verification + the
@@ -419,6 +443,15 @@ class ResearchRunner:
                         session_id, session, phase, phase_outputs, session_started
                     )
                     phase_outputs[phase] = output
+                    # Deterministic post-phase layers. Both only ORDER and
+                    # ALLOCATE: recompute headroom, then let success (not
+                    # failure) trigger the next round of discovery.
+                    if not output.get("_paused"):
+                        self._refresh_whitespace(session_id)
+                        if phase in (P3_COMPETITION, P5_DEMAND):
+                            await self._adjacency_expand(
+                                session_id, session, marketplaces, phase
+                            )
                     self.checkpoints.save(
                         session_id, f"phase_complete:{phase}",
                         {"completed_at": iso_now(), "output_keys": sorted(output.keys())},
@@ -439,6 +472,12 @@ class ResearchRunner:
                             "verification decide which candidates may reach synthesis",
                         )
                         self._run_integrity_pipeline(session_id, phase_outputs)
+                        # Cross-session market memory: everything this pass
+                        # measured (verified niches, near-misses, keyword
+                        # numbers, competitors, census stats) is distilled
+                        # into the owner-scoped knowledge base so later runs
+                        # reuse it. Best-effort: memory never breaks research.
+                        self._harvest_memory(session_id)
                         # Strategic focus pivot gate: the pass above was deep
                         # and adversarial, and NOTHING survived it. When the
                         # session can still afford a full pass, restart
@@ -501,6 +540,9 @@ class ResearchRunner:
         session_started: float,
     ) -> dict[str, Any]:
         spec = SPECS[phase]
+        # Per-mode budget profile: the SAME methodology, shaped differently
+        # for a detailed brief vs keywords vs a run with no topic at all.
+        max_iter = self._phase_iterations(phase, session.mode)
         phase_start = time.monotonic()
         timing = PhaseTiming(phase=phase, started_at=iso_now())
         timings = self._timings_for(session_id)
@@ -510,7 +552,7 @@ class ResearchRunner:
         self.agent.transition(session_id, spec.agent_states[0], substate=phase)
         self.events.append(
             session_id, level="info", actor="agent", action="phase_started",
-            detail={"phase": phase, "max_iterations": spec.max_iterations},
+            detail={"phase": phase, "max_iterations": max_iter},
         )
         self.trace.record(
             session_id, KIND_PHASE,
@@ -530,7 +572,10 @@ class ResearchRunner:
         # budget exit so the model's work is never thrown away.
         best_output: dict[str, Any] | None = None
         iteration = 0
-        for iteration in range(1, spec.max_iterations + 1):
+        # Deterministic deep-discovery inputs for this phase's prompts
+        # (census, frontier, market memory, headroom ordering, adjacency).
+        discovery = self._discovery_digest(session_id, prior_outputs)
+        for iteration in range(1, max_iter + 1):
             if self._cancelled:
                 raise _Cancelled()
             if self._pause_requested:
@@ -542,10 +587,13 @@ class ResearchRunner:
                     f"Paused by owner during {PHASE_TITLES.get(phase, phase)}",
                 )
                 return {"_paused": True}
-            if model_calls >= self.rc.max_model_calls_per_session:
+            # Session-wide model budget (durable, profile-aware): a resumed
+            # session continues the count it already spent.
+            if self._model_calls_used(session_id) >= self._model_call_ceiling(session.mode):
                 self.events.append(
                     session_id, level="warn", actor="agent",
-                    action="session_model_budget_reached", detail={"phase": phase},
+                    action="session_model_budget_reached",
+                    detail={"phase": phase, "ceiling": self._model_call_ceiling(session.mode)},
                 )
                 break
             # Hard wall-clock ceiling per session (deterministic safety).
@@ -590,6 +638,11 @@ class ResearchRunner:
                 screenshot_attached=screenshot_png is not None,
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
+                census_digest=discovery.get("census") or None,
+                frontier_terms=discovery.get("frontier") or None,
+                market_memory=discovery.get("memory") or None,
+                headroom_priority=discovery.get("priority") or None,
+                adjacency_note=discovery.get("adjacency") or "",
                 # Deterministic exit gate, shown so the model knows exactly
                 # what still separates an explore step from a commit.
                 phase_gate=self._phase_gate(
@@ -600,6 +653,7 @@ class ResearchRunner:
                 ),
             )
             model_calls += 1
+            self._bump_model_calls(session_id)
             self.agent.advance_iteration(session_id)
             self.agent.add_budget(session_id, time.monotonic() - phase_start if iteration == 1 else 0.0)
             # Per-call stuck detection: a hung model call is aborted at the
@@ -674,6 +728,19 @@ class ResearchRunner:
                             session_id, level="warn", actor="agent",
                             action="action_rejected_not_allowed",
                             detail={"phase": phase, "action": action_name},
+                        )
+                        continue
+                    # External (non-Amazon) sources are gated ON TOP of the
+                    # phase whitelist: in Phase 1 they are a second wave for
+                    # autonomous runs only, never the opening move.
+                    if action_name in EXTERNAL_ACTIONS and not self._external_action_ok(
+                        session_id, session, phase, iteration, prior_outputs
+                    ):
+                        self.events.append(
+                            session_id, level="warn", actor="agent",
+                            action="action_rejected_external_gated",
+                            detail={"phase": phase, "action": action_name,
+                                    "mode": session.mode, "iteration": iteration},
                         )
                         continue
                     task_key = f"action:{action_name}:{iteration}"
@@ -809,6 +876,26 @@ class ResearchRunner:
         # Niching produces/updates candidate rows.
         niches = output.get("niches")
         if isinstance(niches, list):
+            # Everything past the live cap is RECORDED as backlog — the tail
+            # past 24 is where odd gems live, and silently dropping it was
+            # throwing away discovered demand.
+            overflow = [
+                n for n in niches[self.rc.max_candidates:]
+                if isinstance(n, dict) and str(n.get("niche") or "").strip()
+            ]
+            if overflow:
+                self._record_backlog(
+                    session_id,
+                    [
+                        {
+                            "niche": str(n.get("niche"))[:200],
+                            "parent_market": str(n.get("parent_market") or ""),
+                            "marketplace": str(n.get("marketplace") or ""),
+                        }
+                        for n in overflow
+                    ],
+                    reason="candidate_capacity",
+                )
             for n in niches[: self.rc.max_candidates]:
                 if not isinstance(n, dict) or not str(n.get("niche") or "").strip():
                     continue
@@ -960,6 +1047,540 @@ class ResearchRunner:
                     session_id, level="info", actor="agent", action="opportunities_created",
                     detail={"count": created},
                 )
+
+    # ------------------------------------------------ deep-discovery layers
+    def _phase_iterations(self, phase: str, mode: str) -> int:
+        """Effective iteration cap for this phase under the mode's profile."""
+        spec = SPECS[phase]
+        try:
+            return mode_profile(mode).iterations_for(phase, spec.max_iterations)
+        except Exception:
+            return spec.max_iterations
+
+    def _model_calls_used(self, session_id: str) -> int:
+        """Durable, session-wide model-call spend (survives restarts)."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "model_budget")
+            return int((cp.payload or {}).get("used", 0)) if cp else 0
+        except Exception:
+            return 0
+
+    def _bump_model_calls(self, session_id: str) -> None:
+        try:
+            used = self._model_calls_used(session_id) + 1
+            self.checkpoints.save(
+                session_id, "model_budget", {"used": used, "at": iso_now()}
+            )
+        except Exception:
+            pass  # budget accounting must never break the call itself
+
+    def _model_call_ceiling(self, mode: str) -> int:
+        """Per-session model-call ceiling: the base budget RAISED by the
+        mode's profile extra — and only as far as the hard time budget
+        allows (a 6-hour hard wall does not buy a 160-call agenda)."""
+        base = self.rc.max_model_calls_per_session
+        try:
+            env = int(getattr(self.config, "mode_model_calls", {}).get(mode, 0) or 0)
+        except (TypeError, ValueError):
+            env = 0
+        if env:
+            return max(base, env)
+        profile = mode_profile(mode)
+        hard = max(1, int(getattr(self.config, "session_hard_timeout_hours", 12)))
+        extra = int(round(profile.extra_calls * min(1.0, hard / 12.0)))
+        return base + extra
+
+    # ---------------------------------- census + autocomplete frontier
+    async def _discovery_preflight(
+        self, session_id: str, session: Any, marketplaces: list[Marketplace]
+    ) -> None:
+        """Deterministic preflight: walk the market (census), then mine what
+        buyers type (autocomplete frontier). Runs BEFORE Phase 1 so discovery
+        reasons over measurements, and runs ONCE per session — the durable
+        checkpoint makes a resumed session reuse it instead of re-walking.
+        """
+        try:
+            cp = self.checkpoints.get_safe(session_id, "discovery_preflight")
+            payload = dict(cp.payload) if cp else {}
+        except Exception:
+            payload = {}
+        if payload.get("done"):
+            return
+        cfg = self.config
+        census_out: dict[str, Any] = {}
+        frontier_out: dict[str, Any] = {}
+        if cfg.census_enabled or cfg.frontier_enabled:
+            # Owner visibility: this can take a few minutes on a 2-core box,
+            # so it must never look like a hung session.
+            self.agent.transition(session_id, "exploring", substate="discovery_preflight")
+            self.events.append(
+                session_id, level="info", actor="system",
+                action="discovery_preflight_started",
+                detail={"census": bool(cfg.census_enabled),
+                        "frontier": bool(cfg.frontier_enabled)},
+            )
+            self.trace.record(
+                session_id, KIND_DISCOVERY,
+                "Gathering the measured map first: category census + autocomplete "
+                "demand-language frontier (deterministic backend work, no model)",
+            )
+
+        if cfg.census_enabled and not self._cancelled:
+            try:
+                census = CategoryCensus(
+                    self.browser,
+                    self.executor.collector.evidence_store,
+                    self.events,
+                    max_categories=cfg.census_max_categories,
+                    items_per_category=cfg.census_items_per_category,
+                    max_marketplaces=cfg.census_max_marketplaces,
+                    time_budget_seconds=cfg.census_time_budget_seconds,
+                    should_stop=lambda: self._cancelled or self._pause_requested,
+                )
+                res = await census.run(
+                    session_id=session_id, marketplaces=marketplaces
+                )
+                census_out = res.to_dict()
+                self.trace.record(
+                    session_id, KIND_DISCOVERY,
+                    f"Deterministic market census: {res.charts_captured} chart(s) and "
+                    f"{res.visited_nodes} browse node(s) measured — discovery now has "
+                    "a measured map instead of the model's imagination",
+                )
+            except Exception as exc:
+                census_out = {"error": str(exc)[:200]}
+                self.errors.record(
+                    session_id, scope="census", severity="warning",
+                    message=str(exc)[:300], recoverable=True,
+                )
+
+        if cfg.frontier_enabled and not self._cancelled:
+            try:
+                seeds = seeds_for_session(
+                    session.prompt or "",
+                    session.objective or "",
+                    census_categories=census_out.get("category_names") or [],
+                )
+                frontier = AutocompleteFrontier(
+                    self.browser,
+                    self.executor.collector.evidence_store,
+                    self.events,
+                    max_queries=cfg.frontier_max_queries,
+                    max_depth=cfg.frontier_max_depth,
+                    time_budget_seconds=cfg.frontier_time_budget_seconds,
+                    should_stop=lambda: self._cancelled or self._pause_requested,
+                )
+                fres = await frontier.run(
+                    session_id=session_id,
+                    marketplaces=marketplaces,
+                    seeds=seeds,
+                )
+                frontier_out = fres.to_dict()
+                self.trace.record(
+                    session_id, KIND_DISCOVERY,
+                    f"Autocomplete frontier: {len(fres.terms)} demand-language "
+                    f"phrase(s) mined from {fres.queries_run} suggestion query(ies) "
+                    f"({fres.stopped_reason})",
+                )
+            except Exception as exc:
+                frontier_out = {"error": str(exc)[:200]}
+                self.errors.record(
+                    session_id, scope="frontier", severity="warning",
+                    message=str(exc)[:300], recoverable=True,
+                )
+
+        # Durable, atomic: on resume the preflight is REUSED, never repeated.
+        self.checkpoints.save(
+            session_id, "discovery_preflight",
+            {
+                "done": True,
+                "census": census_out,
+                "frontier": frontier_out,
+                "at": iso_now(),
+            },
+        )
+
+    def _census_categories(self, session_id: str) -> list[dict[str, Any]]:
+        try:
+            cp = self.checkpoints.get_safe(session_id, "discovery_preflight")
+            census = (cp.payload or {}).get("census") or {} if cp else {}
+        except Exception:
+            return []
+        return [
+            c for c in (census.get("categories") or []) if isinstance(c, dict)
+        ][:30]
+
+    def _frontier_terms(self, session_id: str) -> list[str]:
+        try:
+            cp = self.checkpoints.get_safe(session_id, "discovery_preflight")
+            frontier = (cp.payload or {}).get("frontier") or {} if cp else {}
+        except Exception:
+            return []
+        return [
+            str(t) for t in (frontier.get("terms") or [])
+            if isinstance(t, str) and t.strip()
+        ][:60]
+
+    def _discovery_digest(self, session_id: str, prior_outputs: dict[str, Any]) -> dict[str, Any]:
+        """Everything deterministic the model should see this phase: the
+        census map, the demand language, cross-session memory, the headroom
+        ordering and the latest adjacency round. Empty sections are omitted
+        so a lean run's prompts stay lean."""
+        out: dict[str, Any] = {}
+        census = self._census_categories(session_id)
+        if census:
+            out["census"] = census
+        terms = self._frontier_terms(session_id)
+        if terms:
+            out["frontier"] = terms
+        memory = self._memory_digest(session_id)
+        if memory:
+            out["memory"] = memory
+        try:
+            scores = self._whitespace_scores(session_id)
+            cands = self.candidates.list(session_id, limit=self.rc.max_candidates)
+            lines = priority_lines(cands, scores, limit=8)
+            if lines:
+                out["priority"] = lines
+        except Exception:
+            pass
+        note = self._adjacency_note(session_id)
+        if note:
+            out["adjacency"] = note
+        return out
+
+    def _memory_digest(self, session_id: str) -> list[dict[str, Any]]:
+        if not getattr(self.config, "memory_enabled", True):
+            return []
+        try:
+            return self.memory.digest(
+                fresh_days=self.config.memory_fresh_days,
+                limit=self.config.memory_max_digest,
+                exclude_session=session_id,
+            )
+        except Exception:
+            return []  # memory is an accelerator, never a dependency
+
+    def _harvest_memory(self, session_id: str) -> None:
+        """Distill this session's measured facts into cross-session memory."""
+        if not getattr(self.config, "memory_enabled", True):
+            return
+        try:
+            scores = self._whitespace_scores(session_id)
+            written = harvest_session(
+                self.memory,
+                session_id,
+                candidates=self.candidates,
+                browser_evidence=self.browser_evidence,
+                whitespace_by_candidate={
+                    k: v.to_dict() for k, v in scores.items()
+                },
+            )
+            self.events.append(
+                session_id, level="info", actor="system",
+                action="market_memory_harvested", detail=written,
+            )
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="market_memory", severity="warning",
+                message=str(exc)[:300], recoverable=True,
+            )
+
+    def _adjacency_rows(self, session_id: str) -> list[dict[str, Any]]:
+        """Flat neighbour rows for the report's adjacency appendix."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "adjacency_log")
+            rounds = list((cp.payload or {}).get("rounds") or []) if cp else []
+        except Exception:
+            return []
+        rows: list[dict[str, Any]] = []
+        for r in rounds:
+            if not isinstance(r, dict):
+                continue
+            for n in r.get("neighbors") or []:
+                if isinstance(n, dict):
+                    rows.append({**n, "phase": r.get("phase")})
+        return rows[:60]
+
+    def _adjacency_note(self, session_id: str) -> str:
+        try:
+            cp = self.checkpoints.get_safe(session_id, "adjacency_log")
+            rounds = list((cp.payload or {}).get("rounds") or []) if cp else []
+        except Exception:
+            return ""
+        if not rounds:
+            return ""
+        last = rounds[-1]
+        promoted = [
+            str(n.get("term")) for n in (last.get("neighbors") or [])
+            if isinstance(n, dict) and n.get("promoted")
+        ]
+        measured = int(last.get("measured") or 0)
+        lines = [
+            f"{last.get('promoted', 0)} adjacent candidate(s) were promoted "
+            f"mid-run after {measured} measured search(es): "
+            + "; ".join(p[:60] for p in promoted[:6])
+            if promoted else
+            f"{measured} adjacent neighbour(s) were measured this round; none "
+            "cleared the headroom bar for promotion."
+        ]
+        lines.append(
+            "These are markets BESIDE a winner: research them alongside the "
+            "existing candidates (they carry seed evidence ids)."
+        )
+        return " ".join(lines)
+
+    # -------------------------------------------------- whitespace (headroom)
+    def _whitespace_scores(self, session_id: str) -> dict[str, WhitespaceScore]:
+        """Recompute and persist every candidate's headroom score.
+
+        Deterministic, evidence-only: scores are stored on the candidate's
+        meta so the dashboard, report and next run all read the same number.
+        The score never enters any verdict — it orders work, nothing else.
+        """
+        rows = self._all_browser_evidence(session_id)
+        cand_rows = self.candidates.list(session_id, limit=500)
+        scores: dict[str, WhitespaceScore] = {}
+        for cand in cand_rows:
+            try:
+                claims = self.claims.list(
+                    session_id, candidate_id=cand.id, limit=200
+                )
+                ev = evidence_for_candidate(cand, rows, claims=claims)
+                score = compute_whitespace(cand, ev)
+                scores[cand.id] = score
+                prior = (cand.meta or {}).get("whitespace") or {}
+                if prior.get("score") != score.to_dict()["score"]:
+                    self.candidates.update_meta(
+                        session_id, cand.id, {"whitespace": score.to_dict()}
+                    )
+            except Exception:
+                continue  # one odd candidate never blocks the rest
+        self._ws_scores[session_id] = scores
+        return scores
+
+    def _refresh_whitespace(self, session_id: str) -> dict[str, WhitespaceScore]:
+        return self._whitespace_scores(session_id)
+
+    # ---------------------------------------------------- adjacency expansion
+    async def _adjacency_expand(
+        self,
+        session_id: str,
+        session: Any,
+        marketplaces: list[Marketplace],
+        phase: str,
+    ) -> None:
+        """Walk outward from every strong candidate after competition/demand
+        work: measure neighbouring demand language with REAL searches, then
+        promote only what clears the headroom bar. Failures are recorded and
+        researched around; adjacency can slow a run down, never break it."""
+        cfg = self.config
+        if not getattr(cfg, "adjacency_enabled", True):
+            return
+        if self._cancelled or self._pause_requested:
+            return
+        log_entry: dict[str, Any] = {
+            "phase": phase, "at": iso_now(), "measured": 0, "promoted": 0,
+            "neighbors": [],
+        }
+        try:
+            rows = self._all_browser_evidence(session_id)
+            cands = self.candidates.list(session_id, limit=500)
+            known = [c.niche for c in cands]
+            count = len(cands)
+            neighbors = gather_neighbors(
+                candidates=[c for c in cands if c.status != "rejected"],
+                evidence_records=rows,
+                frontier_terms=self._frontier_terms(session_id),
+                exclude_niches=known,
+                limit=24,
+            )
+            if not neighbors:
+                return
+            capacity = self.rc.max_candidates
+            budget = min(len(neighbors), max(4, int(cfg.adjacency_max_new) * 2))
+            for nb in neighbors:
+                if log_entry["promoted"] >= cfg.adjacency_max_new:
+                    break
+                if log_entry["measured"] >= budget:
+                    break
+                if self._cancelled or self._pause_requested:
+                    break
+                if count >= capacity:
+                    self._record_backlog(
+                        session_id,
+                        [{"niche": nb.term, "parent": nb.parent_niche,
+                          "source": nb.source}],
+                        reason="candidate_capacity",
+                    )
+                    continue
+                log_entry["measured"] += 1
+                try:
+                    await self.executor.execute(
+                        session_id=session_id,
+                        action="search_marketplace",
+                        args={
+                            "query": nb.term,
+                            "marketplace": nb.marketplace or "",
+                            "screenshot": False,
+                            "max_items": 12,
+                        },
+                    )
+                except (ActionError, BrowserManagerError) as exc:
+                    self.errors.record(
+                        session_id, scope=f"adjacency:{nb.term[:40]}",
+                        severity="warning", message=str(exc)[:200],
+                        recoverable=True,
+                    )
+                    continue
+                now_rows = self._all_browser_evidence(session_id)
+                mine = [
+                    r for r in now_rows
+                    if str((r.get("data") or {}).get("query") or "").strip().lower()
+                    == nb.term.lower()
+                ] + [
+                    r for r in now_rows if r.get("id") in (nb.evidence_ids or [])
+                ]
+                score = compute_whitespace(_NicheProbe(nb.term), mine)
+                neighbor_row = {**nb.to_dict(), "whitespace": score.to_dict(),
+                                 "promoted": False}
+                if score.measured and (score.score or 0.0) >= float(
+                    cfg.adjacency_min_whitespace
+                ):
+                    meta = redact({
+                        "via": "adjacency",
+                        "parent_candidate": nb.parent_candidate_id,
+                        "parent_market": nb.parent_niche,
+                        "source": nb.source,
+                        "whitespace": score.to_dict(),
+                        "seed_evidence_ids": [
+                            r.get("id") for r in mine if r.get("id")
+                        ][:8],
+                        "chain": [nb.parent_niche, nb.term],
+                    })
+                    self.candidates.create(
+                        session_id,
+                        niche=nb.term[:200],
+                        marketplace=nb.marketplace or "",
+                        rationale=(
+                            f"adjacent to '{nb.parent_niche[:70]}' ({nb.source}) — "
+                            f"{score.note()}"
+                        ),
+                        meta=meta,
+                    )
+                    count += 1
+                    log_entry["promoted"] += 1
+                    neighbor_row["promoted"] = True
+                    self.trace.record(
+                        session_id, KIND_CANDIDATE,
+                        candidate_created_text(nb.term, nb.marketplace or "", score.note()),
+                    )
+                    self.events.append(
+                        session_id, level="info", actor="agent",
+                        action="adjacency_candidate_promoted",
+                        detail={"niche": nb.term[:120], "parent": nb.parent_niche[:120],
+                                "source": nb.source, "whitespace": score.to_dict()},
+                    )
+                log_entry["neighbors"].append(neighbor_row)
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="adjacency", severity="warning",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
+            return
+        # Durable log: prompts and the report read it back.
+        try:
+            prior = self.checkpoints.get_safe(session_id, "adjacency_log")
+            rounds = list((prior.payload or {}).get("rounds") or []) if prior else []
+            rounds.append(log_entry)
+            self.checkpoints.save(session_id, "adjacency_log", {"rounds": rounds[-12:]})
+            if log_entry["measured"]:
+                self.events.append(
+                    session_id, level="info", actor="agent",
+                    action="adjacency_round_completed",
+                    detail={"phase": phase, "measured": log_entry["measured"],
+                            "promoted": log_entry["promoted"]},
+                )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- backlog
+    def _record_backlog(
+        self, session_id: str, items: list[dict[str, Any]], *, reason: str
+    ) -> None:
+        """Candidates beyond the live cap are RECORDED, never silently lost —
+        the tail past 24 is exactly where odd gems live."""
+        if not items:
+            return
+        try:
+            prior = self.checkpoints.get_safe(session_id, "candidate_backlog")
+            rows = list((prior.payload or {}).get("items") or []) if prior else []
+            for it in items:
+                row = {k: v for k, v in it.items() if v not in (None, "")}
+                if not str(row.get("niche") or "").strip():
+                    continue
+                row["reason"] = reason
+                row["at"] = iso_now()
+                rows.append(row)
+            seen: set[str] = set()
+            deduped: list[dict[str, Any]] = []
+            for row in rows:
+                key = str(row.get("niche") or "").strip().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(row)
+            self.checkpoints.save(
+                session_id, "candidate_backlog",
+                {"items": deduped[:200], "count": len(deduped)},
+            )
+        except Exception:
+            pass  # backlog bookkeeping must never break phase handling
+
+    def _backlog_items(self, session_id: str) -> list[dict[str, Any]]:
+        try:
+            cp = self.checkpoints.get_safe(session_id, "candidate_backlog")
+            return [
+                r for r in ((cp.payload or {}).get("items") or [])
+                if isinstance(r, dict)
+            ] if cp else []
+        except Exception:
+            return []
+
+    # -------------------------------------------- external-source gate
+    def _external_action_ok(
+        self,
+        session_id: str,
+        session: Any,
+        phase: str,
+        iteration: int,
+        prior_outputs: dict[str, Any],
+    ) -> bool:
+        """Where outside-Amazon research may fire.
+
+        P4/P5/P6 (consumer, demand, gap): always — Amazon-side candidates
+        already exist there, so external signals corroborate or kill rather
+        than mislead. P1: autonomous runs ONLY, never on the opening move,
+        and only once Amazon-side anchors exist — unanchored forum noise may
+        not set the direction of a six-hour run.
+        """
+        if phase in (P4_CONSUMER, P5_DEMAND, P6_GAP):
+            return True
+        if phase != P1_DISCOVERY:
+            return False
+        if session.mode != "auto":
+            return False
+        if iteration < 2:
+            return False
+        try:
+            rows = self._all_browser_evidence(session_id)
+        except Exception:
+            return False
+        anchor_kinds = {
+            "search_results", "census", "autocomplete", "autocomplete_frontier",
+            "page_state", "product_page", "demand_language",
+        }
+        return any(r.get("kind") in anchor_kinds for r in rows)
 
     # ------------------------------------------------------- integrity layer
     def _run_integrity_pipeline(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
@@ -1195,6 +1816,19 @@ class ResearchRunner:
         def _mentions(text: str) -> bool:
             return niche[:24] in (text or "").lower()
 
+        # Seed evidence (adjacency promotions, and any candidate created with
+        # its own evidence ids): register ONE chain-of-custody claim pointing
+        # at records that really exist, so a candidate born mid-run is judged
+        # on captured evidence instead of on silence.
+        seed_ids = [str(e) for e in ((cand.meta or {}).get("seed_evidence_ids") or [])]
+        if seed_ids:
+            _claim(
+                "demand",
+                f"Measured market signal observed for candidate: {cand.niche}",
+                seed_ids,
+                "seed evidence captured when this candidate was created",
+            )
+
         for m in (phase_outputs.get("competitive_landscape") or {}).get("competitive_maps") or []:
             if isinstance(m, dict) and _mentions(str(m.get("niche", ""))):
                 _claim("competition", str(m.get("saturation") or ""),
@@ -1291,18 +1925,33 @@ class ResearchRunner:
         return items
 
     def _candidates_digest(self, session_id: str) -> list[dict[str, Any]]:
+        """Candidates for the prompt, ordered by headroom (demand ÷
+        competition) so the model spends its iterations on the highest-
+        headroom candidates first. Ordering only — every candidate stays in
+        the list and no verdict changes."""
         rows = self.candidates.list(session_id, limit=self.rc.max_candidates)
-        return [
-            {
+        ws = self._ws_scores.get(session_id) or {}
+        items: list[dict[str, Any]] = []
+        for c in rows:
+            score = ws.get(c.id)
+            value = (
+                score.to_dict().get("score") if score is not None
+                else (c.meta or {}).get("whitespace", {}).get("score")
+            )
+            items.append({
                 "candidate_id": c.id,
                 "niche": c.niche,
                 "status": c.status,
                 "marketplace": c.marketplace,
                 "score": c.score,
+                "whitespace": value,
                 "rationale": c.rationale[:200],
-            }
-            for c in rows
-        ]
+            })
+        items.sort(key=lambda d: (
+            -(d["whitespace"] if isinstance(d["whitespace"], (int, float)) else -1.0),
+            d["niche"],
+        ))
+        return items
 
     def _progress_signature(self, session_id: str) -> dict[str, int]:
         be_count = self.browser_evidence.count(session_id)
@@ -1452,6 +2101,12 @@ class ResearchRunner:
 
         # Structured model first — the report is a RENDERING of durable
         # research state, never a free-form string.
+        # Headroom scores + backlog feed the report's ranking and its
+        # "adjacent opportunities not yet researched" ledger.
+        try:
+            ws = self._whitespace_scores(session_id)
+        except Exception:
+            ws = {}
         model = build_report_model(
             session_id,
             sessions=self.sessions,
@@ -1464,6 +2119,11 @@ class ResearchRunner:
             assessments=self.assessments,
             phase_outputs=phase_outputs,
             focus_pivots=self._focus_pivot_history(session_id),
+            whitespace_by_candidate={
+                k: v.to_dict() for k, v in ws.items()
+            },
+            backlog=self._backlog_items(session_id),
+            adjacency=self._adjacency_rows(session_id),
         )
         body = render_markdown(model)
 
@@ -1529,6 +2189,20 @@ class ResearchRunner:
 
 class _Cancelled(Exception):
     pass
+
+
+class _NicheProbe:
+    """Minimal candidate-shaped object for scoring a measured neighbour
+    before (or without) it becoming a real candidate row."""
+
+    def __init__(self, niche: str, marketplace: str = "") -> None:
+        self.id = ""
+        self.niche = niche
+        self.marketplace = marketplace
+        self.status = "discovered"
+        self.meta = {}
+        self.rationale = ""
+        self.score = 0.0
 
 
 class _RunnerAuth:

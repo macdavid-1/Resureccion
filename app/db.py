@@ -19,7 +19,7 @@ from typing import Any, Iterator
 
 from app.config import Config, get_config
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -400,6 +400,26 @@ CREATE TABLE IF NOT EXISTS owner_messages (
     delivered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ownermsg_session ON owner_messages(session_id, id);
+
+-- Cross-session market memory: one owner-scoped knowledge base of facts a
+-- research run measured, so later runs stop paying twice for the same
+-- numbers. Rows are METADATA about markets (niches, keyword result counts,
+-- competitors, census stats) — never raw pages, never credentials. Freshness
+-- is enforced by the reader via captured_at (reuse < MEMORY_FRESH_DAYS, else
+-- treat as a stale hint that must be cheaply re-verified).
+CREATE TABLE IF NOT EXISTS market_memory (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL DEFAULT 'owner',
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    marketplace TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',
+    captured_at TEXT NOT NULL,
+    source_session_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    UNIQUE (owner, kind, subject, marketplace)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_kind ON market_memory(kind, captured_at);
 """
 
 

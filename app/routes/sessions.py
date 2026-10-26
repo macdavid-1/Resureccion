@@ -277,6 +277,33 @@ async def list_opportunities(session_id: str, request: Request) -> dict:
     return {"opportunities": [o.to_dict() for o in opps]}
 
 
+@router.get("/{session_id}/adjacent")
+async def adjacent_ledger(session_id: str, request: Request) -> dict:
+    """The report's "adjacent opportunities not yet researched" ledger.
+
+    Surviving-but-unfunded candidates, measured adjacency neighbours and the
+    capacity backlog, read from the persisted structured report model. The
+    dashboard uses it for the one-click follow-up: each row seeds the next
+    run through the existing `keywords` mode (no new session plumbing).
+    """
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    rows: list[dict] = []
+    source_report = None
+    for rep in st.reports.list(session_id):
+        try:
+            model = st.reports.read_model_json(rep)
+        except Exception:
+            model = None
+        if isinstance(model, dict) and model.get("adjacent_ledger"):
+            rows = [r for r in model["adjacent_ledger"] if isinstance(r, dict)]
+            source_report = rep.id
+            break
+    return {"ledger": rows[:60], "report_id": source_report}
+
+
 @router.get("/{session_id}/verifications")
 async def list_verifications(session_id: str, request: Request) -> dict:
     _auth(request)

@@ -315,6 +315,62 @@ Synthesis cannot mint opportunities from nothing: a Phase-9 opportunity must
 map onto an existing candidate the pipeline verified, and its
 `verification_status` in the report comes from the engine, not the model.
 
+## Deep discovery (Stage 5)
+
+Discovery used to be whatever the model imagined. Five deterministic layers
+now widen what a run can FIND, and every one of them feeds the ordinary
+evidence → claims → filters → gates pipeline — none of them can override a
+filter, a gate or a verification verdict:
+
+- **Category census** (`app/census.py`) — before Phase 1 opines, the backend
+  walks Amazon's bestseller and new-release charts plus the browse-node tree
+  hanging off them, harvesting rank/price/rating/review counts per node. You
+  cannot discover a category you never visited; this makes the system visit
+  them, and hands the model a measured map instead of its imagination.
+- **Autocomplete frontier** (`app/frontier.py`) — seed → append a–z →
+  deepen, against Amazon's real suggestion endpoint (one page load per
+  marketplace, no login). Completions are literally what buyers type: a
+  long-tail phrase with thin results is hidden demand in plain sight.
+- **Whitespace score** (`app/whitespace.py`) — one deterministic
+  `demand ÷ competition` number per candidate, computed only from captured
+  evidence. It orders the candidate digest (highest headroom gets the next
+  iteration first), ranks the report, and drives adjacency promotion. It
+  never touches a verdict, and an unmeasured candidate is reported as
+  *unmeasured*, never as a fake zero.
+- **Adjacency expansion** (`app/adjacency.py`) — after competition and
+  demand work, walk outward from every strong candidate (its autocomplete
+  completions, shared frontier terms, census siblings), measure the most
+  promising neighbours with real searches, and promote only what clears
+  `ADJACENCY_MIN_WHITESPACE`. Discovery re-entry triggered by SUCCESS rather
+  than by total failure, as a step inside the existing phases — P1→P9, the
+  gates and the report contract are untouched.
+- **Cross-session market memory** (`app/market_memory.py`) — one
+  owner-scoped knowledge base of verified niches, measured keyword result
+  counts, competitors, near-misses and census stats. Rows younger than
+  `MEMORY_FRESH_DAYS` are reused as fact; older rows are carried as stale
+  hints the model must cheaply re-verify. Every run stops paying twice for
+  the same numbers, and autonomous runs get smarter over time.
+
+Supporting changes:
+
+- **Per-mode budget profiles** (`app/methodology.MODE_PROFILES`) — a detailed
+  brief spends on competition/verification, no topic at all spends on
+  discovery/niching; the model-call ceiling is raised for those modes and
+  scaled by the hard time budget. Env-overridable per mode.
+- **No more silently dropped niches** — candidates past the live cap land in
+  a durable backlog and appear in the report's ledger.
+- **Adjacent-opportunities ledger** — surviving-but-unfunded candidates,
+  measured neighbours and backlog rows are published in every report with
+  their headroom and evidence ids, with **Start follow-up research** in the
+  dashboard seeding the next run through the existing keywords mode: each
+  report funds a deeper one.
+- **External sources, mid-methodology only** — `forum_search`,
+  `google_suggest` and `goodreads_check` are allow-listed actions available
+  in Phases 4/5/6 (where Amazon-side candidates already exist) and, for
+  autonomous runs only, as a gated second wave in Phase 1 after Amazon-side
+  anchors exist. They land as ordinary `external_demand` evidence, redacted,
+  and flow through the same integrity pipeline.
+
 ## Design rules
 
 1. Every research session is isolated: all session-scoped data lives under a session ID namespace in both DB rows and filesystem paths.

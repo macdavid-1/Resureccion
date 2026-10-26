@@ -17,6 +17,7 @@ import json
 from typing import Any
 
 from app.methodology import (
+    PHASES_ALLOWING_EXTERNAL as EXTERNAL_PHASES,
     PHASE_TITLES,
     SPECS,
     PhaseTiming,
@@ -64,7 +65,22 @@ def build_system_prompt(phase: str) -> str:
         "other data are visible without signing in, capture them.\n"
         "- Convert observations into concrete, actionable judgments.\n\n"
         f"PHASE CONTRACT — allowed actions: {', '.join(spec.allowed_actions)}.\n"
-        f"Required output JSON fields: {', '.join(spec.output_contract)}.\n"
+        + (
+            "External sources (forums / Google suggestions / Goodreads): "
+            "allowed in this phase as CORROBORATION only — they enter the same "
+            "evidence table, go through redaction, claims, filters and gates, "
+            "and can never override a verdict. "
+            + (
+                "In Phase 1 they are additionally gated by the orchestrator: "
+                "autonomous runs only, and only AFTER Amazon-side anchors "
+                "exist — unanchored forum noise may not set the run's direction.\n"
+                if phase == "opportunity_discovery" else
+                "Use them where Amazon's own signal is thin (unmet-need "
+                "language, independent demand counts).\n"
+            )
+            if phase in EXTERNAL_PHASES else ""
+        )
+        + f"Required output JSON fields: {', '.join(spec.output_contract)}.\n"
         f"Phase guidance: {spec.guidance}"
     )
 
@@ -86,6 +102,11 @@ def build_user_prompt(
     owner_messages: list[str] | None = None,
     pivot_directive: str | None = None,
     phase_gate: dict[str, Any] | None = None,
+    census_digest: list[dict[str, Any]] | None = None,
+    frontier_terms: list[str] | None = None,
+    market_memory: list[dict[str, Any]] | None = None,
+    headroom_priority: list[str] | None = None,
+    adjacency_note: str = "",
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -101,6 +122,33 @@ def build_user_prompt(
     if images_note:
         brief["reference_images"] = images_note
     parts.append("SESSION BRIEF: " + _compact({k: v for k, v in brief.items() if v}))
+
+    # --- deterministic census (measured discovery input) --------------------
+    # Gather by the BACKEND before the model opines (app.census): the walk of
+    # the bestseller/new-release charts and the browse-node tree, so discovery
+    # reasons over measured demand instead of guessing where to look.
+    if census_digest:
+        parts.append(
+            "\nMARKET CENSUS (deterministic backend walk of the bestseller and "
+            "new-release charts plus the browse-node categories — measured "
+            "before this phase started; the evidence ids are stable):\n"
+            + _compact(census_digest, limit=3000)
+            + "\nUse it as your map: regions with strong demand and light "
+            "top-review barriers are where hidden markets live. Ask for more "
+            "category/chart actions to walk deeper where the census looks "
+            "promising."
+        )
+
+    # --- autocomplete frontier (demand language) ----------------------------
+    if frontier_terms:
+        parts.append(
+            "\nAUTOCOMPLETE FRONTIER (phrases real buyers actually type, mined "
+            "deterministically from Amazon's suggestion stream):\n"
+            + _compact(list(frontier_terms)[:60], limit=2400)
+            + "\nThese are demand-language seeds: a long phrase with thin "
+            "results is hidden demand in plain sight. Search the ones that "
+            "match your signals and niche them down."
+        )
 
     # --- strategic focus pivot (autonomous re-discovery) --------------------
     # Present only when the previous research pass died with zero verified
@@ -164,9 +212,35 @@ def build_user_prompt(
         + (_compact(bounded_candidates) if bounded_candidates else "[] (none yet)")
     )
 
+    # --- headroom ordering + adjacency (deterministic; orders, never rules) --
+    if headroom_priority:
+        parts.append(
+            "\nHEADROOM PRIORITY (deterministic demand÷competition score — it "
+            "only orders your work and the report; filters, gates and "
+            "verification still decide what survives):\n- "
+            + "\n- ".join(headroom_priority)
+            + "\nSpend iterations on the highest-headroom candidates first, "
+            "and keep watching for adjacent markets beside them."
+        )
+    if adjacency_note:
+        parts.append("\nADJACENCY: " + adjacency_note)
+
     if prior_phase_outputs:
         parts.append(
             "\nPRIOR PHASE DECISIONS: " + _compact(prior_phase_outputs, limit=4000)
+        )
+
+    # --- cross-session market memory ----------------------------------------
+    # One owner-scoped knowledge base accumulated over earlier runs. Fresh
+    # rows (< MEMORY_FRESH_DAYS) are measured facts to REUSE; stale rows are
+    # orientation hints that must be cheaply re-verified before being relied
+    # on — never presented in the report as current.
+    if market_memory:
+        parts.append(
+            "\nMARKET MEMORY from earlier runs (fresh = reuse as fact, no need "
+            "to re-measure; stale = cheap re-verification before relying on "
+            "it — it is a hint, not a fact):\n"
+            + _compact(market_memory, limit=3000)
         )
 
     # --- owner messages (durable mid-research guidance) ---------------------

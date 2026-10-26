@@ -706,6 +706,7 @@
         <div class="spread mt14" style="margin-bottom:10px">
           <button class="btn small ghost" id="rep-back">‹ All reports</button>
           <span class="row">
+            <span id="rep-followup"></span>
             <a class="btn small ghost" href="/api/sessions/${esc(sid)}/reports/${esc(rid)}/model" target="_blank" rel="noopener">Model</a>
             <button class="btn small primary" id="rep-pdf">Export PDF</button>
             <a class="btn small" href="/api/sessions/${esc(sid)}/reports/${esc(rid)}/file" target="_blank" rel="noopener">Download</a>
@@ -716,6 +717,7 @@
         <div class="section report-body" id="rep-body">${sections}</div></div>`;
       $("#rep-back").addEventListener("click", renderReportsView);
       $("#rep-pdf").addEventListener("click", () => exportPdf(sid, rid));
+      loadFollowupButton(sid);
       // Collapsible h2 sections for phone usability on long reports.
       $("#rep-body").querySelectorAll("h2").forEach((h) => {
         const wrap = document.createElement("div");
@@ -743,6 +745,49 @@
   }
 
   function splitReportSections(md) { return mdToHtml(md); }
+
+  // ---------- one-click follow-up (adjacent opportunities ledger) ----------
+  // The report's ledger lists demand the run discovered but did not fund.
+  // This button seeds the NEXT run from it through the existing keywords
+  // mode — each report funds a deeper one, no new session plumbing.
+  async function loadFollowupButton(sid) {
+    let ledger = [];
+    try { ledger = (await api(`/api/sessions/${sid}/adjacent`)).ledger || []; }
+    catch { return; }
+    const host = $("#rep-followup");
+    if (!host || !ledger.length) return;
+    host.innerHTML = `<button class="btn small primary" id="rep-followup-btn" title="${ledger.length} adjacent opportunity/ies were discovered but not researched">Start follow-up research</button>`;
+    $("#rep-followup-btn").addEventListener("click", () => startFollowup(sid, ledger));
+  }
+
+  async function startFollowup(sid, ledger) {
+    const pick = ledger
+      .map((r) => String(r.niche || "").trim())
+      .filter(Boolean)
+      .slice(0, 10);
+    if (!pick.length) { toast("Nothing to seed the follow-up run with"); return; }
+    const src = state.sessions.find((s) => s.id === sid);
+    const prompt =
+      "Follow-up research seeded from the report \"" + (src?.name || "previous session") +
+      "\". Deeply research these adjacent opportunities, and expand outward into " +
+      "related hidden gold mines with strong demand where competition has not arrived:\n" +
+      pick.map((n) => "- " + n).join("\n");
+    try {
+      const { session } = await api("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          mode: "keywords",
+          prompt,
+          objective: "Follow-up: adjacent opportunities not yet researched",
+          marketplaces: [],
+        }),
+      });
+      await refreshSessions();
+      await openSession(session.id, "research");
+      await sessionAction("start");
+      toast(`Follow-up research started from ${pick.length} seeded niche(s)`);
+    } catch (e) { toast(e.message); }
+  }
 
   // Authenticated file download: fetch WITH the header token, then hand the
   // browser a blob URL. A plain <a href> download depends on the HttpOnly

@@ -11,6 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -82,6 +89,59 @@ class Config:
         self.max_focus_pivots = max(0, min(3, _int_env("MAX_FOCUS_PIVOTS", 1)))
         self.heartbeat_timeout_seconds = _int_env("HEARTBEAT_TIMEOUT_SECONDS", 180)
         self.checkpoint_interval_seconds = _int_env("CHECKPOINT_INTERVAL_SECONDS", 120)
+        # Per-mode budget profiles (deterministic; see app.methodology
+        # MODE_PROFILES). Each mode shifts iteration caps between phases and
+        # the per-session model-call ceiling: a detailed brief (mode
+        # 'prompt') spends on competition/verification, an empty brief (mode
+        # 'auto') spends on discovery/niching. 0/empty = use the profile.
+        self.mode_model_calls = {
+            mode: max(0, _int_env(f"MODEL_CALLS_{mode}", 0))
+            for mode in ("prompt", "keywords", "auto")
+        }
+        # Compact per-phase override: MODE_ITERATIONS_auto=16:14:12:12:10:8:8:12:8
+        # (nine colon-separated integers in PHASE_ORDER). Empty = profile.
+        self.mode_iterations = {
+            mode: os.environ.get(f"MODE_ITERATIONS_{mode}", "").strip()
+            for mode in ("prompt", "keywords", "auto")
+        }
+
+        # --- deep-discovery layers (deterministic, model-free) ----------------
+        # Autocomplete frontier: seed -> append letters -> recursive
+        # completion mining on Amazon's real suggestion endpoint. The demand
+        # LANGUAGE buyers actually type, gathered as ordinary evidence.
+        self.frontier_enabled = _flag("FRONTIER_ENABLED", True)
+        self.frontier_max_queries = max(0, _int_env("FRONTIER_MAX_QUERIES", 240))
+        self.frontier_max_depth = max(1, min(_int_env("FRONTIER_MAX_DEPTH", 2), 4))
+        self.frontier_time_budget_seconds = max(
+            30, _int_env("FRONTIER_TIME_BUDGET_SECONDS", 420)
+        )
+        # Category census: a deterministic walk of the browse-node tree and
+        # the bestseller/new-release charts BEFORE the model opines, so
+        # discovery reasons over a measured census instead of guessing where
+        # to look. Cannot discover a category that was never visited.
+        self.census_enabled = _flag("CENSUS_ENABLED", True)
+        self.census_max_categories = max(0, _int_env("CENSUS_MAX_CATEGORIES", 12))
+        self.census_items_per_category = max(0, _int_env("CENSUS_ITEMS_PER_CATEGORY", 20))
+        self.census_max_marketplaces = max(1, _int_env("CENSUS_MAX_MARKETPLACES", 1))
+        self.census_time_budget_seconds = max(
+            60, _int_env("CENSUS_TIME_BUDGET_SECONDS", 600)
+        )
+        # Adjacency expansion: walk outward from every strong candidate
+        # (related carousels, category siblings, autocomplete of its keyword)
+        # and promote high-headroom neighbors to candidates mid-run.
+        self.adjacency_enabled = _flag("ADJACENCY_ENABLED", True)
+        self.adjacency_max_new = max(0, _int_env("ADJACENCY_MAX_NEW", 6))
+        # Neighbors below this headroom score are recorded but not promoted.
+        self.adjacency_min_whitespace = float(
+            os.environ.get("ADJACENCY_MIN_WHITESPACE", "0.55").strip() or "0.55"
+        )
+        # Cross-session market memory: verified niches, measured keyword
+        # result counts, competitors and near-misses, reused by later runs.
+        # Evidence fresher than memory_fresh_days is reused as fact; older is
+        # carried as a stale hint the model must cheaply re-verify.
+        self.memory_enabled = _flag("MEMORY_ENABLED", True)
+        self.memory_fresh_days = max(1, _int_env("MEMORY_FRESH_DAYS", 7))
+        self.memory_max_digest = max(0, _int_env("MEMORY_MAX_DIGEST", 40))
 
         # --- research model (OpenAI-compatible; DeepInfra MiMo-V2.6-Flash default)
         # MiMo-V2.6-Flash: a thinking model with native vision and 1M context.

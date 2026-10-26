@@ -106,6 +106,40 @@ to `integrity_assessments` and visible via `GET /api/sessions/{id}/integrity`
 report is delivered `PROVISIONAL` with the failures listed in the report
 itself, never silently.
 
+## Deep discovery (Stage 5)
+
+Deterministic, model-free layers that run alongside the 9-phase methodology.
+They only ORDER and ALLOCATE work (and gather measured inputs): none of them
+can override a filter, a quality gate, a KDP risk screen or the verification
+engine.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `CENSUS_ENABLED` | no | `true` | Walk the bestseller/new-release charts and the browse-node tree BEFORE Phase 1, so discovery reasons over a measured map instead of the model's imagination |
+| `CENSUS_MAX_CATEGORIES` | no | `12` | Browse nodes visited per marketplace (0 disables the census) |
+| `CENSUS_ITEMS_PER_CATEGORY` | no | `20` | Items (rank/price/rating/reviews) captured per node |
+| `CENSUS_MAX_MARKETPLACES` | no | `1` | Marketplaces censused — keep `1` on a 2-core box |
+| `CENSUS_TIME_BUDGET_SECONDS` | no | `600` | Wall-clock cap for the whole census walk |
+| `FRONTIER_ENABLED` | no | `true` | Autocomplete demand-language miner: seed → append a–z → deepen, against Amazon's real suggestion endpoint (one page load per marketplace, no login needed) |
+| `FRONTIER_MAX_QUERIES` | no | `240` | Total suggestion queries per run |
+| `FRONTIER_MAX_DEPTH` | no | `2` | Recursive deepening depth (1–4) |
+| `FRONTIER_TIME_BUDGET_SECONDS` | no | `420` | Wall-clock cap for the frontier sweep |
+| `ADJACENCY_ENABLED` | no | `true` | After competition/demand phases, walk outward from every strong candidate and promote high-headroom neighbours mid-run |
+| `ADJACENCY_MAX_NEW` | no | `6` | Neighbours promotable to candidates per adjacency round |
+| `ADJACENCY_MIN_WHITESPACE` | no | `0.55` | Measured headroom a neighbour must clear before it becomes a candidate |
+| `MEMORY_ENABLED` | no | `true` | Cross-session market memory: verified niches, measured keyword result counts, competitors, near-misses and census stats shared between runs |
+| `MEMORY_FRESH_DAYS` | no | `7` | Reuse measurements younger than this as fact; older ones are carried as stale hints the model must cheaply re-verify |
+| `MEMORY_MAX_DIGEST` | no | `40` | Memory rows handed to a single run |
+| `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | profile | Override the per-session model-call ceiling for a mode. Defaults come from the mode profile (120/140/160) and the raise is scaled down when `SESSION_HARD_TIMEOUT_HOURS` is under 12 |
+| `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | profile | Nine colon-separated integers in phase order (`16:14:12:12:10:8:8:12:8`) overriding that mode's per-phase iteration caps |
+
+External (non-Amazon) research actions — `forum_search`, `google_suggest`,
+`goodreads_check` — are not env-configurable: the allow-listed hosts live in
+`app/actions.py` (Reddit, Goodreads, Google suggestions) and the phases that
+may fire them are fixed in `app/methodology.py`. In Phase 1 they are gated to
+autonomous runs, from the second iteration onward, and only once Amazon-side
+evidence exists.
+
 ## Browser infrastructure (Stage 2)
 
 | Variable | Required | Default | Purpose |

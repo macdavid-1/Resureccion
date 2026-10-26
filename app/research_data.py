@@ -378,6 +378,23 @@ class CandidateStore:
             )
         return self.get(session_id, cand_id)  # type: ignore[return-value]
 
+    def update_meta(
+        self, session_id: str, cand_id: str, meta: dict[str, Any], *, merge: bool = True
+    ) -> Candidate:
+        """Persist derived per-candidate analysis (e.g. the whitespace score).
+
+        `merge=True` (default) shallow-merges into the existing meta so
+        concurrent writers (chain, parent_market, seed evidence) survive.
+        """
+        cand = self.require(session_id, cand_id)
+        new_meta = {**cand.meta, **meta} if merge else dict(meta)
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE candidates SET meta = ?, updated_at = ? WHERE session_id = ? AND id = ?",
+                (json.dumps(new_meta), iso_now(), session_id, cand_id),
+            )
+        return self.get(session_id, cand_id)  # type: ignore[return-value]
+
     def _row(self, row: sqlite3.Row) -> Candidate:
         return Candidate(
             id=row["id"],

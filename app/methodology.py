@@ -115,6 +115,132 @@ class PhaseSpec:
     min_output_items: int = 0
 
 
+@dataclass(frozen=True)
+class ModeBudgetProfile:
+    """Deterministic, env-tunable budget profile for one research mode.
+
+    The three starting modes do not need the same shape of research:
+    - 'prompt'   (detailed brief): scope is already known, so discovery can be
+                 short and the budget moves into competition, consumer
+                 intelligence and adversarial verification.
+    - 'keywords' (rough concepts): balanced.
+    - 'auto'     (NO topic given — the owner pressed Start Research): the run
+                 must find markets the owner did not know existed, so Phase 1
+                 and Phase 2 get the largest share and early competitive work
+                 is lighter.
+
+    Iteration caps override the per-phase spec while RUNNING (the spec value
+    stays the contract shown by /api/methodology); `extra_calls` raises the
+    per-session model-call ceiling above RunnerConfig's base, scaled by the
+    hard time budget available (see ResearchRunner._model_call_ceiling).
+    """
+
+    mode: str
+    extra_calls: int
+    iterations: dict[str, int]
+
+    def iterations_for(self, phase: str, default: int) -> int:
+        return max(1, int(self.iterations.get(phase, default)))
+
+
+# Iteration caps per mode, keyed by phase (PHASE_ORDER order). Values are a
+# deliberate rebalancing of the SAME total budget — no phase gets starved,
+# the shape of the research changes with what the owner actually supplied.
+MODE_PROFILES: dict[str, ModeBudgetProfile] = {
+    "prompt": ModeBudgetProfile(
+        mode="prompt",
+        extra_calls=0,
+        iterations={
+            P1_DISCOVERY: 8,          # the brief already scopes discovery
+            P2_NICHING: 10,
+            P3_COMPETITION: 16,       # …so depth moves downstream
+            P4_CONSUMER: 16,
+            P5_DEMAND: 10,
+            P6_GAP: 8,
+            P7_CROSS_MARKET: 8,
+            P8_ADVERSARIAL: 14,
+            P9_SYNTHESIS: 8,
+        },
+    ),
+    "keywords": ModeBudgetProfile(
+        mode="keywords",
+        extra_calls=20,
+        iterations={
+            P1_DISCOVERY: 14,
+            P2_NICHING: 13,
+            P3_COMPETITION: 14,
+            P4_CONSUMER: 14,
+            P5_DEMAND: 10,
+            P6_GAP: 8,
+            P7_CROSS_MARKET: 8,
+            P8_ADVERSARIAL: 12,
+            P9_SYNTHESIS: 8,
+        },
+    ),
+    "auto": ModeBudgetProfile(
+        mode="auto",
+        extra_calls=40,
+        iterations={
+            P1_DISCOVERY: 16,         # no topic: discovery must search wider
+            P2_NICHING: 14,           # …and niching is where candidates born
+            P3_COMPETITION: 12,       # lighter early competitive work
+            P4_CONSUMER: 12,
+            P5_DEMAND: 10,
+            P6_GAP: 8,
+            P7_CROSS_MARKET: 8,
+            P8_ADVERSARIAL: 12,
+            P9_SYNTHESIS: 8,
+        },
+    ),
+}
+
+
+def mode_profile(mode: str) -> ModeBudgetProfile:
+    """Budget profile for a session mode (unknown mode → the balanced one).
+
+    Env overrides (read per call, deterministic):
+    - MODE_ITERATIONS_<mode>=16:14:12:12:10:8:8:12:8 — nine integers in
+      PHASE_ORDER order.
+    An unparsable value is ignored (the profile default stands): a typo must
+    never stop research.
+    """
+    import os
+
+    profile = MODE_PROFILES.get(mode) or MODE_PROFILES["keywords"]
+    raw = (os.environ.get(f"MODE_ITERATIONS_{profile.mode}") or "").strip()
+    if not raw:
+        return profile
+    try:
+        values = [int(v) for v in raw.replace(",", ":").split(":")]
+    except ValueError:
+        return profile
+    if len(values) != len(PHASE_ORDER) or any(v <= 0 for v in values):
+        return profile
+    return ModeBudgetProfile(
+        mode=profile.mode,
+        extra_calls=profile.extra_calls,
+        iterations=dict(zip(PHASE_ORDER, values)),
+    )
+
+
+# External (non-Amazon) research actions. Deliberately NOT a new phase: they
+# land in the existing evidence table with stable ids and flow through the
+# normal evidence -> claims -> filters -> gates pipeline untouched. The
+# runner gates WHERE they may fire (see ResearchRunner._external_action_ok).
+EXTERNAL_ACTIONS: tuple[str, ...] = (
+    "forum_search",      # community complaint / unmet-need language
+    "google_suggest",    # un-Amazon-anchored demand phrasing
+    "goodreads_check",   # independent want-to-read / rating evidence
+)
+
+# Which phases may request them (the model-facing whitelist). P1's use is
+# additionally gated at runtime to autonomous (auto) runs AFTER Amazon-side
+# anchors exist — unanchored forum noise may never set a run's direction.
+PHASES_ALLOWING_EXTERNAL: tuple[str, ...] = (
+    P1_DISCOVERY, P4_CONSUMER, P5_DEMAND, P6_GAP,
+)
+
+
 SPECS: dict[str, PhaseSpec] = {
     P1_DISCOVERY: PhaseSpec(
         key=P1_DISCOVERY,
@@ -127,6 +253,7 @@ SPECS: dict[str, PhaseSpec] = {
             "search_marketplace", "open_category", "autocomplete",
             "bestsellers", "new_releases", "related_products",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
+            *EXTERNAL_ACTIONS,
         ),
         output_contract=(
             "signals",       # list of {topic, audience, hint, marketplace, source}
@@ -136,12 +263,21 @@ SPECS: dict[str, PhaseSpec] = {
         guidance=(
             "Generate a BROAD pool of market signals. Draw on: Amazon search "
             "results, categories, subcategories, autocomplete suggestions, "
-            "bestseller and new-release pages, competitor books, related "
-            "products, review patterns, KDSpy data, marketplace differences, "
-            "observed consumer language, recurring reader problems, "
-            "underserved audiences, and emerging topics. Be creative. Do NOT "
-            "prematurely filter — weak-looking signals may hide gems. Every "
-            "signal must name a concrete topic and audience."
+            "bestseller and new-release pages, the deterministic category "
+            "CENSUS already gathered for this run, the autocomplete FRONTIER "
+            "demand-language terms, competitor books, related products, "
+            "review patterns, KDSpy data, marketplace differences, observed "
+            "consumer language, recurring reader problems, underserved "
+            "audiences, and emerging topics. Prefer parts of the census and "
+            "frontier with strong demand signals and light competition — the "
+            "whole point is finding markets nobody is serving. Be creative. "
+            "Do NOT prematurely filter — weak-looking signals may hide gems. "
+            "Every signal must name a concrete topic and audience. When no "
+            "topic was given, let the measured census (not familiarity) "
+            "decide where to look, and expand outward from surprising "
+            "high-headroom regions. External sources (forums, Google "
+            "suggestions, Goodreads) are a SECOND wave only: use them once "
+            "Amazon-side anchors exist, never as the opening move."
         ),
     ),
     P2_NICHING: PhaseSpec(
@@ -212,7 +348,7 @@ SPECS: dict[str, PhaseSpec] = {
         produces=("discovered", "rejected"),
         allowed_actions=(
             "open_product", "read_reviews", "capture_evidence",
-            "record_observation", "wait",
+            "record_observation", "wait", "forum_search", "goodreads_check",
         ),
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
@@ -224,9 +360,13 @@ SPECS: dict[str, PhaseSpec] = {
             "readers actually wanted, what disappointed them, what they "
             "praised, missing content, confusing explanations, poor "
             "organization, insufficient depth, outdated information, audience "
-            "mismatch, and unfulfilled promises. Do NOT merely summarize: "
-            "convert each recurring complaint into a concrete book-design "
-            "opportunity."
+            "mismatch, and unfulfilled promises. Where Amazon reviews are "
+            "thin or absent (often true in the hidden niches), community "
+            "threads and Goodreads carry the same signal — request "
+            "forum_search / goodreads_check for the candidate's audience and "
+            "language; whether a source is worth mining is YOUR judgment, not "
+            "the backend's. Do NOT merely summarize: convert each recurring "
+            "complaint into a concrete book-design opportunity."
         ),
     ),
     P5_DEMAND: PhaseSpec(
@@ -239,6 +379,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "kdspy_data",
             "open_product", "capture_evidence", "record_observation", "wait",
+            *EXTERNAL_ACTIONS,
         ),
         output_contract=(
             "demand_assessments",  # list of {niche, verdict, signals[], risks[]}
@@ -269,7 +410,7 @@ SPECS: dict[str, PhaseSpec] = {
         produces=("discovered", "rejected"),
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
-            "capture_evidence", "record_observation", "wait",
+            "capture_evidence", "record_observation", "wait", "forum_search",
         ),
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
@@ -573,4 +714,13 @@ class Methodology:
                 for p in (SPECS[p],)
             ],
             "opportunity_contract": list(OPPORTUNITY_FIELDS),
+            "external_actions": list(EXTERNAL_ACTIONS),
+            "phases_allowing_external": list(PHASES_ALLOWING_EXTERNAL),
+            "mode_budget_profiles": {
+                mode: {
+                    "extra_model_calls": p.extra_calls,
+                    "phase_iterations": dict(p.iterations),
+                }
+                for mode, p in MODE_PROFILES.items()
+            },
         }
