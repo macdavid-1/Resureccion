@@ -65,6 +65,9 @@ from app.model_client import (
     ModelConfigError,
     ModelContractError,
     ModelError,
+    ModelReply,
+    ModelUsage,
+    _extract_json,
 )
 from app.prompts import build_system_prompt, build_user_prompt
 from app.recovery import CheckpointStore, ErrorStateStore
@@ -104,6 +107,14 @@ from app.trace import (
 )
 from app.verification import VerificationEngine, evidence_for_candidate
 from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
+
+
+# Extra corrective retries per model iteration when the reply violates the
+# phase's output contract (missing required top-level fields). The retry
+# restates the contract explicitly; whatever JSON the model still produced
+# after the retries is salvaged and flows through the normal gate machinery.
+# A missing field is a degraded iteration — research NEVER pauses for it.
+_CONTRACT_REPAIR_ATTEMPTS = 1
 
 
 @asynccontextmanager
@@ -442,9 +453,34 @@ class ResearchRunner:
             # (deep research + niche-down + adversarial verification + the
             # integrity pipeline) leaves ZERO verified candidates, discovery
             # re-enters on a fresh focus, bounded by config.max_focus_pivots.
-            phase_outputs: dict[str, Any] = {}
             timings = self._timings_for(session_id)
-            pivot_round = 0
+            # Durable resume cursor. The pivot count is restored from the
+            # 'focus_pivots' checkpoint so the pivot budget survives
+            # restarts, and every phase committed in the CURRENT pass is
+            # reused from its 'phase_output' checkpoint: a resumed session
+            # continues at the first incomplete phase — it never re-runs
+            # the methodology from Phase 1.
+            pivot_round = self._pivot_rounds(session_id)
+            phase_outputs: dict[str, Any] = {}
+            completed_phases: set[str] = set()
+            for phase in PHASE_ORDER:
+                prior_out = self._load_phase_output(session_id, phase, pivot_round)
+                if prior_out is not None:
+                    phase_outputs[phase] = prior_out
+                    completed_phases.add(phase)
+            if completed_phases:
+                self.events.append(
+                    session_id, level="info", actor="agent",
+                    action="research_resumed_from_checkpoints",
+                    detail={"completed_phases": sorted(completed_phases),
+                            "pass": pivot_round},
+                )
+                self.trace.record(
+                    session_id, KIND_PHASE,
+                    f"Resuming research: reusing {len(completed_phases)} completed "
+                    f"phase(s) from durable checkpoints and continuing at the first "
+                    f"incomplete phase — nothing researched is lost",
+                )
             while True:
                 completed_all_phases = True
                 for phase in PHASE_ORDER:
@@ -457,6 +493,28 @@ class ResearchRunner:
                         self.events.append(session_id, level="info", actor="system", action="paused_by_owner", detail={"phase": phase})
                         self.trace.record(session_id, KIND_PHASE, f"Paused by owner before {PHASE_TITLES.get(phase, phase)}")
                         return
+                    if phase in completed_phases:
+                        # Completed before the interrupt: REUSED, never
+                        # re-run. Exception: Phase 8's deterministic
+                        # post-phase work has its own durable marker — if
+                        # the interrupt hit between the phase commit and
+                        # that work, run it now before skipping onward.
+                        if phase == P8_ADVERSARIAL and not self._post_p8_done(session_id):
+                            if self._post_adversarial(
+                                session_id, session, phase_outputs,
+                                pivot_round, session_started,
+                            ):
+                                pivot_round += 1
+                                phase_outputs = {}
+                                completed_phases = set()
+                                completed_all_phases = False
+                                break
+                        else:
+                            self._bump_progress(
+                                session_id,
+                                (PHASE_ORDER.index(phase) + 1) / len(PHASE_ORDER),
+                            )
+                        continue
                     # Show the phase that is RUNNING now: the row starts at
                     # 'initializing' and previously only advanced AFTER a
                     # phase finished, so the whole first phase displayed as
@@ -488,7 +546,8 @@ class ResearchRunner:
                             )
                     self.checkpoints.save(
                         session_id, f"phase_complete:{phase}",
-                        {"completed_at": iso_now(), "output_keys": sorted(output.keys())},
+                        {"completed_at": iso_now(), "output_keys": sorted(output.keys()),
+                         "pass": pivot_round},
                     )
                     timings.finish(f"phase:{phase}", outcome="ok")
                     if self.supervisor is not None:
@@ -504,24 +563,14 @@ class ResearchRunner:
                     # integrity pipeline filters and verifies every synthesis-bound
                     # candidate BEFORE synthesis may run.
                     if phase == P8_ADVERSARIAL:
-                        self.trace.record(
-                            session_id, KIND_VERIFICATION,
-                            "Running the deterministic integrity pipeline: filters and "
-                            "verification decide which candidates may reach synthesis",
-                        )
-                        self._run_integrity_pipeline(session_id, phase_outputs)
-                        # Cross-session market memory: everything this pass
-                        # measured (verified niches, near-misses, keyword
-                        # numbers, competitors, census stats) is distilled
-                        # into the owner-scoped knowledge base so later runs
-                        # reuse it. Best-effort: memory never breaks research.
-                        self._harvest_memory(session_id)
-                        # Strategic focus pivot gate: the pass above was deep
-                        # and adversarial, and NOTHING survived it. When the
-                        # session can still afford a full pass, restart
-                        # discovery on a new focus with the failure on record.
-                        if self._maybe_strategic_pivot(
-                            session_id, session, pivot_round, session_started
+                        # Post-phase deterministic work (integrity pipeline,
+                        # market memory harvest, strategic pivot gate). It
+                        # has its own durable completion marker so a resume
+                        # can run it exactly once — or catch it up when the
+                        # interrupt hit between phase commit and this work.
+                        if self._post_adversarial(
+                            session_id, session, phase_outputs,
+                            pivot_round, session_started,
                         ):
                             pivot_round += 1
                             # The new pass analyzes from scratch: the dead
@@ -530,6 +579,7 @@ class ResearchRunner:
                             # candidate ledger, events, trace, and the
                             # 'focus_pivots' checkpoint.
                             phase_outputs = {}
+                            completed_phases = set()
                             completed_all_phases = False
                             break
                 if completed_all_phases:
@@ -613,6 +663,30 @@ class ResearchRunner:
         # budget exit so the model's work is never thrown away.
         best_output: dict[str, Any] | None = None
         iteration = 0
+        # Durable mid-phase resume. Every completed iteration checkpoints
+        # (iteration, stall, best output) for the CURRENT pass, so a paused,
+        # crashed or restarted session continues this phase exactly where it
+        # stopped — never from iteration 1 and never losing the analysis it
+        # had already produced.
+        current_pass = self._pivot_rounds(session_id)
+        progress = self._load_phase_progress(session_id, phase, current_pass)
+        start_iteration = int(progress.get("iteration") or 0)
+        if progress:
+            stall = int(progress.get("stall") or 0)
+            saved_best = progress.get("best_output")
+            if isinstance(saved_best, dict) and saved_best:
+                best_output = saved_best
+        else:
+            # Bootstrap for a session paused by a build that pre-dates the
+            # per-iteration checkpoint: the owner-pause record carries the
+            # phase + iteration where the run stopped.
+            try:
+                paused = self.checkpoints.get_safe(session_id, "paused:owner")
+                if paused is not None and (paused.payload or {}).get("phase") == phase:
+                    start_iteration = int((paused.payload or {}).get("iteration") or 0)
+            except Exception:
+                pass
+        iteration = start_iteration
         # Deterministic deep-discovery inputs for this phase's prompts
         # (census, frontier, market memory, headroom ordering, adjacency).
         discovery = self._discovery_digest(session_id, prior_outputs)
@@ -621,7 +695,7 @@ class ResearchRunner:
         # to the model for the WHOLE phase (a text note alone cannot steer).
         ref_images = self._reference_images(session_id)
         has_images = bool(ref_images) or self._has_images(session_id)
-        for iteration in range(1, max_iter + 1):
+        for iteration in range(start_iteration + 1, max_iter + 1):
             if self._cancelled:
                 raise _Cancelled()
             if self._pause_requested:
@@ -715,36 +789,82 @@ class ResearchRunner:
             # Per-call stuck detection: a hung model call is aborted at the
             # type-specific hard timeout and treated as a failed iteration
             # (retry budget), never a hung session.
-            call_key = f"model:{phase}:{iteration}"
-            timings.start(call_key, TaskType.MODEL_CALL)
-            try:
-                # Hold the browser's egress path open for the whole call.
-                # Nothing loads while the model thinks, so the connection to
-                # the current host idles; a middlebox (CONNECT/WARP bridge)
-                # can reap it mid-call and the next navigation then hangs
-                # instead of failing fast. Duck-typed for test doubles.
-                keepalive = getattr(self.browser, "keepalive_during", None) or _noop_keepalive
-                async with keepalive():
-                    reply = await self.model.call(
-                        session_id, system=system, user=user,
-                        expect_fields=spec.output_contract,
-                        screenshot_png=screenshot_png,
-                        reference_images=ref_images,
-                    )
-                timings.finish(call_key, outcome="ok")
-            except asyncio.CancelledError:
-                timings.abandon(call_key, outcome="cancelled")
-                raise
-            except BaseException:
-                timings.finish(call_key, outcome="failed")
-                raise
-            finally:
-                verdict = timings.check(call_key)
-                if verdict.hard_stuck:
+            # One model iteration, with contract repair. A reply that
+            # violates the output contract (missing required top-level
+            # fields, e.g. 'niches') gets ONE corrective retry that restates
+            # the contract explicitly; if it still violates, whatever JSON
+            # the model did produce is salvaged and fed through the normal
+            # gate machinery below (missing fields keep the phase open; the
+            # stall limiter forces it with its best output). A missing field
+            # is a degraded iteration — research NEVER pauses for it.
+            reply: ModelReply | None = None
+            call_user = user
+            for contract_attempt in range(1, _CONTRACT_REPAIR_ATTEMPTS + 2):
+                call_key = f"model:{phase}:{iteration}:{contract_attempt}"
+                timings.start(call_key, TaskType.MODEL_CALL)
+                try:
+                    # Hold the browser's egress path open for the whole call.
+                    # Nothing loads while the model thinks, so the connection to
+                    # the current host idles; a middlebox (CONNECT/WARP bridge)
+                    # can reap it mid-call and the next navigation then hangs
+                    # instead of failing fast. Duck-typed for test doubles.
+                    keepalive = getattr(self.browser, "keepalive_during", None) or _noop_keepalive
+                    async with keepalive():
+                        reply = await self.model.call(
+                            session_id, system=system, user=call_user,
+                            expect_fields=spec.output_contract,
+                            screenshot_png=screenshot_png,
+                            reference_images=ref_images,
+                        )
+                    timings.finish(call_key, outcome="ok")
+                    break
+                except asyncio.CancelledError:
+                    timings.abandon(call_key, outcome="cancelled")
+                    raise
+                except ModelContractError as exc:
+                    timings.finish(call_key, outcome="contract")
+                    missing = [str(f) for f in getattr(exc, "missing", []) or []]
                     self.events.append(
-                        session_id, level="warn", actor="agent",
-                        action="model_call_hard_timeout", detail=verdict.to_dict(),
+                        session_id, level="warn", actor="model",
+                        action="model_contract_violation",
+                        detail={"phase": phase, "missing": missing,
+                                "attempt": contract_attempt},
                     )
+                    self.errors.record(
+                        session_id, scope=f"model_contract:{phase}",
+                        severity="warning",
+                        message=f"model output missing fields: {missing}",
+                        recoverable=True,
+                    )
+                    if contract_attempt > _CONTRACT_REPAIR_ATTEMPTS:
+                        reply = self._salvage_contract_reply(session_id, exc)
+                        break
+                    # Corrective retry: restate the violated contract so the
+                    # model sees exactly which fields it must emit this time.
+                    call_user = (
+                        f"{user}\n\nCRITICAL — OUTPUT CONTRACT: your previous reply "
+                        f"was rejected because its JSON was missing required "
+                        f"top-level field(s): {', '.join(missing) or '(unparseable)'}. "
+                        f"Emit ONE JSON object containing EVERY required field of "
+                        f"this phase's contract: {', '.join(spec.output_contract)}."
+                    )
+                    self._bump_model_calls(session_id)  # the retry is a real call
+                    continue
+                except BaseException:
+                    timings.finish(call_key, outcome="failed")
+                    raise
+                finally:
+                    verdict = timings.check(call_key)
+                    if verdict.hard_stuck:
+                        self.events.append(
+                            session_id, level="warn", actor="agent",
+                            action="model_call_hard_timeout", detail=verdict.to_dict(),
+                        )
+            if reply is None:
+                # Not even salvageable JSON: a failed iteration. The stall
+                # limiter forces the phase open with whatever best output it
+                # has; the session keeps running — it never pauses here.
+                continue
             # Durable per-run token/cost accounting (exposed on the session).
             self._record_model_usage(session_id, reply)
             if reply.elapsed_seconds and reply.elapsed_seconds >= 150:
@@ -852,6 +972,13 @@ class ResearchRunner:
             last_counts = counts
             stall = 0 if progressed else stall + 1
             timing.attempts_since_progress = stall
+            # Durable mid-phase cursor, written every iteration BEFORE the
+            # gate decides: any pause, crash or restart from this point on
+            # resumes the phase exactly here, with the best analysis so far.
+            self._save_phase_progress(
+                session_id, phase, iteration=iteration, stall=stall,
+                best_output=best_output, current_pass=current_pass,
+            )
 
             # EXPLORE vs COMMIT. A reply that requested actions is an explore
             # step: the actions run first and the phase continues with fresh
@@ -875,8 +1002,14 @@ class ResearchRunner:
                     session_id, f"phase_output:{phase}",
                     {"output": reply.content, "model": reply.model,
                      "iterations": iteration, "commit": "clean",
-                     "evidence_new": phase_new_evidence, "at": iso_now()},
+                     "evidence_new": phase_new_evidence, "at": iso_now(),
+                     "pass": current_pass},
                 )
+                # The phase is committed: the mid-phase cursor retires.
+                try:
+                    self.checkpoints.delete(session_id, f"phase_progress:{phase}")
+                except Exception:
+                    pass
                 self.events.append(
                     session_id, level="info", actor="agent", action="phase_completed",
                     detail={"phase": phase, "iterations": iteration,
@@ -916,8 +1049,12 @@ class ResearchRunner:
         self.checkpoints.save(
             session_id, f"phase_output:{phase}",
             {"output": best_output, "iterations": iteration,
-             "commit": "forced", "at": iso_now()},
+             "commit": "forced", "at": iso_now(), "pass": current_pass},
         )
+        try:
+            self.checkpoints.delete(session_id, f"phase_progress:{phase}")
+        except Exception:
+            pass
         self.events.append(
             session_id, level="warn", actor="agent", action="phase_completed_from_budget",
             detail={"phase": phase, "iterations": iteration,
@@ -926,6 +1063,41 @@ class ResearchRunner:
         )
         self._apply_phase_effects(session_id, phase, best_output)
         return best_output
+
+    def _salvage_contract_reply(
+        self, session_id: str, exc: Exception
+    ) -> ModelReply | None:
+        """Recover the JSON a contract-violating reply DID contain.
+
+        A partial analysis is memory: it flows through the phase gates like
+        any other reply (the missing fields simply keep the phase open) and
+        can become the phase's forced contribution. Only unparseable
+        garbage is discarded — and even then research continues; it never
+        pauses for a model output defect.
+        """
+        raw = str(getattr(exc, "raw", "") or "")
+        try:
+            content = _extract_json(raw)
+        except Exception:
+            content = {}
+        if not isinstance(content, dict) or not content:
+            self.events.append(
+                session_id, level="warn", actor="model",
+                action="model_contract_unsalvageable", detail={},
+            )
+            return None
+        self.events.append(
+            session_id, level="info", actor="model",
+            action="model_contract_salvaged",
+            detail={"fields": sorted(str(k) for k in content)[:20]},
+        )
+        usage = getattr(self.model, "usage", None)
+        return ModelReply(
+            content=content, raw=raw,
+            usage=usage if isinstance(usage, ModelUsage) else ModelUsage(),
+            model=str(getattr(self.model, "_model", "") or ""),
+            elapsed_seconds=0.0,
+        )
 
     # ------------------------------------------------------------ phase effects
     def _apply_phase_effects(self, session_id: str, phase: str, output: dict[str, Any]) -> None:
@@ -1764,6 +1936,113 @@ class ResearchRunner:
             session_id, level="info", actor="agent", action="integrity_pipeline_completed",
             detail={"accepted": accepted, "downgraded": downgraded, "rejected": rejected},
         )
+
+    # ------------------------------------- durable resume cursor helpers
+    def _pivot_rounds(self, session_id: str) -> int:
+        """Strategic focus pivots already taken (durable — restored across
+        restarts so the pivot budget never resets)."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "focus_pivots")
+            pivots = (cp.payload or {}).get("pivots") if cp else None
+            return len(pivots) if isinstance(pivots, list) else 0
+        except Exception:
+            return 0
+
+    def _load_phase_output(
+        self, session_id: str, phase: str, current_pass: int
+    ) -> dict[str, Any] | None:
+        """The phase's committed output from an earlier run of the SAME pass.
+
+        This is the durable resume cursor between phases: an interrupted
+        session reuses every phase it already committed and continues at the
+        first incomplete phase instead of re-running the methodology from
+        Phase 1. Checkpoints from a previous pass (before a focus pivot) are
+        ignored — the new pass must not inherit the dead focus's decisions.
+        """
+        try:
+            cp = self.checkpoints.get_safe(session_id, f"phase_output:{phase}")
+        except Exception:
+            return None
+        if cp is None:
+            return None
+        payload = cp.payload or {}
+        if int(payload.get("pass") or 0) != current_pass:
+            return None
+        out = payload.get("output")
+        return out if isinstance(out, dict) and out else None
+
+    def _load_phase_progress(
+        self, session_id: str, phase: str, current_pass: int
+    ) -> dict[str, Any]:
+        """The phase's mid-phase cursor (last completed iteration, stall
+        count, best output so far) for the CURRENT pass."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, f"phase_progress:{phase}")
+        except Exception:
+            return {}
+        payload = dict(cp.payload) if cp else {}
+        if int(payload.get("pass") or 0) != current_pass:
+            return {}
+        return payload
+
+    def _save_phase_progress(
+        self, session_id: str, phase: str, *, iteration: int,
+        stall: int, best_output: dict[str, Any] | None, current_pass: int,
+    ) -> None:
+        """Checkpoint the mid-phase resume cursor. Accounting-only: any
+        failure is swallowed; research never waits on it."""
+        try:
+            self.checkpoints.save(
+                session_id, f"phase_progress:{phase}",
+                {"pass": current_pass, "iteration": iteration, "stall": stall,
+                 "best_output": best_output, "at": iso_now()},
+            )
+        except Exception:
+            pass
+
+    def _post_p8_done(self, session_id: str) -> bool:
+        """Whether Phase 8's deterministic post-phase work (integrity
+        pipeline + market-memory harvest + pivot gate) finished for the
+        current pass — durable, so an interrupt between the phase commit
+        and that work is caught up on resume instead of skipped."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "post_p8")
+            return bool((cp.payload or {}).get("done")) if cp else False
+        except Exception:
+            return False
+
+    def _post_adversarial(
+        self, session_id: str, session: Any,
+        phase_outputs: dict[str, Any], pivot_round: int, session_started: float,
+    ) -> bool:
+        """Deterministic post-Phase-8 work. Returns True when a strategic
+        focus pivot should restart the pass (its own durable record)."""
+        self.trace.record(
+            session_id, KIND_VERIFICATION,
+            "Running the deterministic integrity pipeline: filters and "
+            "verification decide which candidates may reach synthesis",
+        )
+        self._run_integrity_pipeline(session_id, phase_outputs)
+        # Cross-session market memory: everything this pass measured
+        # (verified niches, near-misses, keyword numbers, competitors,
+        # census stats) is distilled into the owner-scoped knowledge base
+        # so later runs reuse it. Best-effort: memory never breaks research.
+        self._harvest_memory(session_id)
+        # Strategic focus pivot gate: when a full deep pass leaves ZERO
+        # verified candidates and the session can still afford a full pass,
+        # restart discovery on a new focus with the failure on record.
+        if self._maybe_strategic_pivot(
+            session_id, session, pivot_round, session_started
+        ):
+            return True
+        try:
+            self.checkpoints.save(
+                session_id, "post_p8",
+                {"done": True, "pass": self._pivot_rounds(session_id), "at": iso_now()},
+            )
+        except Exception:
+            pass  # marker is best-effort; the pipeline result itself is durable
+        return False
 
     # ---------------------------------------------------- strategic pivot
     def _maybe_strategic_pivot(
