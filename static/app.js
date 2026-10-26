@@ -170,6 +170,7 @@
     state.traceAfter = 0;
     state.lastRefresh = 0;
     $("#ws-trace").innerHTML = "";
+    $("#ws-now").hidden = true;
     $("#owner-msg-input").value = "";
     $("#owner-msg-hint").hidden = true;
     $("#start-pane").classList.add("hidden");
@@ -183,6 +184,11 @@
     // Terminal sessions have nothing new to stream; skip the connection.
     if (!["completed", "failed", "cancelled"].includes(session.status)) connectStream(id);
     else state.lastRefresh = Date.now();
+    // History first: SSE only carries entries produced WHILE connected, so
+    // the feed (and the reasoning strip) are seeded from the durable trace.
+    void loadTrace(id);
+    // Research that is actually moving shows its browser frames immediately.
+    setLiveView(["running", "queued", "paused", "interrupted"].includes(session.status));
     try {
       const [cands, opps] = await Promise.all([
         api(`/api/sessions/${id}/candidates`),
@@ -335,33 +341,9 @@
     updateWsHead(state.current);
     renderCounts(snap.counts || state.current.counts);
     // Trace: incremental append only — never re-render the whole feed.
-    if (snap.trace?.length) {
-      const feed = $("#ws-trace");
-      const frag = document.createDocumentFragment();
-      for (const t of snap.trace) {
-        if (state.ws.trace.has(t.id)) continue;
-        state.ws.trace.set(t.id, t);
-        const div = document.createElement("div");
-        div.className = `trace-item ${esc(t.kind)}`;
-        div.innerHTML = `<div class="trace-t">${esc(fmtClock(t.created_at))}</div>
-          <div class="trace-x"><span class="k">${esc(t.kind)}</span>${esc(t.text)}</div>`;
-        frag.appendChild(div);
-      }
-      if (frag.childNodes.length) {
-        feed.appendChild(frag);
-        $("#ws-trace-empty").hidden = true;
-        // Bound the feed in DOM and in the dedup map (6h sessions).
-        while (feed.children.length > 120) feed.removeChild(feed.firstChild);
-        if (state.ws.trace.size > 400) {
-          const excess = state.ws.trace.size - 400;
-          let dropped = 0;
-          for (const key of state.ws.trace.keys()) {
-            if (dropped++ >= excess) break;
-            state.ws.trace.delete(key);
-          }
-        }
-        if (nearBottom(feed.parentElement)) feed.parentElement.scrollTop = feed.parentElement.scrollHeight;
-      }
+    if (snap.trace?.length) appendTrace(snap.trace);
+    if (["completed", "failed", "cancelled"].includes(s.status) && state.liveTimer) {
+      clearInterval(state.liveTimer); state.liveTimer = null;  // keep last frame, stop polling
     }
     if (snap.recent_errors?.length) {
       state.ws.errors = snap.recent_errors;
@@ -395,6 +377,61 @@
   }
 
   function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
+
+  async function loadTrace(id) {
+    try {
+      const { trace } = await api(`/api/sessions/${id}/activity?limit=50`);
+      appendTrace(trace);
+    } catch {}
+  }
+
+  // Shared by the SSE stream and the initial history load. Appends new rows
+  // and lifts the agent's newest operational note into the reasoning strip.
+  function appendTrace(entries) {
+    if (!entries?.length) return;
+    const feed = $("#ws-trace");
+    const frag = document.createDocumentFragment();
+    let lastNote = null;
+    for (const t of entries) {
+      if (state.ws.trace.has(t.id)) continue;
+      state.ws.trace.set(t.id, t);
+      const div = document.createElement("div");
+      div.className = `trace-item ${esc(t.kind)}`;
+      div.innerHTML = `<div class="trace-t">${esc(fmtClock(t.created_at))}</div>
+        <div class="trace-x"><span class="k">${esc(t.kind)}</span>${esc(t.text)}</div>`;
+      frag.appendChild(div);
+      // The reasoning summary: the per-iteration activity_note (tagged by the
+      // runner), falling back to any discovery line for older rows.
+      if (t.kind === "discovery" || t.detail?.source === "activity_note") lastNote = t;
+    }
+    if (frag.childNodes.length) {
+      feed.appendChild(frag);
+      $("#ws-trace-empty").hidden = true;
+      // Bound the feed in DOM and in the dedup map (6h sessions).
+      while (feed.children.length > 120) feed.removeChild(feed.firstChild);
+      if (state.ws.trace.size > 400) {
+        const excess = state.ws.trace.size - 400;
+        let dropped = 0;
+        for (const key of state.ws.trace.keys()) {
+          if (dropped++ >= excess) break;
+          state.ws.trace.delete(key);
+        }
+      }
+      if (nearBottom(feed.parentElement)) feed.parentElement.scrollTop = feed.parentElement.scrollHeight;
+    }
+    if (lastNote) showNowNote(lastNote);
+  }
+
+  // The "agent now" strip. The pulse only runs while research is actually
+  // moving, so a stopped session never fakes liveness.
+  function showNowNote(t) {
+    const box = $("#ws-now");
+    if (!box) return;
+    $("#ws-now-text").textContent = t.text;
+    $("#ws-now-label").textContent = "Agent now · " + fmtClock(t.created_at);
+    box.hidden = false;
+    box.classList.toggle("stale", !["running", "queued"].includes(state.current?.status || ""));
+  }
 
   async function refreshFindings(id) {
     try {
@@ -459,19 +496,27 @@
   }
 
   // ---------- live view (browser frames) ----------
-  function toggleLiveView() {
+  // setLiveView owns the frame loop; the toggle button is just its inverse,
+  // and opening a session that is actually researching turns it ON by default
+  // — watching must not depend on finding a button.
+  function setLiveView(on) {
     const img = $("#lv-img"), off = $("#lv-off"), btn = $("#lv-toggle");
-    if (img.classList.contains("hidden")) {
-      img.classList.remove("hidden"); off.classList.add("hidden");
-      btn.textContent = "Hide live view";
+    if (on) {
+      if (img.classList.contains("hidden")) {
+        img.classList.remove("hidden"); off.classList.add("hidden");
+        btn.textContent = "Hide live view";
+      }
       loadLiveFrame();
       if (!state.liveTimer) state.liveTimer = setInterval(loadLiveFrame, 2500);
     } else {
-      img.classList.add("hidden"); off.classList.remove("hidden");
-      btn.textContent = "Show live view";
+      if (!img.classList.contains("hidden")) {
+        img.classList.add("hidden"); off.classList.remove("hidden");
+        btn.textContent = "Show live view";
+      }
       clearInterval(state.liveTimer); state.liveTimer = null;
     }
   }
+  function toggleLiveView() { setLiveView($("#lv-img").classList.contains("hidden")); }
   async function loadLiveFrame() {
     const id = state.current?.id;
     if (!id) return;
@@ -699,6 +744,28 @@
 
   function splitReportSections(md) { return mdToHtml(md); }
 
+  // Authenticated file download: fetch WITH the header token, then hand the
+  // browser a blob URL. A plain <a href> download depends on the HttpOnly
+  // cookie being present AND on the browser honouring `download` for a
+  // programmatic click — on a phone that silently does nothing, which is how
+  // "export" can report success while no file ever arrives.
+  async function downloadArtifact(url, filename) {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail ?? detail; } catch {}
+      throw new Error(detail);
+    }
+    const href = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = filename || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 60000);
+  }
+
   async function exportAllPdf(sid, btn) {
     // Default: every report of this session in ONE combined PDF. Ticking
     // "separate" opts into one PDF per report.
@@ -712,12 +779,10 @@
         body: JSON.stringify({ separate }),
       });
       for (const p of res.pdfs || []) {
-        const a = document.createElement("a");
-        a.href = `/api/sessions/${sid}/artifacts/${p.pdf.id}/file`;
-        a.download = p.pdf.path ? p.pdf.path.split("/").pop() : "report.pdf";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+        await downloadArtifact(
+          `/api/sessions/${sid}/artifacts/${p.pdf.id}/file`,
+          p.pdf.path ? p.pdf.path.split("/").pop() : "report.pdf",
+        );
       }
       toast(separate
         ? `${(res.pdfs || []).length} PDF(s) exported — one per report`
@@ -737,13 +802,11 @@
     btn.innerHTML = '<span class="spinner"></span> Rendering…';
     try {
       const res = await api(`/api/sessions/${sid}/reports/${rid}/export-pdf`, { method: "POST" });
-      const a = document.createElement("a");
-      a.href = `/api/sessions/${sid}/artifacts/${res.pdf.id}/file`;
-      a.download = res.pdf.path ? res.pdf.path.split("/").pop() : "report.pdf";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      toast("PDF exported — 6×9 report saved to session artifacts");
+      await downloadArtifact(
+        `/api/sessions/${sid}/artifacts/${res.pdf.id}/file`,
+        res.pdf.path ? res.pdf.path.split("/").pop() : "report.pdf",
+      );
+      toast("PDF exported — 6×9 report saved to your device");
     } catch (e) {
       toast(e.message);
     } finally {
@@ -1115,6 +1178,11 @@
     // legacy click/touchend pair that double-fired and raced a 30ms de-dupe.
     // Any real movement (swipe, pan, pinch) is NOT a tap: never turn the
     // end of a gesture into a stray click on the page.
+    // DECLARED HERE, before every reader/writer: an undeclared assignment
+    // throws ReferenceError under this file's "use strict", which killed the
+    // pointerup handler (taps did nothing) AND aborted rbBind() itself, taking
+    // the touch gestures and everything bound after it down with it.
+    let gestureMoved = false;
     let downX = 0, downY = 0;
     img.addEventListener("pointerdown", (e) => {
       if (!e.isPrimary) return;
@@ -1158,7 +1226,7 @@
     // two-finger pinch → zoom around the pinch midpoint.
     let touchY = null, touchX = null, lastScrollAt = 0, pendingDy = 0;
     let pinch = null;
-    gestureMoved = false;
+    gestureMoved = false;  // (declared above — reset for the touch path)
     img.addEventListener("touchstart", (e) => {
       gestureMoved = false;
       if (e.touches.length === 2) {

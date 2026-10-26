@@ -313,6 +313,27 @@ select { appearance: none; }
 .trace-item.pivot .k, .trace-item.recovery .k { color: var(--danger); }
 .trace-item.report .k { color: var(--accent-bright); }
 
+/* reasoning summary — the agent's current one-line operational note */
+.ws-now {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 9px 14px 10px; border-bottom: 1px solid var(--line);
+  background: var(--bg-raise);
+}
+.ws-now[hidden] { display: none; }
+.ws-now-dot {
+  flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); margin-top: 6px;
+  animation: ws-pulse 1.6s ease-in-out infinite;
+}
+.ws-now.stale .ws-now-dot { background: var(--text-3); animation: none; opacity: 0.7; }
+.ws-now-label {
+  flex: 0 0 auto; font-size: 0.64rem; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--text-3); margin-top: 3px;
+  white-space: nowrap;
+}
+.ws-now-text { font-size: 0.85rem; line-height: 1.45; color: var(--text); min-width: 0; }
+@keyframes ws-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
 /* live view */
 .liveview-wrap { position: relative; background: var(--bg-raise); border-bottom: 1px solid var(--line); }
 .liveview-wrap img { display: block; width: 100%; max-height: 46vh; object-fit: contain; }
@@ -571,6 +592,7 @@ textarea:focus-visible, select:focus-visible, summary:focus-visible {
   .chip.pulse .dot, .rec-badge .dot, .record-btn.recording .dot { animation: none; }
   .skeleton::after { animation: none; }
   .trace-item { animation: none; }
+  .ws-now-dot { animation: none; }
   .rb-tap { animation-duration: 1ms; opacity: 0; }
   .btn, .progress i { transition: none; }
   .spinner { animation-duration: 1.6s; }

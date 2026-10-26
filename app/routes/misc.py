@@ -1,11 +1,13 @@
 """Routes for events, uploads, artifacts, reports, exports."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.exports import ExportError
 from app.reports import ReportError
@@ -52,6 +54,62 @@ def _st(request: Request) -> Any:
 def _session_or_404(request: Request, session_id: str) -> None:
     if _st(request).sessions.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
+
+
+def _report_model(request: Request, session_id: str, rep: Any) -> dict[str, Any]:
+    """The report's structured model, rebuilt from durable state if missing.
+
+    The report body is a RENDERING of durable research state, so a missing or
+    half-written `.model.json` (an interrupted save, a pruned file) must never
+    make a finished report un-exportable — the phase outputs, candidates,
+    verifications and evidence are all still in the database. A session with
+    no research state to render keeps the original 404.
+    """
+    st = _st(request)
+    model = st.reports.read_model_json(rep)
+    if model:
+        return model
+    if not (
+        st.candidates.list(session_id, limit=1)
+        or st.opportunities.list(session_id, limit=1)
+    ):
+        raise HTTPException(status_code=404, detail="no structured model stored for this report")
+
+    from app.methodology import PHASE_ORDER
+    from app.report_model import build_report_model
+
+    outputs: dict[str, Any] = {}
+    for phase in PHASE_ORDER:
+        cp = st.checkpoints.get(session_id, f"phase_output:{phase}")
+        if cp is not None:
+            outputs[phase] = (cp.payload or {}).get("output") or {}
+    pivots_cp = st.checkpoints.get(session_id, "focus_pivots")
+    pivots = [
+        {k: v for k, v in p.items() if k != "directive"}
+        for p in ((pivots_cp.payload or {}).get("pivots") or [])
+        if isinstance(p, dict)
+    ] if pivots_cp else []
+    rebuilt = build_report_model(
+        session_id,
+        sessions=st.sessions,
+        candidates=st.candidates,
+        opportunities=st.opportunities,
+        verifications=st.verifications,
+        claims=st.claims,
+        browser_evidence=st.browser_evidence,
+        observations=st.observations,
+        assessments=st.integrity,
+        phase_outputs=outputs,
+        focus_pivots=pivots,
+    ).to_dict()
+    # Persist the rebuild so the next export (and re-render) reads it back.
+    try:
+        st.reports.save_model_json(
+            session_id, report=rep, model_json=json.dumps(rebuilt)
+        )
+    except Exception:
+        pass  # the rebuild itself is what matters; persistence is additive
+    return rebuilt
 
 
 # ------------------------------------------------------------- methodology
@@ -304,14 +362,17 @@ async def export_report_pdf(session_id: str, report_id: str, request: Request) -
     rep = st.reports.get(session_id, report_id)
     if rep is None:
         raise HTTPException(status_code=404, detail="report not found")
-    model = st.reports.read_model_json(rep)
-    if model is None:
-        raise HTTPException(status_code=404, detail="no structured model stored for this report")
+    model = _report_model(request, session_id, rep)
     from app.pdf_export import PdfExportError, export_pdf
 
     try:
-        result = export_pdf(
-            st.db, st.config, session_id, model=model, artifacts=st.artifacts,
+        # Rendered in a worker thread: PDFKit blocks for seconds on a large
+        # report, and doing that on the event loop froze the whole app —
+        # frames, SSE and every other request stalled for the duration.
+        result = await run_in_threadpool(
+            export_pdf,
+            st.db, st.config, session_id,
+            model=model, artifacts=st.artifacts,
         )
     except PdfExportError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -342,18 +403,22 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
     chosen = []
     models = []
     for r in reports:
-        m = st.reports.read_model_json(r)
-        if m is not None:
-            chosen.append(r)
-            models.append(m)
+        try:
+            models.append(_report_model(request, session_id, r))
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                continue  # nothing to render from this report
+            raise
+        chosen.append(r)
     if not chosen:
         raise HTTPException(status_code=404, detail="no reports with a stored model")
     from app.pdf_export import PdfExportError, export_reports
 
     try:
-        result = export_reports(
-            st.db, st.config, session_id, models=models,
-            artifacts=st.artifacts, separate=body.separate,
+        result = await run_in_threadpool(
+            export_reports,
+            st.db, st.config, session_id,
+            models=models, artifacts=st.artifacts, separate=body.separate,
         )
     except PdfExportError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -93,8 +93,10 @@ class ScriptedModel:
 
     Like the real model, it reads the evidence digest from the prompt and
     cites REAL evidence ids in its analyses (the prompt tells it ids are
-    stable and must be referenced), and requests capture_evidence actions —
-    so the min_evidence exit gates can be satisfied and the runner advances.
+    stable and must be referenced), EXPLORES while the deterministic exit
+    gate still reports missing new evidence (capture_evidence actions), and
+    then COMMITS with no actions once the gate is satisfied — the explore /
+    commit split the runner enforces.
     """
 
     def __init__(self, script: dict[str, list[dict[str, Any]]]) -> None:
@@ -102,6 +104,14 @@ class ScriptedModel:
         self.calls: list[str] = []
         self.user_prompts: dict[str, list[str]] = {}
         self.usage = type("U", (), {"calls": 0, "failed_calls": 0})()
+
+    @staticmethod
+    def _evidence_required(user: str) -> int:
+        """New evidence the phase gate still requires (0 = may commit)."""
+        import re
+
+        m = re.search(r'"evidence_required":\s*(\d+)', user)
+        return int(m.group(1)) if m else 0
 
     @staticmethod
     def _cited_ids(user: str) -> list[str]:
@@ -125,7 +135,10 @@ class ScriptedModel:
                     for item in value:
                         if isinstance(item, dict):
                             item.setdefault("evidence_ids", list(ids))
-        if phase != "opportunity_synthesis":
+        # Explore only while the exit gate still owes new evidence; once it
+        # reports 0 the model must COMMIT (no actions) or the phase keeps
+        # looping. Mirrors exactly what the real prompt instructs.
+        if phase != "opportunity_synthesis" and self._evidence_required(user) > 0:
             content["actions"] = [
                 {"action": "capture_evidence", "args": {"note": f"evidence batch {i}"}}
                 for i in range(6)
@@ -353,6 +366,34 @@ async def test_vision_screenshot_attached_to_every_research_call(db, config, ses
     # adversarial and synthesis phases (which browse least) included.
     assert all(s is not None for s in shots[first:]), \
         [i for i, s in enumerate(shots) if s is None]
+
+
+@pytest.mark.asyncio
+async def test_activity_notes_are_tagged_for_the_reasoning_strip(db, config, session):
+    """The per-iteration activity_note is the only surface the UI has for
+    "what the agent is doing right now" (chain-of-thought is deliberately
+    never recorded), so it must be distinguishable from structural trace
+    lines — the "agent now" strip renders exactly these."""
+    from app.trace import ActivityTrace
+
+    class NoteModel(ScriptedModel):
+        async def call(self, session_id, *, system, user, **k):
+            reply = await super().call(session_id, system=system, user=user, **k)
+            reply.content["activity_note"] = (
+                "Opening competitor product pages to read review patterns"
+            )
+            return reply
+
+    runner = make_runner(db, config, NoteModel(PHASE_OUTPUTS))
+    await runner.run(session)
+    assert SessionStore(db, config).require(session).status == "completed"
+    entries = ActivityTrace(db).recent(session, limit=200)
+    notes = [e for e in entries if (e.detail or {}).get("source") == "activity_note"]
+    assert notes, "no activity note reached the trace"
+    assert all(e.to_dict()["detail"]["source"] == "activity_note" for e in notes)
+    # Structural trace lines (phases, candidates) stay untagged.
+    untagged = [e for e in entries if not (e.detail or {}).get("source")]
+    assert untagged, "structural trace lines lost their shape"
 
 
 @pytest.mark.asyncio
@@ -713,6 +754,151 @@ def test_runner_config_defaults_are_depth_friendly():
     rc = RunnerConfig()
     assert rc.max_model_calls_per_session >= 100
     assert rc.max_opportunities >= 10
+
+
+# ============================================ exit-gate integrity (regression)
+# The three bugs behind a rich-evidence session ending with ZERO candidates:
+# a session-wide evidence floor, phases committing on their explore step, and
+# budget exhaustion discarding the model's work.
+
+class ImmediateCommitModel(ScriptedModel):
+    """Never requests an action: tries to commit on its very first reply."""
+
+    def _reply_for(self, phase: str, user: str) -> FakeModelReply:
+        reply = super()._reply_for(phase, user)
+        reply.content.pop("actions", None)
+        return reply
+
+
+class NeverCommitModel(ScriptedModel):
+    """Always explores — it never stops asking for actions."""
+
+    def _reply_for(self, phase: str, user: str) -> FakeModelReply:
+        reply = super()._reply_for(phase, user)
+        reply.content["actions"] = [
+            {"action": "capture_evidence", "args": {"note": "again"}} for _ in range(2)
+        ]
+        return reply
+
+
+def _seed_evidence(db, session_id: str, n: int) -> None:
+    store = BrowserEvidenceStore(db)
+    for i in range(n):
+        store.create(
+            session_id=session_id, marketplace="us", kind="search_results",
+            url=f"https://www.amazon.com/s?k=old{i}",
+            title=f"Amazon.com : legacy query {i}", data={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_evidence_floor_counts_phase_new_not_session_total(db, config, session):
+    """A phase may not borrow earlier phases' evidence to open its exit gate.
+
+    Before the fix the gate read the SESSION total, so 100 records captured in
+    Phase 1 satisfied every later floor instantly and a phase could commit on
+    its first iteration with nothing researched.
+    """
+    sessions = SessionStore(db, config)
+    _seed_evidence(db, session, 40)  # legacy session-wide evidence
+    model = ScriptedModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert sessions.require(session).status == "completed"
+    # The gate must demand THIS phase's evidence even though 40 records from
+    # earlier phases already exist: with the old session-wide count the
+    # requirement read 0 and Phase 1 committed on its first reply.
+    first_p1 = model.user_prompts["opportunity_discovery"][0]
+    assert ScriptedModel._evidence_required(first_p1) == SPECS["opportunity_discovery"].min_evidence
+    assert len(model.user_prompts["opportunity_discovery"]) > 1, model.calls
+    events = EventLog(db).tail(session)
+    p1 = [e for e in events if e.action == "phase_completed"
+          and e.detail["phase"] == "opportunity_discovery"]
+    assert p1, "phase 1 never completed"
+    assert p1[0].detail["evidence_new"] >= SPECS["opportunity_discovery"].min_evidence
+
+
+@pytest.mark.asyncio
+async def test_phase_commits_only_without_pending_actions(db, config, session):
+    """An explore step (reply with actions) never closes the phase — only a
+    commit (no actions, floors met) does."""
+    sessions = SessionStore(db, config)
+    model = ScriptedModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert sessions.require(session).status == "completed"
+    events = [e for e in EventLog(db).tail(session) if e.action == "phase_completed"]
+    assert {e.detail["phase"] for e in events} == set(PHASE_ORDER)
+    # Every commit happened on an iteration that requested no actions: the
+    # synthetic model only stops requesting actions once the gate reads 0.
+    for phase, prompts in model.user_prompts.items():
+        if phase == "opportunity_synthesis":
+            continue
+        last = prompts[-1]
+        assert ScriptedModel._evidence_required(last) == 0, phase
+
+
+@pytest.mark.asyncio
+async def test_duplicate_captures_do_not_reset_the_stall_guard(db, config, session):
+    """Re-running the identical search must read as no progress, so the
+    anti-stall guard ends a phase that is busy but not going deeper — instead
+    of looping to its full budget."""
+    from app.methodology import STALL_LIMIT
+
+    sessions = SessionStore(db, config)
+    model = NeverCommitModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert sessions.require(session).status == "completed"
+    assert any(e.action == "phase_stalled" for e in EventLog(db).tail(session))
+    p1_calls = model.calls.count("opportunity_discovery")
+    assert p1_calls < SPECS["opportunity_discovery"].max_iterations
+    assert p1_calls <= STALL_LIMIT + 1
+
+
+@pytest.mark.asyncio
+async def test_budget_exhaustion_still_applies_the_model_output(db, config, session):
+    """A phase that burns its whole budget must contribute what the model
+    produced (niches → candidates), never return {} and drop it."""
+    sessions = SessionStore(db, config)
+    model = NeverCommitModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert sessions.require(session).status == "completed"
+    events = EventLog(db).tail(session)
+    assert any(e.action == "phase_completed_from_budget" for e in events)
+    # The niching output reached the candidate ledger despite no clean commit.
+    cands = CandidateStore(db).list(session, limit=50)
+    assert any("grief" in c.niche for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_empty_niching_output_cannot_commit_while_signals_exist(db, config, session):
+    """Phase 2 is where candidates are BORN: with Phase 1 signals on the
+    table it may not commit an empty niches list (the zero-candidate bug)."""
+    from app.methodology import P1_DISCOVERY, P2_NICHING
+
+    class EmptyNichingModel(ScriptedModel):
+        def _reply_for(self, phase: str, user: str) -> FakeModelReply:
+            reply = super()._reply_for(phase, user)
+            if phase == P2_NICHING:
+                reply.content["niches"] = []
+                reply.content.pop("actions", None)  # tries to commit empty
+            return reply
+
+    sessions = SessionStore(db, config)
+    model = EmptyNichingModel(PHASE_OUTPUTS)
+    runner = make_runner(db, config, model)
+    await runner.run(session)
+    assert sessions.require(session).status == "completed"
+    p2_calls = model.calls.count(P2_NICHING)
+    # It may not commit on the first attempt: the output floor keeps the
+    # phase open until the stall guard forces it to hand over what it has.
+    assert p2_calls > 1, model.calls
+    assert not any(
+        e.action == "phase_completed" and e.detail["phase"] == P2_NICHING
+        for e in EventLog(db).tail(session)
+    )
 
 
 # ------------------------------------------------------------ focus pivot

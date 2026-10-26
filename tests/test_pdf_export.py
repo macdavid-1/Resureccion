@@ -301,6 +301,35 @@ class TestFailureSafety:
         leftovers = [p for p in artifacts.session_dir(session).glob(".pdf-*.tmp")]
         assert not leftovers, f"temp files leaked: {leftovers}"
 
+    def test_export_rebuilds_model_from_durable_state_when_file_is_lost(self, client):
+        """A finished report whose .model.json went missing (interrupted save,
+        pruned file) must still export: the model is rebuilt from the durable
+        research state instead of answering 404."""
+        if not node_available():
+            pytest.skip("node/pdfkit sidecar unavailable")
+        from tests.test_research_runner import PHASE_OUTPUTS as PO
+        from tests.test_research_runner import ScriptedModel, make_runner
+
+        st = client.app.state
+        s = st.sessions.create(mode="prompt", prompt="export rebuild probe", objective="o")
+        import asyncio
+
+        asyncio.run(make_runner(st.db, st.config, ScriptedModel(PO)).run(s.id))
+        res = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})
+        h = {"X-Auth-Token": res.json()["token"]}
+        reps = client.get(f"/api/sessions/{s.id}/reports", headers=h).json()["reports"]
+        final = [r for r in reps if r["kind"] == "final"][0]
+        # Destroy the stored model, keep the report body.
+        report = st.reports.get(s.id, final["id"])
+        Path(report.body_path).with_suffix(".model.json").unlink()
+        assert st.reports.read_model_json(report) is None
+
+        res = client.post(f"/api/sessions/{s.id}/reports/{final['id']}/export-pdf", headers=h)
+        assert res.status_code == 200, res.text
+        assert res.json()["bytes"] > 1500
+        # The rebuild was persisted, so the next export reads it back.
+        assert st.reports.read_model_json(report) is not None
+
     def test_missing_node_raises_clear_error(self, db, config, session, monkeypatch):
         import app.pdf_export as pex
         from app.artifacts import ArtifactStore

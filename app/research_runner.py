@@ -119,6 +119,19 @@ class RunnerConfig:
     min_remaining_session_fraction_for_pivot: float = 0.5
 
 
+# Signature keys that count as REAL progress for the anti-stall guard.
+# Deliberately excludes the raw evidence totals: a duplicate capture bumps
+# those, and a phase re-running the same search forever would then never
+# stall. Distinct sources + candidates only.
+_PROGRESS_KEYS: tuple[str, ...] = ("distinct_evidence", "candidates")
+
+
+def _primary_items(output: dict[str, Any], primary: str) -> int:
+    """How many analysis items a reply holds in its primary contract field."""
+    value = output.get(primary) if isinstance(output, dict) else None
+    return len(value) if isinstance(value, list) else 0
+
+
 class ResearchRunner:
     """One research session's lifecycle. Run via `run()` in a worker task."""
 
@@ -506,7 +519,17 @@ class ResearchRunner:
 
         stall = 0
         model_calls = 0
-        last_counts = self._progress_signature(session_id)
+        # Phase-start baseline. The min_evidence floor is measured against
+        # what THIS phase captures (counts - baseline), never against the
+        # session total: Phase 1 alone can hand over 100+ evidence records,
+        # which used to satisfy every later floor instantly and let a phase
+        # commit on its first iteration with nothing researched.
+        baseline = self._progress_signature(session_id)
+        last_counts = baseline
+        # Last reply that filled the phase contract — applied on a forced or
+        # budget exit so the model's work is never thrown away.
+        best_output: dict[str, Any] | None = None
+        iteration = 0
         for iteration in range(1, spec.max_iterations + 1):
             if self._cancelled:
                 raise _Cancelled()
@@ -567,6 +590,14 @@ class ResearchRunner:
                 screenshot_attached=screenshot_png is not None,
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
+                # Deterministic exit gate, shown so the model knows exactly
+                # what still separates an explore step from a commit.
+                phase_gate=self._phase_gate(
+                    phase,
+                    baseline=baseline,
+                    latest=last_counts,
+                    prior_outputs=prior_outputs,
+                ),
             )
             model_calls += 1
             self.agent.advance_iteration(session_id)
@@ -614,7 +645,13 @@ class ResearchRunner:
             # asked for a one-line activity_note; absent is fine).
             iter_note = str(reply.content.get("activity_note") or "").strip()
             if iter_note:
-                self.trace.record(session_id, KIND_DISCOVERY, iter_note)
+                # Tagged so the UI can lift it into the "agent now" reasoning
+                # strip, apart from structural trace lines. Still an
+                # operational summary — chain-of-thought is never recorded.
+                self.trace.record(
+                    session_id, KIND_DISCOVERY, iter_note,
+                    detail={"source": "activity_note"},
+                )
 
             # --- execute requested browser actions ------------------------
             actions = reply.content.get("actions") or []
@@ -671,23 +708,56 @@ class ResearchRunner:
             # --- gate checks ----------------------------------------------
             missing = [f for f in spec.output_contract if f not in reply.content]
             counts = self._progress_signature(session_id)
-            progressed = counts != last_counts
+            phase_new_evidence = max(0, counts["evidence_total"] - baseline["evidence_total"])
+            primary = spec.output_contract[0]
+            items = _primary_items(reply.content, primary)
+            floor = self._output_floor(phase, prior_outputs, counts["candidates"])
+
+            # The model's most complete analysis so far survives a forced or
+            # budget exit: whichever reply filled the primary contract with
+            # the most items (ties → latest) becomes the phase's contribution.
+            if best_output is None or items >= _primary_items(best_output, primary):
+                best_output = reply.content
+
+            # Progress = NEW sources, not new rows: a re-run of an identical
+            # search writes another evidence row with the same identity, and
+            # that used to reset the stall counter forever (busy, not deep).
+            progressed = any(
+                counts[k] != last_counts.get(k) for k in _PROGRESS_KEYS
+            )
             last_counts = counts
             stall = 0 if progressed else stall + 1
             timing.attempts_since_progress = stall
 
-            gates_ok = not missing and (
-                spec.min_evidence == 0 or counts["evidence_total"] >= spec.min_evidence
+            # EXPLORE vs COMMIT. A reply that requested actions is an explore
+            # step: the actions run first and the phase continues with fresh
+            # evidence — it can never also close the phase. Only a reply that
+            # asks for no further browsing and satisfies the floors commits.
+            actions_now = reply.content.get("actions")
+            exploring = isinstance(actions_now, list) and len(actions_now) > 0
+
+            gates_ok = (
+                not missing
+                and items >= floor
+                and not exploring
+                and (spec.min_evidence == 0 or phase_new_evidence >= spec.min_evidence)
             )
-            if gates_ok and stall < STALL_LIMIT:
+            # A fully satisfied gate always commits — being stuck earlier in
+            # the phase is no reason to reject a commit that now meets every
+            # floor. STALL_LIMIT below is what forces a phase that is STILL
+            # exploring with nothing new to hand over what it has.
+            if gates_ok:
                 self.checkpoints.save(
                     session_id, f"phase_output:{phase}",
                     {"output": reply.content, "model": reply.model,
-                     "iterations": iteration, "at": iso_now()},
+                     "iterations": iteration, "commit": "clean",
+                     "evidence_new": phase_new_evidence, "at": iso_now()},
                 )
                 self.events.append(
                     session_id, level="info", actor="agent", action="phase_completed",
                     detail={"phase": phase, "iterations": iteration,
+                            "evidence_new": phase_new_evidence,
+                            "primary_items": items,
                             "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
                 )
                 self._apply_phase_effects(session_id, phase, reply.content)
@@ -698,24 +768,40 @@ class ResearchRunner:
                     session_id, level="warn", actor="agent", action="phase_stalled",
                     detail={"phase": phase, "iterations": iteration,
                             "missing_fields": missing,
-                            "evidence_total": counts["evidence_total"]},
+                            "evidence_new": phase_new_evidence,
+                            "evidence_total": counts["evidence_total"],
+                            "primary_items": items,
+                            "exploring": exploring},
                 )
                 self.trace.record(
                     session_id, KIND_PIVOT,
-                    pivot_text(PHASE_TITLES.get(phase, phase), f"no new evidence after {iteration} iterations; forcing the phase to contribute what it has and moving on"),
+                    pivot_text(PHASE_TITLES.get(phase, phase), f"no new distinct evidence after {iteration} iterations; forcing the phase to contribute what it has and moving on"),
                 )
-                # Force-apply whatever analysis the model produced so the phase
-                # still contributes, then move on.
-                self._apply_phase_effects(session_id, phase, reply.content)
-                break
+                break  # the phase's best output is applied below, not dropped
 
-        # Budget exhausted or stalled: record and continue with what we have.
+        # Budget exhausted or stalled: record it AND apply whatever the model
+        # actually produced. Returning {} here used to throw away every niche
+        # the model had mentioned in intermediate replies.
         self.errors.record(
             session_id, scope=f"methodology:{phase}", severity="warning",
             message=f"phase {phase} ended at budget/stall without full gate pass",
             recoverable=True,
         )
-        return {}
+        if best_output is None:
+            return {}
+        self.checkpoints.save(
+            session_id, f"phase_output:{phase}",
+            {"output": best_output, "iterations": iteration,
+             "commit": "forced", "at": iso_now()},
+        )
+        self.events.append(
+            session_id, level="warn", actor="agent", action="phase_completed_from_budget",
+            detail={"phase": phase, "iterations": iteration,
+                    "primary_items": _primary_items(best_output, spec.output_contract[0]),
+                    "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
+        )
+        self._apply_phase_effects(session_id, phase, best_output)
+        return best_output
 
     # ------------------------------------------------------------ phase effects
     def _apply_phase_effects(self, session_id: str, phase: str, output: dict[str, Any]) -> None:
@@ -1225,7 +1311,61 @@ class ResearchRunner:
         return {
             "browser_evidence": be_count,
             "evidence_total": be_count + ev_count,
+            # Distinct captured sources — the anti-stall signal (duplicates
+            # of a query already researched do not raise it).
+            "distinct_evidence": self.browser_evidence.distinct_sources(session_id),
             "candidates": cand_count,
+        }
+
+    def _output_floor(
+        self, phase: str, prior_outputs: dict[str, Any], candidates_seen: int
+    ) -> int:
+        """How many primary-output items this phase needs before it may commit.
+
+        The floor is declared per phase in the methodology (min_output_items)
+        and gated on the phase's UPSTREAM INPUT, so a phase is never forced to
+        manufacture content it has nothing to work with:
+        - discovery has no upstream input → always needs a signal,
+        - niching needs Phase 1's signals (or candidates already on record),
+        - analysis phases need at least one candidate,
+        - adversarial verification and synthesis declare 0 (the deterministic
+          pipeline and the opportunity contract decide instead of the model).
+        """
+        spec = SPECS[phase]
+        want = spec.min_output_items
+        if want <= 0:
+            return 0
+        needs = set(spec.consumes)
+        if not needs:
+            return want
+        if "signal" in needs:
+            signals = (prior_outputs.get(P1_DISCOVERY) or {}).get("signals")
+            return want if (signals or candidates_seen) else 0
+        if "discovered" in needs:
+            return want if candidates_seen else 0
+        return want
+
+    def _phase_gate(
+        self,
+        phase: str,
+        *,
+        baseline: dict[str, int],
+        latest: dict[str, int],
+        prior_outputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Deterministic exit-gate snapshot for the model's prompt."""
+        spec = SPECS[phase]
+        primary = spec.output_contract[0]
+        evidence_new = max(0, latest["evidence_total"] - baseline["evidence_total"])
+        required = max(0, spec.min_evidence - evidence_new)
+        return {
+            "primary_output": primary,
+            "min_output_items": self._output_floor(
+                phase, prior_outputs, latest["candidates"]
+            ),
+            "evidence_new": evidence_new,
+            "evidence_required": required,
+            "duplicate_sources_do_not_count": True,
         }
 
     def _has_images(self, session_id: str) -> bool:

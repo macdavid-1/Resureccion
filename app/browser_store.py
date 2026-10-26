@@ -422,6 +422,27 @@ class BrowserEvidenceStore:
             ).fetchone()
         return int(row["n"])
 
+    def distinct_sources(self, session_id: str, *, limit: int = 5000) -> int:
+        """Number of DISTINCT sources captured (kind + marketplace + label).
+
+        This is the anti-stall signal: re-running the identical search
+        re-captures the SAME source, so a session that is busy but not
+        thorough (the same query six times) does not register as progress.
+        Only the identity columns are read — payloads stay in the database,
+        so the count stays cheap enough to call every model iteration.
+        """
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT kind, marketplace, title, url FROM browser_evidence "
+                "WHERE session_id = ? ORDER BY captured_at DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        keys: set[str] = set()
+        for r in rows:
+            label = " ".join((r["title"] or r["url"] or "").strip().lower().split())
+            keys.add(f"{r['kind']}|{r['marketplace']}|{label}")
+        return len(keys)
+
     def _row(self, row: sqlite3.Row) -> BrowserEvidence:
         return BrowserEvidence(
             id=row["id"],

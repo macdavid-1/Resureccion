@@ -49,6 +49,12 @@ def build_system_prompt(phase: str) -> str:
         f"{PHASE_TITLES[phase]}.\n\n"
         "METHODOLOGY LAW:\n"
         f"- {depth_priority_text()}\n"
+        "- Two modes of work: EXPLORE (request browser actions — they run and "
+        "fresh evidence comes back) and COMMIT (no actions, complete output). "
+        "Only a commit ends the phase; an explore step can never also close it.\n"
+        "- Depth beats breadth: open competitor product pages and read reviews "
+        "instead of re-running searches you already ran. Re-capturing the same "
+        "source is a duplicate, not research, and does not count as progress.\n"
         "- Evidence must come from pages you actually inspected via actions. "
         "Never fabricate rankings, prices, review counts, or KDSpy numbers.\n"
         "- If evidence is missing, request more actions; do not guess.\n"
@@ -79,6 +85,7 @@ def build_user_prompt(
     screenshot_attached: bool = False,
     owner_messages: list[str] | None = None,
     pivot_directive: str | None = None,
+    phase_gate: dict[str, Any] | None = None,
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -104,6 +111,32 @@ def build_user_prompt(
             "\nSTRATEGIC PIVOT — this pass is a fresh start on a NEW focus "
             "(the previous one failed adversarial verification entirely):\n"
             + pivot_directive
+        )
+
+    # --- deterministic exit gate (explore vs commit) -----------------------
+    # Shown so the model knows exactly how much research the phase still owes
+    # before it may close, instead of discovering it by being rejected.
+    if phase_gate:
+        g = phase_gate
+        floor = int(g.get("min_output_items") or 0)
+        parts.append(
+            "\nPHASE EXIT GATE (deterministic — the orchestrator, not you, "
+            "decides when this phase ends): " + _compact(g) + "\n"
+            "- EXPLORE: a reply carrying a non-empty 'actions' list runs those "
+            "actions and re-prompts you with fresh evidence. It never ends the phase.\n"
+            "- COMMIT: reply with NO 'actions' key, with the contract fully "
+            "filled, to end the phase.\n"
+            f"- output: '{g.get('primary_output', '')}' must hold at least "
+            f"{floor} item(s)"
+            + (
+                " before commit — this phase has upstream input to work from, "
+                "so it may not conclude empty."
+                if floor > 0 else
+                " — an empty list is acceptable here if that is genuinely "
+                "what the evidence shows."
+            )
+            + "\n- Only genuinely NEW sources open the gate: re-running a search "
+              "you already ran re-captures the same source and does not count."
         )
 
     # --- phase-specific instruction ----------------------------------------
@@ -154,11 +187,12 @@ def build_user_prompt(
     t = timing.digest()
     parts.append(
         "\nTIMING: " + _compact(t)
-        + f"\nStall policy: you have produced no new evidence for "
-        f"{t['iterations_without_progress']} iteration(s); at 3 the orchestrator "
-        "forces a pivot. If stuck (page failing, no results, repeated errors), "
-        "PIVOT: choose a different query, marketplace, or candidate — never "
-        "wait indefinitely."
+        + f"\nStall policy: {t['iterations_without_progress']} iteration(s) have "
+        "produced no NEW distinct evidence; at 3 the orchestrator forces the "
+        "phase to commit whatever it has and moves on. If stuck (page failing, "
+        "no results, repeated errors, or you keep re-running the same query), "
+        "PIVOT: choose a different query, marketplace, page type, or candidate — "
+        "never wait indefinitely and never repeat a search you already ran."
     )
 
     # --- output format -------------------------------------------------------
@@ -166,11 +200,13 @@ def build_user_prompt(
         "\nRESPOND WITH JSON ONLY, an object with exactly these keys: "
         + _compact(list(spec.output_contract))
         + " — plus optional key 'actions': a list of browser actions you want "
-        "executed BEFORE your analysis is finalized, each "
+        "executed BEFORE your next analysis, each "
         '{"action": "<one of the allowed actions>", "args": {...}}. '
-        "If 'actions' is present and non-empty, the orchestrator will run them "
-        "and re-prompt you with fresh evidence; keep analysis fields filled "
-        "with your best current judgment in that case."
+        "If 'actions' is present and non-empty this is an EXPLORE step: the "
+        "orchestrator runs the actions and re-prompts you with fresh evidence; "
+        "keep the analysis fields filled with your best current judgment, but "
+        "know the phase stays open. Leave 'actions' out entirely to COMMIT and "
+        "end the phase."
     )
     parts.append(
         "\nOPERATOR VISIBILITY: additionally include the optional key "

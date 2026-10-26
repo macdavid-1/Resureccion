@@ -144,6 +144,14 @@
               <h2>Live research</h2>
               <button id="lv-toggle" class="btn small ghost">Show live view</button>
             </div>
+            <!-- Reasoning summary: the agent's own one-line operational note
+                 for the current iteration (app.trace never exposes hidden
+                 chain-of-thought — this is the sanctioned surface). -->
+            <div class="ws-now" id="ws-now" hidden>
+              <span class="ws-now-dot"></span>
+              <span class="ws-now-label" id="ws-now-label">Agent now</span>
+              <span class="ws-now-text" id="ws-now-text">—</span>
+            </div>
             <div class="trace-feed" id="ws-trace"></div>
             <div class="section" id="ws-trace-empty" hidden>
               <p class="muted" style="font-size:0.84rem; margin:0">Waiting for the agent to report activity…</p>

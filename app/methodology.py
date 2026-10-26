@@ -105,6 +105,14 @@ class PhaseSpec:
     # What the phase's final answer must contain (JSON contract).
     output_contract: tuple[str, ...]
     guidance: str
+    # Minimum items the phase's PRIMARY output contract field (the first
+    # entry of output_contract) must hold before the phase may COMMIT.
+    # 0 = the phase may legitimately conclude with an empty list (the
+    # deterministic pipeline downstream decides instead of the model).
+    # The runner additionally gates the floor on the phase's upstream input
+    # (see ResearchRunner._output_floor): an analysis phase with no
+    # candidates yet is not forced to invent any.
+    min_output_items: int = 0
 
 
 SPECS: dict[str, PhaseSpec] = {
@@ -124,6 +132,7 @@ SPECS: dict[str, PhaseSpec] = {
             "signals",       # list of {topic, audience, hint, marketplace, source}
             "observations",  # what was actually seen on pages
         ),
+        min_output_items=1,  # discovery with no signal is not discovery
         guidance=(
             "Generate a BROAD pool of market signals. Draw on: Amazon search "
             "results, categories, subcategories, autocomplete suggestions, "
@@ -149,6 +158,11 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "niches",  # list of {niche, parent_market, chain, evidence_ids, demand_hints}
         ),
+        # THE candidate-starvation guard: niching is the ONE place candidates
+        # are born, so it may never commit an empty list while Phase 1 handed
+        # it signals. An empty commit here means the whole pass ends with
+        # zero candidates no matter how much evidence was gathered.
+        min_output_items=1,
         guidance=(
             "Narrow EVERY promising broad market aggressively along the chain: "
             "broad market → category → subcategory → audience → specific "
@@ -174,6 +188,7 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "competitive_maps",  # list of {niche, competitors[], saturation, pricing, patterns}
         ),
+        min_output_items=1,
         guidance=(
             "For every serious candidate, identify the relevant competitors "
             "and inspect MULTIPLE competing books (never judge from one). "
@@ -202,6 +217,7 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
         ),
+        min_output_items=1,
         guidance=(
             "Treat reviews as PRIMARY consumer evidence. Collect "
             "representative positive AND negative patterns. Identify what "
@@ -227,6 +243,7 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "demand_assessments",  # list of {niche, verdict, signals[], risks[]}
         ),
+        min_output_items=1,
         guidance=(
             "Determine whether evidence suggests GENUINE buyer demand. "
             "Distinguish actual demand from curiosity, casual browsing, "
@@ -257,6 +274,7 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
         ),
+        min_output_items=1,
         guidance=(
             "For every serious candidate answer precisely: What exists? What "
             "sells? What do readers want? What do competitors fail to "
@@ -279,6 +297,7 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "cross_market_checks",  # list of {niche, marketplace, verdict, notes}
         ),
+        min_output_items=1,
         guidance=(
             "Where useful, spot-check the strongest candidates on additional "
             "marketplaces to determine whether the signal is local, "
@@ -305,6 +324,10 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "verdicts",  # list of {niche, verdict: pass|downgrade|reject, contradictions[], reasons}
         ),
+        # 0 on purpose: the deterministic integrity pipeline that runs right
+        # after this phase is the authoritative verdict, whatever the model
+        # asserts (or omits) here.
+        min_output_items=0,
         guidance=(
             "Deliberately try to KILL your own strongest candidates. For each: "
             "What evidence contradicts it? Is demand actually weak? Is "
@@ -328,6 +351,9 @@ SPECS: dict[str, PhaseSpec] = {
         output_contract=(
             "opportunities",  # full opportunity objects (see OPPORTUNITY_FIELDS)
         ),
+        # 0 on purpose: a session whose candidates all died must be able to
+        # conclude honestly with no opportunity rather than manufacture one.
+        min_output_items=0,
         guidance=(
             "ONLY now synthesize final opportunities from verified candidates. "
             "Target 5-10 opportunities for an autonomous session — but NEVER "
@@ -535,6 +561,7 @@ class Methodology:
                     "order": i + 1,
                     "max_iterations": p.max_iterations,
                     "min_evidence": p.min_evidence,
+                    "min_output_items": p.min_output_items,
                     "allowed_actions": list(p.allowed_actions),
                     "output_contract": list(p.output_contract),
                     "consumes": list(p.consumes),
