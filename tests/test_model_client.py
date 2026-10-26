@@ -270,3 +270,57 @@ async def test_usage_accounting_accumulates():
     assert d["configured"] is True
     assert d["model"] == "test-model"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reference_images_are_attached_as_vision_parts():
+    """Image-only / image-steered sessions: the owner's uploads must reach
+    the model's eyes — screenshot first, then every reference image."""
+    from app.model_client import MAX_REFERENCE_IMAGES_PARTS
+
+    cfg = _config(model_vision_enabled=True)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call(
+        "s1", system="s", user="u",
+        screenshot_png=b"png-bytes",
+        reference_images=[b"ref-one", b"ref-two"],
+    )
+    parts = seen["body"]["messages"][1]["content"]
+    assert [p["type"] for p in parts] == ["text", "image_url", "image_url", "image_url"]
+    urls = [p["image_url"]["url"] for p in parts[1:]]
+    assert urls[0].startswith("data:image/png;base64,")  # live screenshot first
+    assert all(u.startswith("data:image/jpeg;base64,") for u in urls[1:])
+    # Defense in depth: a pathological upload set is capped per request.
+    await client.call(
+        "s1", system="s", user="u",
+        reference_images=[b"x" for _ in range(MAX_REFERENCE_IMAGES_PARTS + 5)],
+    )
+    parts2 = seen["body"]["messages"][1]["content"]
+    assert len(parts2) == 1 + MAX_REFERENCE_IMAGES_PARTS
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reference_images_ignored_when_vision_disabled():
+    """Vision off means the user content stays a plain string — no image
+    parts, no payload bloat."""
+    cfg = _config(model_vision_enabled=False)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call(
+        "s1", system="s", user="u",
+        screenshot_png=b"png", reference_images=[b"ref"],
+    )
+    assert isinstance(seen["body"]["messages"][1]["content"], str)
+    await client.aclose()

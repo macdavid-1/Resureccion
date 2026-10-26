@@ -26,6 +26,10 @@ class CreateSessionRequest(BaseModel):
     prompt: str = ""
     objective: str = ""
     marketplaces: list[str] = Field(default_factory=list)
+    # Image-only sessions: the dashboard uploads reference images right after
+    # creation, so it must declare intent up front or the store rejects a
+    # blank 'keywords' brief before the uploads land.
+    has_images: bool = False
 
 
 class UpdateSessionRequest(BaseModel):
@@ -59,6 +63,7 @@ async def create_session(body: CreateSessionRequest, request: Request) -> dict:
             prompt=body.prompt,
             objective=body.objective,
             marketplaces=body.marketplaces,
+            has_images=body.has_images,
         )
         st.agent.initialize(s.id)
         st.browser.ensure(s.id)

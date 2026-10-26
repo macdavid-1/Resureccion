@@ -926,12 +926,20 @@
           prompt: state.mode === "auto" ? "" : prompt,
           objective: $("#ns-objective").value.trim(),
           marketplaces: $("#ns-marketplaces").value.split(",").map((s) => s.trim()).filter(Boolean),
+          has_images: state.images.length > 0,
         }),
       });
       for (const f of state.images) {
         const fd = new FormData();
         fd.append("file", f);
-        await fetch(`/api/sessions/${session.id}/uploads`, { method: "POST", headers: authHeaders(), body: fd });
+        const up = await fetch(`/api/sessions/${session.id}/uploads`, { method: "POST", headers: authHeaders(), body: fd });
+        if (!up.ok) {
+          // Never start research silently missing its reference images —
+          // surface the failure and leave the inputs intact for a retry.
+          let detail = up.statusText;
+          try { detail = (await up.json()).detail ?? detail; } catch {}
+          throw new Error(`Reference image upload failed: ${detail}`);
+        }
       }
       state.images = []; renderImgThumbs();
       $("#ns-prompt").value = ""; $("#ns-objective").value = ""; $("#ns-marketplaces").value = "";

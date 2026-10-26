@@ -43,6 +43,11 @@ from app.redact import scrub_url
 # DEFAULT_BASE_URL / DEFAULT_MODEL are re-exported from app.config (single
 # source of truth) — callers and tests import them from here.
 
+# Hard cap on owner reference images sent per call (defense in depth; the
+# runner already caps its own list) so a pathological upload set can never
+# blow up a request payload.
+MAX_REFERENCE_IMAGES_PARTS = 6
+
 
 class ModelConfigError(Exception):
     """MODEL_API_KEY missing or invalid configuration."""
@@ -181,12 +186,16 @@ class ModelClient:
         expect_fields: tuple[str, ...] = (),
         max_retries: int = 4,
         screenshot_png: bytes | None = None,
+        reference_images: list[bytes] | None = None,
     ) -> ModelReply:
         """One model call returning strict JSON. Retries transient failures.
 
         When `screenshot_png` is provided (and vision is enabled) it is sent
         as an OpenAI-style image_url content part so vision-capable models
         (MiMo-V2.6-Flash) can see exactly what the browser sees.
+        `reference_images` (already prepared JPEG/PNG bytes) are appended
+        after it — the owner's uploaded brief images, so an image-only or
+        image-steered session actually reaches the model's eyes.
         """
         if not self.is_configured:
             raise ModelConfigError(
@@ -194,15 +203,25 @@ class ModelClient:
                 "Set it in the environment (DeepInfra key recommended)."
             )
         user_content: Any = user
-        if screenshot_png and self.config.model_vision_enabled:
-            data_url = "data:image/png;base64," + base64.b64encode(screenshot_png).decode("ascii")
-            user_content = [
-                {"type": "text", "text": user},
-                {
+        if self.config.model_vision_enabled and (screenshot_png or reference_images):
+            parts: list[dict[str, Any]] = [{"type": "text", "text": user}]
+            if screenshot_png:
+                parts.append({
                     "type": "image_url",
-                    "image_url": {"url": data_url, "detail": "auto"},
-                },
-            ]
+                    "image_url": {
+                        "url": "data:image/png;base64," + base64.b64encode(screenshot_png).decode("ascii"),
+                        "detail": "auto",
+                    },
+                })
+            for img in (reference_images or [])[:MAX_REFERENCE_IMAGES_PARTS]:
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64," + base64.b64encode(img).decode("ascii"),
+                        "detail": "auto",
+                    },
+                })
+            user_content = parts
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [

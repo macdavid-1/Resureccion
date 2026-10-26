@@ -1181,3 +1181,160 @@ def test_resume_auth_paused_sessions_only_touches_auth_pauses():
     assert jobs == [("a", "research_resume")]
     assert marks == [("a", "queued")]
     assert evs == ["auto_resumed_after_signin"]
+
+
+# =====================================================================
+# Pipeline wiring regressions: initialization → research → report
+# =====================================================================
+class TestPipelineWiring:
+    @pytest.mark.asyncio
+    async def test_owner_pause_never_records_the_phase_as_complete(
+        self, db, config, session
+    ):
+        """A pause INSIDE a phase must stop the run right there. Falling
+        through wrote a `phase_complete` checkpoint for a half-run phase and
+        could run Phase 8's integrity pipeline on a paused session."""
+        sessions = SessionStore(db, config)
+        cps = CheckpointStore(db)
+        model = ScriptedModel(PHASE_OUTPUTS)
+        runner = make_runner(db, config, model)
+        original_call = model.call
+
+        async def call_and_pause(*a, **k):
+            reply = await original_call(*a, **k)
+            runner.request_pause()
+            return reply
+
+        model.call = call_and_pause  # type: ignore[method-assign]
+        await runner.run(session)
+        assert sessions.require(session).status == "paused"
+        assert cps.get(session, "paused:owner") is not None
+        # Phase 1 was interrupted mid-run: it must NOT be recorded complete.
+        assert cps.get(session, "phase_complete:opportunity_discovery") is None
+        # Resume finishes the session and only then records completion.
+        runner2 = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        await runner2.run(session)
+        assert sessions.require(session).status == "completed"
+        assert cps.get(session, "phase_complete:opportunity_discovery") is not None
+
+    @pytest.mark.asyncio
+    async def test_pause_during_phase_8_skips_the_integrity_pipeline(
+        self, db, config, session
+    ):
+        """Pausing while adversarial verification runs must not trigger the
+        deterministic integrity pipeline (or a possible focus pivot) on a
+        session that is already paused — the pipeline re-runs on resume."""
+        sessions = SessionStore(db, config)
+        cps = CheckpointStore(db)
+        model = ScriptedModel(PHASE_OUTPUTS)
+        runner = make_runner(db, config, model)
+        original_call = model.call
+
+        async def call_and_pause_on_p8(*a, **k):
+            reply = await original_call(*a, **k)
+            if model.calls and model.calls[-1] == "adversarial_verification":
+                runner.request_pause()
+            return reply
+
+        model.call = call_and_pause_on_p8  # type: ignore[method-assign]
+        await runner.run(session)
+        assert sessions.require(session).status == "paused"
+        assert cps.get(session, "phase_complete:adversarial_verification") is None
+        assert cps.get(session, "integrity_pipeline") is None
+        # Resume completes, and THEN the integrity pipeline runs.
+        runner2 = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        await runner2.run(session)
+        assert sessions.require(session).status == "completed"
+        assert cps.get(session, "integrity_pipeline") is not None
+
+    @pytest.mark.asyncio
+    async def test_progress_is_live_and_never_goes_backwards(
+        self, db, config, session
+    ):
+        """The dashboard bar binds to `session.progress`: it used to sit at
+        0% for a whole six-hour run and only jump to 100% at the end."""
+        sessions = SessionStore(db, config)
+        model = ScriptedModel(PHASE_OUTPUTS)
+        seen: list[float] = []
+        original_call = model.call
+
+        async def spy(*a, **k):
+            seen.append(sessions.require(session).progress)
+            return await original_call(*a, **k)
+
+        model.call = spy  # type: ignore[method-assign]
+        runner = make_runner(db, config, model)
+        await runner.run(session)
+        final = sessions.require(session).progress
+        assert final == 1.0
+        assert seen and seen[0] > 0.0, "progress stayed at 0 during research"
+        assert seen == sorted(seen), f"progress went backwards: {seen}"
+
+    @pytest.mark.asyncio
+    async def test_job_row_tracks_the_research_lifecycle(self, db, config, session):
+        """Jobs are created by the start route and then frozen at `pending`:
+        a finished session still showed a pending job. The runner now drives
+        the durable job row through initializing → researching → completed."""
+        sessions = SessionStore(db, config)
+        events = EventLog(db)
+        jobs = JobOrchestrator(db, config, sessions, events, ErrorStateStore(db))
+        job = jobs.create_job(session, kind="research_run")
+        assert jobs.get(session, job.id).status == "pending"
+
+        runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        await runner.run(session)
+        assert sessions.require(session).status == "completed"
+        assert jobs.get(session, job.id).status == "completed"
+        actions = {e.action for e in events.tail(session, limit=1000)}
+        assert "job_initializing" in actions
+        assert "job_researching" in actions
+        assert "job_completed" in actions
+
+    @pytest.mark.asyncio
+    async def test_paused_preflight_is_not_recorded_as_done(self, db, config, session):
+        """A pause during the census/frontier walk must not stamp partial
+        measurements as permanently complete — the resumed session re-walks
+        the parts that never finished."""
+        sessions = SessionStore(db, config)
+        cps = CheckpointStore(db)
+        runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        runner.request_pause()  # owner pauses while the preflight walks
+        await runner.run(session)
+        assert sessions.require(session).status == "paused"
+        cp = cps.get(session, "discovery_preflight")
+        assert cp is not None
+        assert cp.payload["done"] is False
+
+        runner2 = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        await runner2.run(session)
+        assert sessions.require(session).status == "completed"
+        assert cps.get(session, "discovery_preflight").payload["done"] is True
+
+    @pytest.mark.asyncio
+    async def test_reference_images_are_prepared_and_cached(self, db, config, session):
+        """Owner uploads are downscaled to bounded JPEGs once per run so the
+        model can actually SEE an image-steered brief."""
+        from io import BytesIO
+
+        from PIL import Image
+
+        from app.uploads import UploadStore
+
+        buf = BytesIO()
+        Image.new("RGBA", (3000, 2000), (200, 30, 30, 128)).save(buf, format="PNG")
+        store = UploadStore(db, config)
+        store.save(
+            session, filename="cover.png", content_type="image/png",
+            data=buf.getvalue(),
+        )
+        runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+        images = runner._reference_images(session)
+        assert len(images) == 1
+        assert images[0][:2] == b"\xff\xd8"  # prepared as JPEG
+        # Downscaled to the bound with aspect preserved (3000x2000 → 768x512).
+        out = Image.open(BytesIO(images[0]))
+        assert out.format == "JPEG" and out.size == (768, 512)
+        # Cached per run — repeated prompt builds never re-encode.
+        assert runner._reference_images(session) is images
+        # A session without uploads attaches nothing.
+        assert runner._reference_images("no-such-session") == []

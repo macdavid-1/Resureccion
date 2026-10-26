@@ -49,6 +49,44 @@ class TestRecordingAPI:
         assert client.post("/api/sessions/nope/recording/start", headers=h).status_code == 404
 
 
+class TestImageOnlySessionCreation:
+    """The dashboard's image-only path: create with `has_images`, then
+    upload. The flag never reached the store, so a blank 'keywords' brief
+    was rejected with 400 before any image could be attached."""
+
+    def test_image_only_session_creates_and_accepts_uploads(self, client):
+        from io import BytesIO
+
+        from PIL import Image
+
+        h = _login(client)
+        res = client.post(
+            "/api/sessions", headers=h,
+            json={"mode": "keywords", "prompt": "", "objective": "",
+                  "marketplaces": [], "has_images": True},
+        )
+        assert res.status_code == 200, res.text
+        sid = res.json()["session"]["id"]
+
+        buf = BytesIO()
+        Image.new("RGB", (32, 32), (10, 120, 200)).save(buf, format="PNG")
+        up = client.post(
+            f"/api/sessions/{sid}/uploads", headers=h,
+            files={"file": ("reference.png", buf.getvalue(), "image/png")},
+        )
+        assert up.status_code == 200, up.text
+        listed = client.get(f"/api/sessions/{sid}/uploads", headers=h)
+        assert len(listed.json()["uploads"]) == 1
+
+    def test_blank_keywords_without_images_still_rejected(self, client):
+        h = _login(client)
+        res = client.post(
+            "/api/sessions", headers=h,
+            json={"mode": "keywords", "prompt": ""},
+        )
+        assert res.status_code == 400
+
+
 def _seed_reports(client, sid: str, n: int) -> None:
     """n final reports with stored structured models (PDF-exportable)."""
     import json as _json

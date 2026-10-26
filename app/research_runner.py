@@ -124,6 +124,7 @@ class RunnerConfig:
     max_model_calls_per_session: int = 120      # absolute safety ceiling
     max_evidence_digest_items: int = 40         # digest size cap per prompt
     max_candidates: int = 24                    # candidates tracked at once
+    max_reference_images: int = 4               # owner images attached per model call
     min_opportunities_target: int = 5           # target for auto sessions
     max_opportunities: int = 12                 # synthesis output cap
     # A strategic focus pivot spends a whole new P1→P9 pass, so it only
@@ -242,6 +243,8 @@ class ResearchRunner:
         self._ws_scores: dict[str, dict[str, WhitespaceScore]] = {}
         self._ws_evidence_count: dict[str, int] = {}
         self.memory = MarketMemoryStore(db)
+        # Owner reference images, prepared once per run (see _reference_images).
+        self._ref_images: dict[str, list[bytes]] = {}
 
     # ------------------------------------------------- owner message channel
     def _take_owner_messages(self, session_id: str) -> None:
@@ -317,6 +320,26 @@ class ResearchRunner:
         if last is not None:
             self.sessions.accumulate_elapsed(session_id, now - last)
 
+    def _bump_progress(self, session_id: str, value: float) -> None:
+        """Advance the durable, owner-visible progress estimate.
+
+        The dashboard binds its progress bar to `session.progress`, which
+        used to sit at 0% until the final `1.0` — a six-hour run looked
+        frozen. Phases feed it (1/9 each, fractionally within a phase).
+        Monotonic by design: a resume or a focus pivot re-runs phases, but
+        the bar never jumps backwards — progress is the session's journey
+        toward a completed report, not the current pass's cursor.
+        Accounting only: any failure is swallowed; research never waits on it.
+        """
+        try:
+            target = round(min(0.99, max(0.0, value)), 4)
+            current = self.sessions.get(session_id)
+            if current is None or target <= (current.progress or 0.0):
+                return
+            self.sessions.update(session_id, progress=target)
+        except Exception:
+            pass
+
     # ---------------------------------------------------------- usage/cost
     def _record_model_usage(self, session_id: str, reply: Any) -> None:
         """Checkpoint this session's cumulative token/cost usage (durable).
@@ -362,6 +385,7 @@ class ResearchRunner:
         self._elapsed_last[session_id] = session_started
         try:
             self.sessions.update(session_id, status="running", error=None)
+            self._mark_job(session_id, "initializing", {"note": "session start"})
             # Idempotent: after a crash/resume the agent state row already
             # exists; a fresh session needs it created before transitioning.
             self.agent.initialize(session_id)
@@ -409,6 +433,9 @@ class ResearchRunner:
             # Phase 1 reasons over measurements instead of its imagination.
             # Durable: a resumed session reuses it and never re-walks.
             await self._discovery_preflight(session_id, session, marketplaces)
+            # Initialization is done (plan + preflight): research is now
+            # doing model-visible work — the durable job row follows.
+            self._mark_job(session_id, "researching", {"note": "methodology start"})
 
             # 1-9. The methodology. The phase order is strict; the only
             # repetition is the STRATEGIC FOCUS PIVOT: when a full pass
@@ -443,6 +470,13 @@ class ResearchRunner:
                         session_id, session, phase, phase_outputs, session_started
                     )
                     phase_outputs[phase] = output
+                    # Owner pause hit INSIDE the phase: stop here. Falling
+                    # through would record the phase as complete, finish its
+                    # timing as "ok", and (when the phase is P8) run the
+                    # integrity pipeline and a possible focus pivot on a
+                    # session that is already paused.
+                    if output.get("_paused"):
+                        return
                     # Deterministic post-phase layers. Both only ORDER and
                     # ALLOCATE: recompute headroom, then let success (not
                     # failure) trigger the next round of discovery.
@@ -461,6 +495,10 @@ class ResearchRunner:
                         self.supervisor.heartbeat(session_id, phase=phase, note="phase_complete")
                     self.sessions.update(
                         session_id, phase=SESSION_PHASE_BY_METHOD_PHASE.get(phase, "exploration")
+                    )
+                    self._bump_progress(
+                        session_id,
+                        (PHASE_ORDER.index(phase) + 1) / len(PHASE_ORDER),
                     )
                     # After adversarial verification (P8), the deterministic
                     # integrity pipeline filters and verifies every synthesis-bound
@@ -503,6 +541,7 @@ class ResearchRunner:
 
             self.sessions.update(session_id, status="completed", progress=1.0)
             self.agent.transition(session_id, "done")
+            self._mark_job(session_id, "completed", {"note": "final report written"})
             self.events.append(
                 session_id, level="info", actor="agent", action="research_completed",
                 detail={"elapsed_seconds": round(time.monotonic() - session_started, 1)},
@@ -522,6 +561,7 @@ class ResearchRunner:
         except asyncio.CancelledError:
             self.sessions.update(session_id, status="interrupted", error="runner task cancelled")
             self.agent.transition(session_id, "waiting_recovery", substate="task_cancelled")
+            self._mark_job(session_id, "recovering", {"note": "runner task cancelled"})
             raise
         except Exception as exc:
             self._fail(session_id, exc)
@@ -543,6 +583,7 @@ class ResearchRunner:
         # Per-mode budget profile: the SAME methodology, shaped differently
         # for a detailed brief vs keywords vs a run with no topic at all.
         max_iter = self._phase_iterations(phase, session.mode)
+        phase_idx = PHASE_ORDER.index(phase)
         phase_start = time.monotonic()
         timing = PhaseTiming(phase=phase, started_at=iso_now())
         timings = self._timings_for(session_id)
@@ -575,6 +616,11 @@ class ResearchRunner:
         # Deterministic deep-discovery inputs for this phase's prompts
         # (census, frontier, market memory, headroom ordering, adjacency).
         discovery = self._discovery_digest(session_id, prior_outputs)
+        # Owner reference images: prepared once per run, attached to every
+        # model call so an image-only or image-steered brief stays visible
+        # to the model for the WHOLE phase (a text note alone cannot steer).
+        ref_images = self._reference_images(session_id)
+        has_images = bool(ref_images) or self._has_images(session_id)
         for iteration in range(1, max_iter + 1):
             if self._cancelled:
                 raise _Cancelled()
@@ -609,6 +655,11 @@ class ResearchRunner:
             timing.session_elapsed_seconds = time.monotonic() - session_started
             timing.attempts_since_progress = stall
             self._tick_elapsed(session_id)
+            # Known progress: this phase's slice of the 9-phase methodology.
+            self._bump_progress(
+                session_id,
+                (phase_idx + iteration / max(1, max_iter)) / len(PHASE_ORDER),
+            )
 
             # --- owner message pickup (non-interrupting) -----------------
             # Checked on EVERY iteration, before the prompt is built: whatever
@@ -632,8 +683,13 @@ class ResearchRunner:
                 prior_phase_outputs={k: v for k, v in prior_outputs.items() if k != phase},
                 timing=timing,
                 images_note=(
-                    "reference images were uploaded; treat their subject matter "
-                    "as part of the brief" if self._has_images(session_id) else ""
+                    (
+                        f"{len(ref_images)} reference image(s) are attached to this "
+                        "message — treat their subject matter as part of the brief"
+                        if ref_images else
+                        "reference images were uploaded; treat their subject matter "
+                        "as part of the brief"
+                    ) if has_images else ""
                 ),
                 screenshot_attached=screenshot_png is not None,
                 owner_messages=self._owner_note_lines_for(session_id),
@@ -673,6 +729,7 @@ class ResearchRunner:
                         session_id, system=system, user=user,
                         expect_fields=spec.output_contract,
                         screenshot_png=screenshot_png,
+                        reference_images=ref_images,
                     )
                 timings.finish(call_key, outcome="ok")
             except asyncio.CancelledError:
@@ -1109,15 +1166,36 @@ class ResearchRunner:
         cfg = self.config
         census_out: dict[str, Any] = {}
         frontier_out: dict[str, Any] = {}
-        if cfg.census_enabled or cfg.frontier_enabled:
+        # A pause or cancel stops the walk via `should_stop` — a PARTIALLY
+        # measured map must never be recorded as `done`, or a resumed session
+        # would treat it as the full map and never re-walk. Each half that
+        # finished cleanly is cached on its own checkpoint, so an interrupt
+        # during the frontier still reuses the finished census (and vice
+        # versa) instead of paying for the whole walk twice.
+        try:
+            ccp = self.checkpoints.get_safe(session_id, "discovery_preflight_census")
+            if ccp is not None and not (ccp.payload or {}).get("error"):
+                census_out = dict(ccp.payload or {})
+        except Exception:
+            census_out = {}
+        try:
+            fcp = self.checkpoints.get_safe(session_id, "discovery_preflight_frontier")
+            if fcp is not None and not (fcp.payload or {}).get("error"):
+                frontier_out = dict(fcp.payload or {})
+        except Exception:
+            frontier_out = {}
+
+        interrupted = self._cancelled or self._pause_requested
+        will_census = bool(cfg.census_enabled) and not census_out and not interrupted
+        will_frontier = bool(cfg.frontier_enabled) and not frontier_out and not interrupted
+        if will_census or will_frontier:
             # Owner visibility: this can take a few minutes on a 2-core box,
             # so it must never look like a hung session.
             self.agent.transition(session_id, "exploring", substate="discovery_preflight")
             self.events.append(
                 session_id, level="info", actor="system",
                 action="discovery_preflight_started",
-                detail={"census": bool(cfg.census_enabled),
-                        "frontier": bool(cfg.frontier_enabled)},
+                detail={"census": bool(cfg.census_enabled), "frontier": bool(cfg.frontier_enabled)},
             )
             self.trace.record(
                 session_id, KIND_DISCOVERY,
@@ -1125,7 +1203,7 @@ class ResearchRunner:
                 "demand-language frontier (deterministic backend work, no model)",
             )
 
-        if cfg.census_enabled and not self._cancelled:
+        if will_census:
             try:
                 census = CategoryCensus(
                     self.browser,
@@ -1147,6 +1225,10 @@ class ResearchRunner:
                     f"{res.visited_nodes} browse node(s) measured — discovery now has "
                     "a measured map instead of the model's imagination",
                 )
+                if not (self._cancelled or self._pause_requested) and "error" not in census_out:
+                    self.checkpoints.save(
+                        session_id, "discovery_preflight_census", census_out
+                    )
             except Exception as exc:
                 census_out = {"error": str(exc)[:200]}
                 self.errors.record(
@@ -1154,7 +1236,7 @@ class ResearchRunner:
                     message=str(exc)[:300], recoverable=True,
                 )
 
-        if cfg.frontier_enabled and not self._cancelled:
+        if will_frontier:
             try:
                 seeds = seeds_for_session(
                     session.prompt or "",
@@ -1182,6 +1264,10 @@ class ResearchRunner:
                     f"phrase(s) mined from {fres.queries_run} suggestion query(ies) "
                     f"({fres.stopped_reason})",
                 )
+                if not (self._cancelled or self._pause_requested) and "error" not in frontier_out:
+                    self.checkpoints.save(
+                        session_id, "discovery_preflight_frontier", frontier_out
+                    )
             except Exception as exc:
                 frontier_out = {"error": str(exc)[:200]}
                 self.errors.record(
@@ -1190,10 +1276,15 @@ class ResearchRunner:
                 )
 
         # Durable, atomic: on resume the preflight is REUSED, never repeated.
+        # `done` is set only when the walk was NOT interrupted — a paused or
+        # cancelled run leaves it False so the resumed session re-walks the
+        # parts that never finished.
+        stopped = self._cancelled or self._pause_requested
         self.checkpoints.save(
-            session_id, "discovery_preflight",
+            session_id,
+            "discovery_preflight",
             {
-                "done": True,
+                "done": not stopped,
                 "census": census_out,
                 "frontier": frontier_out,
                 "at": iso_now(),
@@ -2022,6 +2113,69 @@ class ResearchRunner:
 
         return bool(UploadStore(self.db, self.config).list(session_id))
 
+    def _reference_images(self, session_id: str) -> list[bytes]:
+        """Owner reference images, prepared for the model — cached per run.
+
+        Image-only and image-steered sessions only work if the model can
+        actually SEE the uploads: a text note saying "images were uploaded"
+        cannot steer a six-hour run. Each image is downscaled to a bounded
+        JPEG once (a 20 MB phone photo must never bloat every request) and
+        then attached to each model call of this run. Loading is best-effort:
+        a corrupt or missing upload simply drops out of the prompt — images
+        may only ever improve research, never break it.
+        """
+        cached = self._ref_images.get(session_id)
+        if cached is not None:
+            return cached
+        images: list[bytes] = []
+        try:
+            if self.config.model_vision_enabled:
+                from app.uploads import UploadStore
+
+                store = UploadStore(self.db, self.config)
+                for up in store.list(session_id)[: self.rc.max_reference_images]:
+                    try:
+                        prepared = self._prepare_reference_image(store.read_bytes(up))
+                    except Exception:
+                        continue
+                    if prepared:
+                        images.append(prepared)
+        except Exception:
+            images = []
+        self._ref_images[session_id] = images
+        return images
+
+    @staticmethod
+    def _prepare_reference_image(data: bytes) -> bytes | None:
+        """Downscale/re-encode an uploaded image to a bounded JPEG.
+
+        Returns None for anything unprocessable — transparency is flattened
+        onto white, animated formats contribute their first frame only.
+        """
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+
+            img = Image.open(BytesIO(data))
+            try:
+                img.seek(0)  # animated formats: first frame only
+            except (EOFError, AttributeError):
+                pass
+            if img.mode in ("RGBA", "LA", "P", "PA"):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.getchannel("A"))
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img.thumbnail((768, 768))
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=85)
+            return out.getvalue()
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ helpers
     def _resolve_marketplaces(self, session: Any) -> tuple[list[Marketplace], str]:
         """Explicit lists are obeyed exactly; otherwise auto-select by
@@ -2042,9 +2196,28 @@ class ResearchRunner:
         return None
 
     # ------------------------------------------------------------- failure paths
+    def _mark_job(self, session_id: str, status: str, detail: dict[str, Any] | None = None) -> None:
+        """Advance the durable research-job row through its autonomy states.
+
+        Jobs are created by the start/resume routes and boot recovery; the
+        supervisor owns the vocabulary (queued → initializing → researching →
+        completed / failed / waiting_authentication / …). Without these marks
+        the durable job row — and the `job_*` events on the owner's feed —
+        froze at its creation state forever: a finished session still showed
+        a `pending` job. Best-effort: job bookkeeping never blocks research.
+        """
+        mark = getattr(self.supervisor, "mark", None)
+        if mark is None:
+            return
+        try:
+            mark(session_id, status, detail=detail or None)
+        except Exception:
+            pass  # autonomy bookkeeping is additive; research proceeds
+
     def _pause_for_auth(self, session_id: str, exc: AuthPauseRequired) -> None:
         self.sessions.update(session_id, status="paused", error=f"authentication required: {exc}")
         self.agent.transition(session_id, "waiting_recovery", substate="auth_required")
+        self._mark_job(session_id, "waiting_authentication", {"note": str(exc)[:200]})
         self.errors.record(
             session_id, scope="browser_auth", severity="warning",
             message=str(exc), recoverable=True,
@@ -2060,6 +2233,7 @@ class ResearchRunner:
     def _pause_for_model(self, session_id: str, exc: Exception) -> None:
         self.sessions.update(session_id, status="paused", error=f"model failure: {exc}")
         self.agent.transition(session_id, "waiting_recovery", substate="model_failure")
+        self._mark_job(session_id, "paused", {"note": f"model failure: {str(exc)[:160]}"})
         self.errors.record(
             session_id, scope="model", severity="error",
             message=str(exc), recoverable=True,
@@ -2073,6 +2247,7 @@ class ResearchRunner:
     def _pause_for_browser(self, session_id: str, exc: BrowserManagerError) -> None:
         self.sessions.update(session_id, status="paused", error=f"browser failure: {exc}")
         self.agent.transition(session_id, "waiting_recovery", substate="browser_failure")
+        self._mark_job(session_id, "paused", {"note": f"browser failure: {str(exc)[:160]}"})
         self.errors.record(
             session_id, scope="browser", severity="error", message=str(exc), recoverable=True,
         )
@@ -2084,6 +2259,7 @@ class ResearchRunner:
     def _fail(self, session_id: str, exc: Exception) -> None:
         self.sessions.update(session_id, status="failed", error=str(exc)[:500])
         self.agent.transition(session_id, "failed", substate="runner_error")
+        self._mark_job(session_id, "failed", {"note": f"{type(exc).__name__}: {str(exc)[:200]}"})
         self.errors.record(
             session_id, scope="runner", severity="critical",
             message=f"{type(exc).__name__}: {exc}", recoverable=False,
