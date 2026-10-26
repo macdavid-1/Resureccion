@@ -244,6 +244,23 @@ CREATE TABLE IF NOT EXISTS activity_trace (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_trace(session_id, id);
 
+-- The owner-visible chain of thought: one row per model call. `label` is the
+-- one-line summary (phase/step, upgraded to the model's activity_note when
+-- the reply lands); `detail` is the reasoning text itself, written
+-- incrementally while the call streams so a watcher sees it grow, then
+-- finalized on completion. Research state must never live in memory only.
+CREATE TABLE IF NOT EXISTS thoughts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'streaming',
+    chars INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_thoughts_session ON thoughts(session_id, id);
+
 CREATE TABLE IF NOT EXISTS task_timings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES research_sessions(id),

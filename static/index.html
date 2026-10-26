@@ -164,6 +164,21 @@
             <div class="owner-msg-hint muted" id="owner-msg-hint" hidden></div>
           </div>
 
+          <!-- Owner's chain of thought: one row per model call. Tap a
+               summary to open the full reasoning beneath it (tapping again
+               collapses it back); while the call is streaming, the open row
+               keeps updating in place. Raw reasoning is owner-only. -->
+          <div class="panel mt14">
+            <div class="panel-h">
+              <h2>Chain of thought</h2>
+              <span class="muted mono" style="font-size:0.72rem" id="th-count"></span>
+            </div>
+            <div id="ws-thoughts"></div>
+            <div class="section" id="ws-thoughts-empty">
+              <p class="muted" style="font-size:0.84rem; margin:0">The model's reasoning appears here — tap a line to read the full thought.</p>
+            </div>
+          </div>
+
           <div class="panel mt14">
             <div class="panel-h"><h2>Candidates</h2><span class="muted mono" style="font-size:0.72rem" id="cand-more"></span></div>
             <div id="ws-cands"></div>

@@ -60,10 +60,15 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 | `MODEL_TIMEOUT_SECONDS` | no | `180` | HTTP timeout per model call |
 | `MODEL_VISION_ENABLED` | no | `true` | Attach latest browser screenshot to each iteration |
 | `MODEL_VISION_MAX_BYTES` | no | `400000` | Screenshot size guard for vision input |
+| `MODEL_STREAM` | no | `true` | Stream the model response so the owner watches the chain of thought grow live (session → *Chain of thought*). Purely an enhancement: any endpoint that rejects or ignores `stream` falls back to a plain request automatically, and `false` forces that plain request |
 
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw
 HTML, cookies, or credentials.
+
+Chain-of-thought text is written in exactly one place: the session's
+`thoughts` rows, visible only to the signed-in owner in the app. It never
+enters events, evidence, recordings, exports or reports.
 
 ## Container runtime (Docker / docker-compose)
 

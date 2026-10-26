@@ -1078,10 +1078,12 @@ async def test_research_screenshots_feed_live_view(db, config, session, monkeypa
 
 def test_registry_wires_live_view_into_runner(db, config, monkeypatch):
     """The production construction path (RunnerRegistry._build_runner) must
-    pass the live-view store AND the runner's own session id through."""
+    pass the live-view store, the thought store (the owner's chain of
+    thought), AND the runner's own session id through."""
     import app.model_client as mc
 
     sentinel = object()
+    thought_sentinel = object()
     events = EventLog(db)
     errors = ErrorStateStore(db)
     state = type("S", (), {
@@ -1099,16 +1101,27 @@ def test_registry_wires_live_view_into_runner(db, config, monkeypatch):
         "browser_evidence": BrowserEvidenceStore(db),
         "browser_auth": type("BAS", (), {})(),
         "live_view": sentinel,
+        "thoughts": thought_sentinel,
     })()
     registry = RunnerRegistry(
         db, config, sessions=SessionStore(db, config), events=events,
         errors=errors, state=state,
     )
-    monkeypatch.setattr(mc, "ModelClient", lambda cfg, ev: ScriptedModel(PHASE_OUTPUTS))
+    seen: dict = {}
+
+    def fake_client(cfg, ev, thoughts=None):
+        seen["thoughts"] = thoughts
+        return ScriptedModel(PHASE_OUTPUTS)
+
+    monkeypatch.setattr(mc, "ModelClient", fake_client)
     runner = registry._build_runner("sess-live-42")
     collector = runner.executor.collector
     assert collector._live_view is sentinel
     assert collector._live_session() == "sess-live-42"
+    # The thought store reaches both the client that WRITES reasoning and
+    # the runner that upgrades each summary to the model's activity_note.
+    assert seen["thoughts"] is thought_sentinel
+    assert runner.thoughts is thought_sentinel
 
 
 def test_resume_auth_paused_sessions_only_touches_auth_pauses():

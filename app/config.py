@@ -177,6 +177,12 @@ class Config:
             "1", "true", "yes", "on"
         )
         self.model_vision_max_bytes = _int_env("MODEL_VISION_MAX_BYTES", 400_000)
+        # Live chain of thought: stream the model response so the owner can
+        # watch the reasoning as it is produced. The stream is an enhancement
+        # only — any endpoint that will not stream falls back to the plain
+        # request automatically, so research never depends on it. Set
+        # MODEL_STREAM=false to force the plain request.
+        self.model_stream_enabled = _flag("MODEL_STREAM", True)
         # Optional headers for OpenRouter attribution.
         self.app_title = os.environ.get("APP_TITLE", "Resurreccion").strip()
 

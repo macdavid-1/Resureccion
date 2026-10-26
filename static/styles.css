@@ -313,6 +313,45 @@ select { appearance: none; }
 .trace-item.pivot .k, .trace-item.recovery .k { color: var(--danger); }
 .trace-item.report .k { color: var(--accent-bright); }
 
+/* owner's chain of thought — one row per model call.
+   The summary line is always visible; tapping a row opens the full
+   reasoning underneath THAT row only, and tapping again collapses it. */
+.thought { border-bottom: 1px solid var(--line); animation: fadein 0.3s ease; }
+.thought:last-child { border-bottom: none; }
+.thought-head {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  margin: 0; padding: 10px 14px; border: 0; background: none;
+  font: inherit; color: var(--text); text-align: left; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.thought-dot {
+  flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-3); opacity: 0.55;
+}
+.thought.streaming .thought-dot { background: var(--accent); opacity: 1; animation: ws-pulse 1.6s ease-in-out infinite; }
+.thought.dead .thought-dot { background: var(--danger); opacity: 0.85; animation: none; }
+.thought-sum {
+  flex: 1 1 auto; min-width: 0; font-size: 0.86rem; line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.thought-meta {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 0.66rem;
+  color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.thought-caret { flex: 0 0 auto; font-size: 0.7rem; color: var(--text-3); transition: transform 0.15s ease; }
+.thought.open .thought-caret { transform: rotate(180deg); }
+.thought.open .thought-head { background: var(--bg-raise); }
+.thought-body { padding: 0 14px 12px 29px; }
+.thought-body[hidden] { display: none; }
+.thought-detail {
+  margin: 0; padding: 10px 12px; max-height: 52vh; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: var(--mono); font-size: 0.74rem; line-height: 1.55; color: var(--text-2);
+  background: var(--bg-raise);
+  border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  border-radius: var(--r);
+}
+
 /* reasoning summary — the agent's current one-line operational note */
 .ws-now {
   display: flex; gap: 8px; align-items: flex-start;
@@ -592,6 +631,8 @@ textarea:focus-visible, select:focus-visible, summary:focus-visible {
   .chip.pulse .dot, .rec-badge .dot, .record-btn.recording .dot { animation: none; }
   .skeleton::after { animation: none; }
   .trace-item { animation: none; }
+  .thought { animation: none; }
+  .thought.streaming .thought-dot { animation: none; }
   .ws-now-dot { animation: none; }
   .rb-tap { animation-duration: 1ms; opacity: 0; }
   .btn, .progress i { transition: none; }

@@ -66,7 +66,7 @@ class RunnerRegistry:
             browser=st.browser_manager,
             browser_evidence=st.browser_evidence,
             browser_auth=st.browser_auth,
-            model=ModelClient(self.config, st.events),
+            model=ModelClient(self.config, st.events, thoughts=getattr(st, "thoughts", None)),
             runner_config=self.runner_config,
             claims=getattr(st, "claims", None),
             assessments=getattr(st, "integrity", None),
@@ -74,6 +74,7 @@ class RunnerRegistry:
             supervisor=getattr(st, "autonomy", None),
             owner_messages=getattr(st, "owner_messages", None),
             live_view=getattr(st, "live_view", None),
+            thoughts=getattr(st, "thoughts", None),
             live_session_id=session_id,
         )
 

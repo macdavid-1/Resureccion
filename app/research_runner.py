@@ -186,6 +186,7 @@ class ResearchRunner:
         trace: ActivityTrace | None = None,
         supervisor: Any = None,
         live_view: Any = None,
+        thoughts: Any = None,
         live_session_id: str | None = None,
     ) -> None:
         self.db = db
@@ -218,6 +219,9 @@ class ResearchRunner:
         )
         # --- autonomy layer -----------------------------------------------------
         self.trace = trace or ActivityTrace(db)
+        # Owner-visible chain of thought (one row per model call; the only
+        # place raw reasoning is ever written, and only for the owner).
+        self.thoughts = thoughts
         self.supervisor = supervisor
         self._pause_requested = False
         self._owner_note_lines: list[str] = []
@@ -815,6 +819,12 @@ class ResearchRunner:
                             expect_fields=spec.output_contract,
                             screenshot_png=screenshot_png,
                             reference_images=ref_images,
+                            # The thought's summary until the reply lands:
+                            # where the model is and how far into the phase.
+                            label=(
+                                f"{PHASE_TITLES.get(phase, phase)} · step {iteration}"
+                                + (f" · retry {contract_attempt}" if contract_attempt else "")
+                            ),
                         )
                     timings.finish(call_key, outcome="ok")
                     break
@@ -878,11 +888,20 @@ class ResearchRunner:
             if iter_note:
                 # Tagged so the UI can lift it into the "agent now" reasoning
                 # strip, apart from structural trace lines. Still an
-                # operational summary — chain-of-thought is never recorded.
+                # operational summary — chain-of-thought is never recorded
+                # in the trace: the one exception is the owner-only thought
+                # row, whose SUMMARY becomes this note (a one-line summary of
+                # the very call that produced it).
                 self.trace.record(
                     session_id, KIND_DISCOVERY, iter_note,
                     detail={"source": "activity_note"},
                 )
+                if self.thoughts is not None:
+                    # getattr: test doubles (and any ModelReply-shaped object)
+                    # need not carry the field at all.
+                    thought_id = getattr(reply, "thought_id", None)
+                    if thought_id is not None:
+                        self.thoughts.summarize(thought_id, iter_note)
 
             # --- execute requested browser actions ------------------------
             actions = reply.content.get("actions") or []

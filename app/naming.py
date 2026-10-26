@@ -76,7 +76,7 @@ async def generate_session_name(
     try:
         reply = await model.call(
             session_id, system=system, user=user, max_tokens=64,
-            temperature=0.4, max_retries=1,
+            temperature=0.4, max_retries=1, label="Naming this session",
         )
         name = _valid_name(str((reply.content or {}).get("name") or ""))
     except Exception:

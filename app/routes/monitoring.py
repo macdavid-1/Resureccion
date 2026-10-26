@@ -5,9 +5,14 @@ WITHOUT manual refresh:
 
 - GET /api/sessions/{id}/stream  — Server-Sent Events with a compact state
   snapshot (phase, progress, counts, latest trace lines, browser status,
-  recoveries) pushed on change; resilient to owner disconnects.
+  recoveries, thought summaries + the thought currently streaming) pushed
+  on change; resilient to owner disconnects.
 - GET /api/sessions/{id}/activity — the concise operational trace (the
   «why» one-liners), pollable with after_id for incremental updates.
+- GET /api/sessions/{id}/thoughts — the owner's chain-of-thought summaries
+  (one per model call; reasoning text stays out of the list payload).
+- GET /api/sessions/{id}/thoughts/{thought_id} — one full thought, fetched
+  only when the owner opens it.
 - GET /api/sessions/{id}/timing — timing instrumentation (per task type,
   waits, slowest tasks, seconds since last progress).
 - GET /api/sessions/{id}/live-view/frame — newest live browser frame (JPEG).
@@ -71,6 +76,13 @@ def _snapshot(request: Request, session_id: str, after_trace: int) -> dict:
         errors = []
     last_cp = st.checkpoints.latest(session_id)
     job = st.autonomy.current_job(session_id) if hasattr(st, "autonomy") else None
+    # Chain of thought: summaries for the list, plus full detail for the one
+    # call that is thinking right now so an open row updates as it streams.
+    try:
+        thought_summaries = st.thoughts.recent(session_id)
+        live_thought = st.thoughts.live(session_id)
+    except Exception:
+        thought_summaries, live_thought = [], None
     owner_msgs: list[dict] = []
     try:
         owner_msgs = [m.to_dict() for m in st.owner_messages.journal(session_id, limit=20)]
@@ -84,6 +96,8 @@ def _snapshot(request: Request, session_id: str, after_trace: int) -> dict:
         "job": job.to_dict() if job else None,
         "owner_messages": owner_msgs,
         "trace": [e.to_dict() for e in entries],
+        "thoughts": thought_summaries,
+        "live_thought": live_thought,
         "last_checkpoint": last_cp.to_dict() if last_cp else None,
         "recent_errors": [
             {"scope": e.scope, "severity": e.severity, "message": e.message,
@@ -102,6 +116,30 @@ async def activity(session_id: str, request: Request, after_id: int = 0, limit: 
     trace = ActivityTrace(st.db)
     entries = trace.recent(session_id, after_id=after_id, limit=limit)
     return {"trace": [e.to_dict() for e in entries]}
+
+
+@router.get("/{session_id}/thoughts")
+async def thoughts(session_id: str, request: Request, limit: int = 50) -> dict:
+    """Chain-of-thought SUMMARIES, oldest first (no reasoning text — that
+    is fetched per-row on tap, so the list stays cheap on a phone)."""
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"thoughts": st.thoughts.recent(session_id, limit=limit)}
+
+
+@router.get("/{session_id}/thoughts/{thought_id}")
+async def thought_detail(thought_id: int, session_id: str, request: Request) -> dict:
+    """One full thought: the summary line plus the reasoning text behind it."""
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    thought = st.thoughts.get(thought_id)
+    if thought is None or thought.session_id != session_id:
+        raise HTTPException(status_code=404, detail="thought not found")
+    return {"thought": thought.to_dict()}
 
 
 @router.get("/{session_id}/timing")

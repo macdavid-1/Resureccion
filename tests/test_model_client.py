@@ -306,6 +306,169 @@ async def test_reference_images_are_attached_as_vision_parts():
     await client.aclose()
 
 
+# ---------- streamed reasoning → the owner's chain of thought ----------
+def _sse(*chunks) -> httpx.Response:
+    """A real SSE body: reasoning deltas, then content, then [DONE]."""
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=body.encode(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_answer_feeds_the_live_thought(db, config):
+    """The stream IS the owner's live chain of thought: reasoning deltas are
+    appended as they arrive, and the row closes as done with the text kept."""
+    from app.sessions import SessionStore
+    from app.thoughts import STATUS_DONE, ThoughtStore
+
+    sid = SessionStore(db, config).create(mode="prompt", prompt="x").id
+    store = ThoughtStore(db)
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _sse(
+            {"choices": [{"delta": {"reasoning_content": "weighing demand "}}]},
+            {"choices": [{"delta": {"reasoning_content": "vs saturation"}}]},
+            {"choices": [{"delta": {"content": '{"signals": []}'}}],
+             "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+        )
+
+    cfg = _config()
+    client = ModelClient(cfg, thoughts=store, transport=_transport(handler))
+    reply = await client.call(sid, system="sys", user="usr", label="Phase 1 · step 1")
+
+    assert seen["body"]["stream"] is True
+    assert reply.content == {"signals": []}
+    assert reply.usage.prompt_tokens == 10  # usage rides the final chunk
+    assert reply.thought_id is not None
+    thought = store.get(reply.thought_id)
+    assert thought.status == STATUS_DONE
+    assert thought.detail == "weighing demand vs saturation"
+    assert thought.label == "Phase 1 · step 1"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejected_falls_back_to_the_plain_request():
+    """The plain POST is the contract: an endpoint that will not take
+    `stream` costs one extra request, never a failed call."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if json.loads(request.content).get("stream"):
+            return httpx.Response(400, text="stream is not supported here")
+        return _response({"ok": True})
+
+    client = ModelClient(_config(), transport=_transport(handler))
+    reply = await client.call("s1", system="s", user="u")
+    assert reply.content == {"ok": True}
+    assert calls["n"] == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejected_by_url_is_one_plain_request():
+    """A wrong URL 404s identically either way — no pointless double call."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(404, text="not found")
+
+    client = ModelClient(_config(), transport=_transport(handler))
+    with pytest.raises(ModelError) as exc_info:
+        await client.call("s1", system="s", user="u")
+    assert "404" in str(exc_info.value)
+    assert calls["n"] == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_that_answers_json_instead_of_streaming_costs_one_request():
+    """Providers that ignore `stream` and answer with a plain JSON body are
+    consumed as-is — the body is not paid for twice."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _response({"ok": True})
+
+    client = ModelClient(_config(), transport=_transport(handler))
+    reply = await client.call("s1", system="s", user="u")
+    assert reply.content == {"ok": True}
+    assert calls["n"] == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_plain_response_reasoning_captured_when_not_streaming(db, config):
+    """A non-streamed answer still has its reasoning on the message — the
+    thought exists either way, it just is not live."""
+    from app.sessions import SessionStore
+    from app.thoughts import STATUS_DONE, ThoughtStore
+
+    sid = SessionStore(db, config).create(mode="prompt", prompt="x").id
+    store = ThoughtStore(db)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {
+                "content": json.dumps({"ok": True}),
+                "reasoning_content": "thought this through",
+            }}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        })
+
+    client = ModelClient(_config(), thoughts=store, transport=_transport(handler))
+    reply = await client.call(sid, system="s", user="u")
+    thought = store.get(reply.thought_id)
+    assert thought.status == STATUS_DONE
+    assert thought.detail == "thought this through"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_stream_false_forces_the_plain_request():
+    """MODEL_STREAM=false is the kill switch: no `stream` key ever ships."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return _response({"ok": True})
+
+    client = ModelClient(_config(model_stream_enabled=False), transport=_transport(handler))
+    await client.call("s1", system="s", user="u")
+    assert "stream" not in seen["body"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_call_closes_the_thought_as_failed(db, config):
+    """A 4xx must never leave a row claiming to be streaming forever."""
+    from app.sessions import SessionStore
+    from app.thoughts import STATUS_FAILED, STATUS_STREAMING, ThoughtStore
+
+    sid = SessionStore(db, config).create(mode="prompt", prompt="x").id
+    store = ThoughtStore(db)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="unauthorized")
+
+    client = ModelClient(_config(), thoughts=store, transport=_transport(handler))
+    with pytest.raises(ModelError):
+        await client.call(sid, system="s", user="u")
+    rows = store.recent(sid)
+    assert rows and rows[0]["status"] == STATUS_FAILED
+    assert store.live(sid) is None
+    assert STATUS_STREAMING not in {r["status"] for r in rows}
+    await client.aclose()
+
+
 @pytest.mark.asyncio
 async def test_reference_images_ignored_when_vision_disabled():
     """Vision off means the user content stays a plain string — no image

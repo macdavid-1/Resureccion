@@ -11,7 +11,7 @@
     mode: "prompt", images: [],
     liveSessionId: null, recording: false,
     reportOpen: null,
-    ws: { trace: new Map(), cands: [], opps: [], errors: [] },
+    ws: { trace: new Map(), cands: [], opps: [], errors: [], thoughts: new Map(), open: new Set() },
     liveTimer: null, recTimer: null, elapsedTimer: null,
     lastRefresh: 0,
   };
@@ -76,6 +76,7 @@
     try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
     catch { return ""; }
   }
+  const fmtChars = (n) => `${n >= 1000 ? (n / 1000).toFixed(1) : n}${n >= 1000 ? "k" : ""} chars`;
   const PHASE_LABEL = {
     initializing: "Initializing", discovery: "Discovery", exploration: "Exploration",
     verification: "Verification", synthesis: "Synthesis", reporting: "Reporting", done: "Complete",
@@ -166,10 +167,13 @@
 
   async function openSession(id, targetView) {
     state.liveSessionId = id;
-    state.ws = { trace: new Map(), cands: [], opps: [], errors: [] };
+    state.ws = { trace: new Map(), cands: [], opps: [], errors: [], thoughts: new Map(), open: new Set() };
     state.traceAfter = 0;
     state.lastRefresh = 0;
     $("#ws-trace").innerHTML = "";
+    $("#ws-thoughts").innerHTML = "";
+    $("#ws-thoughts-empty").hidden = false;
+    $("#th-count").textContent = "";
     $("#ws-now").hidden = true;
     $("#owner-msg-input").value = "";
     $("#owner-msg-hint").hidden = true;
@@ -187,6 +191,9 @@
     // History first: SSE only carries entries produced WHILE connected, so
     // the feed (and the reasoning strip) are seeded from the durable trace.
     void loadTrace(id);
+    // Same for the chain of thought: terminal sessions never open the SSE
+    // stream, so the summaries must come from the store either way.
+    void loadThoughts(id);
     // Research that is actually moving shows its browser frames immediately.
     setLiveView(["running", "queued", "paused", "interrupted"].includes(session.status));
     try {
@@ -342,6 +349,9 @@
     renderCounts(snap.counts || state.current.counts);
     // Trace: incremental append only — never re-render the whole feed.
     if (snap.trace?.length) appendTrace(snap.trace);
+    // Chain of thought: rows update in place; the streaming thought rides
+    // along so an open row grows while the model reasons.
+    if (snap.thoughts) applyThoughts(snap.thoughts, snap.live_thought || null);
     if (["completed", "failed", "cancelled"].includes(s.status) && state.liveTimer) {
       clearInterval(state.liveTimer); state.liveTimer = null;  // keep last frame, stop polling
     }
@@ -383,6 +393,132 @@
       const { trace } = await api(`/api/sessions/${id}/activity?limit=50`);
       appendTrace(trace);
     } catch {}
+  }
+
+  async function loadThoughts(id) {
+    try {
+      const { thoughts } = await api(`/api/sessions/${id}/thoughts?limit=50`);
+      applyThoughts(thoughts || [], null);
+    } catch {}
+  }
+
+  // ---------- owner's chain of thought ----------
+  // One row per model call: the summary line always visible, the full
+  // reasoning under it ONLY for the row the owner tapped. Rows are built
+  // once and updated in place, so an open row keeps its scroll position and
+  // its expanded state while the stream keeps pushing — tapping one row
+  // never opens (or closes) another.
+  function createThoughtRow(id) {
+    const el = document.createElement("div");
+    el.className = "thought";
+    el.dataset.thought = String(id);
+    el.innerHTML =
+      '<button type="button" class="thought-head" aria-expanded="false">' +
+        '<span class="thought-dot"></span>' +
+        '<span class="thought-sum">Thinking…</span>' +
+        '<span class="thought-meta"></span>' +
+        '<span class="thought-caret">▾</span>' +
+      "</button>" +
+      '<div class="thought-body" hidden><pre class="thought-detail"></pre></div>';
+    el.querySelector(".thought-head").addEventListener("click", () => toggleThought(id));
+    return el;
+  }
+
+  function setThoughtOpen(el, open) {
+    el.classList.toggle("open", open);
+    el.querySelector(".thought-head").setAttribute("aria-expanded", open ? "true" : "false");
+    el.querySelector(".thought-body").hidden = !open;
+  }
+
+  function applyThoughts(list, live) {
+    const wrap = $("#ws-thoughts");
+    if (!wrap) return;
+    const items = Array.isArray(list) ? list : [];
+    const empty = $("#ws-thoughts-empty");
+    if (empty) empty.hidden = items.length > 0;
+    const count = $("#th-count");
+    if (count) count.textContent = items.length ? `${items.length} thought${items.length > 1 ? "s" : ""}` : "";
+    const seen = new Set();
+    for (const t of items) {
+      if (!t || t.id == null) continue;
+      seen.add(t.id);
+      // Merge, never replace: a detail fetched on tap (or streamed live)
+      // survives the next summary-only snapshot.
+      const rec = { ...(state.ws.thoughts.get(t.id) || {}), ...t };
+      if (live && live.id === t.id && typeof live.detail === "string") rec.detail = live.detail;
+      state.ws.thoughts.set(t.id, rec);
+      let el = wrap.querySelector(`[data-thought="${t.id}"]`);
+      if (!el) { el = createThoughtRow(t.id); wrap.appendChild(el); }
+      updateThoughtRow(el, rec);
+    }
+    // The server keeps the newest rows only; drop what it no longer sends so
+    // the panel cannot grow without bound on a six-hour run.
+    Array.from(wrap.children).forEach((el) => {
+      if (!seen.has(Number(el.dataset.thought))) el.remove();
+    });
+    if (state.ws.thoughts.size > 200) {
+      let dropped = state.ws.thoughts.size - 200;
+      for (const key of state.ws.thoughts.keys()) {
+        if (dropped-- <= 0) break;
+        state.ws.thoughts.delete(key);
+      }
+    }
+  }
+
+  function updateThoughtRow(el, rec) {
+    const streaming = rec.status === "streaming";
+    const label = String(rec.label || "").trim() || (streaming ? "Thinking…" : "Thought");
+    const sum = el.querySelector(".thought-sum");
+    if (sum.textContent !== label) sum.textContent = label;
+    el.classList.toggle("streaming", streaming);
+    el.classList.toggle("dead", rec.status === "failed" || rec.status === "interrupted");
+    const meta = streaming
+      ? `${fmtClock(rec.created_at)} · live`
+      : `${fmtClock(rec.created_at)}${rec.chars ? ` · ${fmtChars(rec.chars)}` : ""}`;
+    const metaEl = el.querySelector(".thought-meta");
+    if (metaEl.textContent !== meta) metaEl.textContent = meta;
+    if (rec.detail === undefined || rec.detail === null) return;
+    const pre = el.querySelector(".thought-detail");
+    if (pre.textContent === rec.detail) return;
+    // Follow the stream only when the owner is already at its end — reading
+    // an earlier part of the thought must never be yanked away.
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+    pre.textContent = rec.detail || (streaming ? "" : "(no reasoning recorded for this call)");
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+  }
+
+  function toggleThought(id) {
+    const el = document.querySelector(`[data-thought="${id}"]`);
+    if (!el) return;
+    if (state.ws.open.has(id)) {
+      // Tap again → collapse back to the summary.
+      state.ws.open.delete(id);
+      setThoughtOpen(el, false);
+      return;
+    }
+    state.ws.open.add(id);
+    setThoughtOpen(el, true);
+    const pre = el.querySelector(".thought-detail");
+    const rec = state.ws.thoughts.get(id) || {};
+    if (rec.detail !== undefined && rec.detail !== null) {
+      pre.textContent = rec.detail || "(no reasoning recorded for this call)";
+      if (rec.status === "streaming") pre.scrollTop = pre.scrollHeight;  // watch it grow
+      return;
+    }
+    // Finished thought, not fetched yet: load its detail once, on tap.
+    const sid = state.current?.id || state.liveSessionId;
+    if (!sid) { pre.textContent = "(session not loaded)"; return; }
+    pre.textContent = "…";
+    api(`/api/sessions/${sid}/thoughts/${id}`)
+      .then(({ thought }) => {
+        const cur = state.ws.thoughts.get(id) || {};
+        cur.detail = typeof thought.detail === "string" ? thought.detail : "";
+        state.ws.thoughts.set(id, cur);
+        if (state.ws.open.has(id)) {
+          pre.textContent = cur.detail || "(no reasoning recorded for this call)";
+        }
+      })
+      .catch((e) => { if (state.ws.open.has(id)) pre.textContent = e.message; });
   }
 
   // Shared by the SSE stream and the initial history load. Appends new rows

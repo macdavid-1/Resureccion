@@ -51,6 +51,7 @@ from app.routes import monitoring as monitoring_routes
 from app.routes import relay as relay_routes
 from app.routes import sessions as session_routes
 from app.trace import ActivityTrace
+from app.thoughts import ThoughtStore
 from app.runner_registry import RunnerRegistry
 from app.security import AuthError, AuthService
 from app.sessions import SessionStore
@@ -132,6 +133,11 @@ def create_app() -> FastAPI:
         # --- research executor (methodology + model + browser actions) ------
         app.state.methodology = Methodology(config)
         app.state.trace = ActivityTrace(db)
+        # Owner-only live chain of thought. A process that died mid-call
+        # leaves rows still marked streaming: keep their flushed detail, but
+        # stop claiming the call is live.
+        app.state.thoughts = ThoughtStore(db)
+        app.state.thoughts.recover_stale()
         app.state.live_view = LiveViewStore(db)
         app.state.autonomy = AutonomySupervisor(
             db,
