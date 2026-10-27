@@ -34,8 +34,10 @@ AGENT_STATES = (
 TRANSITIONS: dict[str, set[str]] = {
     "idle": {"planning", "stopped"},
     # planning may jump straight to any working state: phases with distinct
-    # agent_states start at different points (e.g. P2 starts at analyzing).
-    "planning": {"exploring", "observing", "analyzing", "verifying", "synthesizing", "waiting_recovery", "stopped", "failed"},
+    # agent_states start at different points (e.g. P2 starts at analyzing),
+    # and a RESUME whose every phase is already checkpointed skips straight
+    # to reporting without re-running anything.
+    "planning": {"exploring", "observing", "analyzing", "verifying", "synthesizing", "reporting", "waiting_recovery", "stopped", "failed"},
     "exploring": {"observing", "analyzing", "planning", "verifying", "waiting_recovery", "stopped", "failed"},
     "observing": {"exploring", "analyzing", "verifying", "waiting_recovery", "stopped", "failed"},
     "analyzing": {"verifying", "synthesizing", "exploring", "observing", "planning", "waiting_recovery", "stopped", "failed"},
@@ -45,7 +47,12 @@ TRANSITIONS: dict[str, set[str]] = {
     "done": {"planning", "stopped"},
     "waiting_recovery": {"planning", "exploring", "observing", "analyzing", "verifying", "synthesizing", "stopped", "failed"},
     "stopped": set(),
-    "failed": set(),
+    # failed is recoverable, not a dead end: the owner may resume a failed
+    # run (the runner re-enters at planning and replays from the durable
+    # checkpoints), recovery can park it in waiting_recovery, and it can
+    # still be stopped. Without these edges, resuming a failed session
+    # raised 'invalid transition failed -> planning' and instantly re-failed.
+    "failed": {"planning", "waiting_recovery", "stopped"},
 }
 
 

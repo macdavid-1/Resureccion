@@ -516,6 +516,61 @@ def test_unknown_verdict_candidate_id_is_skipped_not_fatal(db, config, session):
     assert "verdict_skipped_unknown_candidate" in actions, actions
 
 
+# =====================================================================
+# Resume: the agent state machine must let a failed run start again
+# =====================================================================
+@pytest.mark.asyncio
+async def test_resume_from_failed_agent_state_completes(db, config, session):
+    """Regression: _fail() parks the agent in the TERMINAL 'failed' state
+    (no outgoing edges). Resuming then raised AgentStateError —
+    'invalid transition failed -> planning; allowed: []' — on the runner's
+    very first transition, the self-heal budget burned on the same
+    unstoppable error, and the session re-failed. Exactly what the owner
+    hit tapping Resume."""
+    sessions = SessionStore(db, config)
+    agent = AgentStateStore(db, EventLog(db))
+    sessions.update(session, status="failed", error="candidate x not found")
+    agent.initialize(session)
+    agent.transition(session, "planning", substate="methodology_start")
+    agent.transition(session, "failed", substate="runner_error")
+    # The resume route marks the session queued before spawning the runner.
+    sessions.update(session, status="queued")
+
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    await runner.run(session)
+
+    s = sessions.require(session)
+    assert s.status == "completed", s.error
+    assert agent.require(session).state == "done"
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_straight_to_report_when_all_phases_checkpointed(db, config, session):
+    """A run that died with every phase already committed (e.g. while
+    writing the report) resumes by skipping ALL phases — planning must be
+    able to jump straight to reporting or the resume re-fails. Nothing
+    researched is re-run: the resumed model is never called for a phase."""
+    sessions = SessionStore(db, config)
+    agent = AgentStateStore(db, EventLog(db))
+    await make_runner(db, config, ScriptedModel(PHASE_OUTPUTS)).run(session)
+    assert sessions.require(session).status == "completed"
+
+    # Emulate a crash at report time: the durable marks a failed run leaves.
+    agent.transition(session, "planning", substate="crash_setup")
+    agent.transition(session, "failed", substate="runner_error")
+    sessions.update(session, status="failed", error="report write crashed")
+    sessions.update(session, status="queued")
+
+    resumed_model = ScriptedModel(PHASE_OUTPUTS)
+    await make_runner(db, config, resumed_model).run(session)
+
+    s = sessions.require(session)
+    assert s.status == "completed", s.error
+    assert agent.require(session).state == "done"
+    # Every phase_output checkpoint was reused: zero phase re-runs.
+    assert resumed_model.calls == [], resumed_model.calls
+
+
 @pytest.mark.asyncio
 async def test_run_shows_live_phase_and_accumulates_elapsed(db, config, session):
     """Two truths the owner was confused by: the session row must show the
