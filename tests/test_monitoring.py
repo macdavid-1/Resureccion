@@ -74,6 +74,24 @@ class TestStream:
         assert snap["session"]["id"] == sid
         assert "counts" in snap and "trace" in snap
 
+    def test_stream_snapshot_carries_live_usage(self, client):
+        """The header's token counters read usage off the SSE session
+        payload — without it they only ever refreshed on a page reload."""
+        from app.recovery import CheckpointStore
+
+        h = _login(client)
+        sid = _mk_session(client, h)
+        CheckpointStore(client.app.state.db).save(
+            sid, "model_usage",
+            {"calls": 3, "failed_calls": 0, "prompt_tokens": 1234,
+             "completion_tokens": 56, "cost_usd": 0.0},
+        )
+        res = client.get(f"/api/sessions/{sid}/stream?max_events=1", headers=h)
+        line = next(l for l in res.text.splitlines() if l.startswith("data: "))
+        snap = json.loads(line[6:])
+        assert snap["session"]["usage"]["prompt_tokens"] == 1234
+        assert snap["session"]["usage"]["completion_tokens"] == 56
+
 
 class TestLiveView:
     def test_live_frame_empty_204(self, client):

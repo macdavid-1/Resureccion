@@ -13,6 +13,7 @@
     reportOpen: null,
     ws: { trace: new Map(), cands: [], opps: [], errors: [], thoughts: new Map(), open: new Set() },
     liveTimer: null, recTimer: null, elapsedTimer: null,
+    elapsedAnchor: null, elapsedLive: false,
     lastRefresh: 0,
   };
 
@@ -209,7 +210,12 @@
   function updateWsHead(s) {
     $("#ws-name").textContent = s.name || "—";
     $("#ws-mode").textContent = ({ prompt: "Directed", keywords: "Seeded", auto: "Autonomous" })[s.mode] || s.mode;
-    $("#ws-elapsed").textContent = fmtElapsed(s.elapsed_seconds);
+    // The header clock is LIVE: every server value re-anchors the ticker;
+    // it never snaps the text — the durable counter only folds once per
+    // model iteration, so writing it straight through froze the clock for
+    // minutes at a time.
+    reanchorElapsed(s);
+    setLiveClock(s);
     // Per-run model spend — durable checkpoint from the runner (null before
     // the first call of a run). Cost shows only when the provider reports it.
     const u = s.usage;
@@ -225,6 +231,51 @@
     renderPauseBanner(s);
     $("#tb-context").textContent = state.view === "research" ? s.name : $("#tb-context").textContent;
     renderActions(s);
+  }
+
+  // ---------- live header clock ----------
+  // #ws-elapsed counts live while a run moves. Every server render
+  // re-anchors {counter, wall-clock}; the ticker extrapolates whole seconds
+  // between pushes. An incoming server value is adopted ONLY when it is
+  // ahead of the current estimate: the durable counter folds once per model
+  // iteration so it lags between folds — snapping to it froze the clock,
+  // and adopting a stale one would make time run backwards.
+  function reanchorElapsed(s) {
+    const incoming = Number(s.elapsed_seconds);
+    if (!Number.isFinite(incoming)) return;
+    const now = Date.now();
+    const a = state.elapsedAnchor;
+    // Anchor per session: opening another session must not inherit the
+    // previous session's running total.
+    if (!a || a.sid !== s.id) {
+      state.elapsedAnchor = { sid: s.id, base: incoming, at: now };
+      return;
+    }
+    const est = a.base + (now - a.at) / 1000;
+    if (incoming > est) state.elapsedAnchor = { ...a, base: incoming, at: now };
+  }
+
+  function renderElapsed() {
+    const a = state.elapsedAnchor;
+    if (!a) return;
+    const secs = a.base + (state.elapsedTimer ? (Date.now() - a.at) / 1000 : 0);
+    $("#ws-elapsed").textContent = fmtElapsed(secs);
+  }
+
+  function setLiveClock(s) {
+    const live = ["running", "queued", "verifying"].includes(s.status);
+    if (state.elapsedLive && !live) {
+      // Freezing (pause/finish): fold the extrapolation into the anchor so
+      // the clock stops exactly where it stood, not at a staler counter.
+      const a = state.elapsedAnchor;
+      if (a) { a.base += (Date.now() - a.at) / 1000; a.at = Date.now(); }
+    }
+    state.elapsedLive = live;
+    if (live && !state.elapsedTimer) state.elapsedTimer = setInterval(renderElapsed, 1000);
+    if (!live && state.elapsedTimer) {
+      clearInterval(state.elapsedTimer); state.elapsedTimer = null;
+    }
+    renderElapsed();
   }
 
   // Why research is not moving — always visible, never a bare "paused".
@@ -368,19 +419,6 @@
     if (s.status !== prevStatus || ["completed", "failed"].includes(s.status)) {
       refreshFindings(s.id);
       if (["completed", "failed", "cancelled"].includes(s.status) && state.recording) stopRecording();
-    }
-    // Elapsed clock stays honest between SSE pushes (heartbeat every 15s).
-    if (!state.elapsedTimer && state.current && ["running", "queued", "verifying"].includes(state.current.status)) {
-      state.elapsedTimer = setInterval(() => {
-        if (!state.current) return;
-        const t0 = Date.parse(state.current.updated_at || "") || 0;
-        if (!t0) return;
-        const base = state.current.elapsed_seconds || 0;
-        $("#ws-elapsed").textContent = fmtElapsed(base + Math.max(0, (Date.now() - t0) / 1000));
-      }, 1000);
-    } else if (state.elapsedTimer && state.current && !["running", "queued", "verifying"].includes(state.current.status)) {
-      clearInterval(state.elapsedTimer); state.elapsedTimer = null;
-      $("#ws-elapsed").textContent = fmtElapsed(state.current.elapsed_seconds);
     }
     const now = Date.now();
     if (now - state.lastRefresh > THROTTLE_MS) {

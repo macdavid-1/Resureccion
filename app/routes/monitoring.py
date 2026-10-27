@@ -88,8 +88,17 @@ def _snapshot(request: Request, session_id: str, after_trace: int) -> dict:
         owner_msgs = [m.to_dict() for m in st.owner_messages.journal(session_id, limit=20)]
     except Exception:
         owner_msgs = []
+    # Per-run model spend — the same durable checkpoint the detail route
+    # serves, pushed on every SSE tick so the header's token counters
+    # advance after each model call WITHOUT a page refresh.
+    session_data = session.to_dict()
+    try:
+        usage_cp = st.checkpoints.get(session_id, "model_usage")
+        session_data["usage"] = dict(usage_cp.payload) if usage_cp else None
+    except Exception:
+        session_data["usage"] = None
     return {
-        "session": session.to_dict(),
+        "session": session_data,
         "counts": counts,
         "agent": agent.to_dict() if agent else None,
         "browser": browser.to_dict() if browser else None,
