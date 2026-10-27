@@ -162,7 +162,10 @@ async def resume_session(session_id: str, request: Request) -> dict:
     st = request.app.state
     try:
         s = st.sessions.require(session_id)
-        if s.status not in ("interrupted", "paused"):
+        # Failed sessions are resumable too: the runner replays from the
+        # durable checkpoint cursor, so a promising research that died
+        # mid-run continues where it stopped instead of being lost.
+        if s.status not in ("interrupted", "paused", "failed"):
             raise ValueError(f"cannot resume session in status {s.status!r}")
         st.sessions.bump_resume(session_id)
         s = st.sessions.update(session_id, status="queued", error=None)

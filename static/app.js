@@ -244,7 +244,7 @@
     const el = $("#ws-actions");
     const btns = [];
     if (s.status === "draft") btns.push(`<button class="btn primary small" data-act="start">Start research</button>`);
-    if (["interrupted", "paused"].includes(s.status)) btns.push(`<button class="btn primary small" data-act="resume">Resume</button>`);
+    if (["interrupted", "paused", "failed"].includes(s.status)) btns.push(`<button class="btn primary small" data-act="resume">Resume</button>`);
     if (s.status === "running") btns.push(`<button class="btn small" data-act="pause">Pause</button>`);
     if (!["completed", "cancelled"].includes(s.status)) btns.push(`<button class="btn small danger" data-act="cancel">Cancel</button>`);
     el.innerHTML = btns.join("");
@@ -313,6 +313,9 @@
       state.current = session;
       updateWsHead(session);
       toast(({ start: "Research started", pause: "Pausing at a safe boundary", resume: "Resuming", cancel: "Cancelled" })[act] || act);
+      // A failed session's live stream was disconnected when it died;
+      // resuming must re-attach it or the owner watches a frozen view.
+      if (act === "resume") connectStream(id);
       refreshSessions();
     } catch (e) { toast(e.message); }
   }

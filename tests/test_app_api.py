@@ -35,6 +35,33 @@ def test_auth_required_for_sessions(client) -> None:
     assert res.status_code == 401
 
 
+def test_failed_session_is_owner_resumable(client) -> None:
+    """A FAILED research must be resumable from its checkpoints — the exact
+    recovery path for a promising session that died mid-run. Terminal
+    sessions (completed) stay non-resumable."""
+    headers = {"X-Auth-Token": _login(client)["token"]}
+    res = client.post(
+        "/api/sessions", headers=headers,
+        json={"mode": "prompt", "prompt": "research grief journals"},
+    )
+    sid = res.json()["session"]["id"]
+    client.app.state.sessions.update(sid, status="failed", error="boom")
+
+    # Stub the live-runner spawn so the route test never starts research.
+    started: list[str] = []
+    client.app.state.runners.start = lambda s: started.append(s)  # type: ignore[method-assign]
+
+    res = client.post(f"/api/sessions/{sid}/resume", headers=headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["session"]["status"] == "queued"
+    assert started == [sid]
+
+    # Terminal sessions stay non-resumable.
+    client.app.state.sessions.update(sid, status="completed")
+    res = client.post(f"/api/sessions/{sid}/resume", headers=headers)
+    assert res.status_code == 400
+
+
 def test_login_and_session_flow(client) -> None:
     data = _login(client)
     token = data["token"]

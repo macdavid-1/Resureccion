@@ -92,6 +92,7 @@ from app.trace import (
     KIND_OWNER,
     KIND_PHASE,
     KIND_PIVOT,
+    KIND_RECOVERY,
     KIND_REPORT,
     KIND_VERIFICATION,
     ActivityTrace,
@@ -103,6 +104,7 @@ from app.trace import (
     marketplace_text,
     phase_text,
     pivot_text,
+    recovery_text,
     verification_text,
 )
 from app.verification import VerificationEngine, evidence_for_candidate
@@ -115,6 +117,13 @@ from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
 # after the retries is salvaged and flows through the normal gate machinery.
 # A missing field is a degraded iteration — research NEVER pauses for it.
 _CONTRACT_REPAIR_ATTEMPTS = 1
+
+# Unexpected errors inside a run are RECOVERED this many times before the
+# session is marked failed. The retry re-enters the methodology at its
+# durable checkpoint cursor (completed phases reused, the interrupted
+# phase resumed from its own iteration checkpoint), so a heal costs one
+# extra attempt — never research quality. See ResearchRunner._self_heal.
+_SELF_HEAL_ATTEMPTS = 3
 
 
 @asynccontextmanager
@@ -394,11 +403,68 @@ class ResearchRunner:
     # ------------------------------------------------------------------- run
     async def run(self, session_id: str) -> None:
         """Execute the full methodology for a session. Never raises outward —
-        every failure path ends in a durable session status."""
+        every failure path ends in a durable session status.
+
+        Self-healing wrapper: an unexpected error inside the run is
+        RECOVERED (up to _SELF_HEAL_ATTEMPTS times) by re-entering the
+        methodology at its durable checkpoint cursor — completed phases are
+        reused and the interrupted phase resumes mid-flight, so a heal
+        costs one extra attempt, never research quality. The session is
+        marked failed only when the heal budget is spent (and even then it
+        stays owner-resumable). Dedicated outcomes — cancel, auth/model/
+        browser pause — are handled first and never loop.
+        """
         session = self.sessions.require(session_id)
         session_started = time.monotonic()
         self._elapsed_last[session_id] = session_started
+        heals_left = _SELF_HEAL_ATTEMPTS
         try:
+            while True:
+                try:
+                    await self._run_once(session_id, session, session_started)
+                    return
+                except _Cancelled:
+                    try:
+                        self.sessions.update(session_id, status="cancelled", error="cancelled by owner")
+                        self.agent.transition(session_id, "stopped", substate="cancelled")
+                    except Exception:
+                        pass  # never mask a durable cancel behind a DB hiccup
+                    return
+                except AuthPauseRequired as exc:
+                    self._pause_for_auth(session_id, exc)
+                    return
+                except (ModelConfigError, ModelError) as exc:
+                    self._pause_for_model(session_id, exc)
+                    return
+                except BrowserManagerError as exc:
+                    self._pause_for_browser(session_id, exc)
+                    return
+                except asyncio.CancelledError:
+                    self.sessions.update(session_id, status="interrupted", error="runner task cancelled")
+                    self.agent.transition(session_id, "waiting_recovery", substate="task_cancelled")
+                    self._mark_job(session_id, "recovering", {"note": "runner task cancelled"})
+                    raise
+                except Exception as exc:
+                    if heals_left > 0:
+                        heals_left -= 1
+                        self._self_heal(session_id, exc, heals_left)
+                        continue  # re-enter at the last durable checkpoint
+                    self._fail(session_id, exc)
+                    return
+        finally:
+            self._tick_elapsed(session_id)  # flush the final slice on every exit path
+            self._elapsed_last.pop(session_id, None)
+            await self.model.aclose()
+
+    async def _run_once(
+        self, session_id: str, session: Any, session_started: float
+    ) -> None:
+            """One attempt at the full methodology; run() self-heals an
+            unexpected error by re-entering this from the checkpoints.
+
+            NOTE: the body keeps its original 12-space indent from when it
+            lived inside run()'s try block — consistent, so valid Python.
+            """
             self.sessions.update(session_id, status="running", error=None)
             self._mark_job(session_id, "initializing", {"note": "session start"})
             # Idempotent: after a crash/resume the agent state row already
@@ -600,29 +666,7 @@ class ResearchRunner:
                 session_id, level="info", actor="agent", action="research_completed",
                 detail={"elapsed_seconds": round(time.monotonic() - session_started, 1)},
             )
-        except _Cancelled:
-            try:
-                self.sessions.update(session_id, status="cancelled", error="cancelled by owner")
-                self.agent.transition(session_id, "stopped", substate="cancelled")
-            except Exception:
-                pass  # never mask a durable cancel behind a DB hiccup
-        except AuthPauseRequired as exc:
-            self._pause_for_auth(session_id, exc)
-        except (ModelConfigError, ModelError) as exc:
-            self._pause_for_model(session_id, exc)
-        except BrowserManagerError as exc:
-            self._pause_for_browser(session_id, exc)
-        except asyncio.CancelledError:
-            self.sessions.update(session_id, status="interrupted", error="runner task cancelled")
-            self.agent.transition(session_id, "waiting_recovery", substate="task_cancelled")
-            self._mark_job(session_id, "recovering", {"note": "runner task cancelled"})
-            raise
-        except Exception as exc:
-            self._fail(session_id, exc)
-        finally:
-            self._tick_elapsed(session_id)  # flush the final slice on every exit path
-            self._elapsed_last.pop(session_id, None)
-            await self.model.aclose()
+
 
     # ------------------------------------------------------------------ phases
     async def _run_phase(
@@ -1172,8 +1216,25 @@ class ResearchRunner:
             for v in verdicts:
                 if not isinstance(v, dict):
                     continue
-                cid = v.get("candidate_id")
+                cid = str(v.get("candidate_id") or "").strip()
                 if not cid:
+                    continue
+                if self.candidates.get(session_id, cid) is None:
+                    # The model referenced a candidate id that does not
+                    # exist — a hallucinated slug, not a real row. A verdict
+                    # is model output: an unknown id is skipped with a
+                    # durable warning, never allowed to abort the run. (This
+                    # exact crash failed a live session mid-verification:
+                    # "candidate cand_... not found in session ...").
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="verdict_skipped_unknown_candidate",
+                        detail={
+                            "candidate_id": cid[:80],
+                            "verdict": str(v.get("verdict") or "")[:40],
+                            "phase": phase,
+                        },
+                    )
                     continue
                 verdict = str(v.get("verdict") or "").lower()
                 if verdict == "pass":
@@ -2553,6 +2614,59 @@ class ResearchRunner:
             session_id, level="error", actor="browser",
             action="paused_for_browser_failure", detail={"error": str(exc)[:300]},
         )
+
+    def _self_heal(self, session_id: str, exc: Exception, remaining: int) -> None:
+        """Recover an unexpected research error WITHOUT failing the session.
+
+        The retry re-enters the methodology at its durable checkpoint
+        cursor: completed phases are reused from 'phase_output', the
+        interrupted phase resumes from its own iteration checkpoint, and
+        discovery preflight is never re-walked — so a heal costs one extra
+        attempt, never research quality. Every heal is recorded durably
+        (recoverable error state, event, recovery trace, checkpoint) so the
+        owner can audit exactly what was recovered; the session fails only
+        when the heal budget is spent (and stays owner-resumable even then).
+        """
+        try:
+            # Park the agent in waiting_recovery so the retry's
+            # methodology_start transition is legal from ANY mid-phase state.
+            self.agent.transition(session_id, "waiting_recovery", substate="self_heal")
+        except Exception:
+            pass  # already there (or a DB hiccup) — the heal proceeds anyway
+        try:
+            self.errors.record(
+                session_id, scope="runner", severity="warning",
+                message=f"{type(exc).__name__}: {exc}", recoverable=True,
+            )
+            self.events.append(
+                session_id, level="warn", actor="system",
+                action="research_self_heal",
+                detail={
+                    "error": str(exc)[:300],
+                    "type": type(exc).__name__,
+                    "attempts_remaining": remaining,
+                    "trace": traceback.format_exc()[-800:],
+                },
+            )
+            self.trace.record(
+                session_id, KIND_RECOVERY,
+                recovery_text(
+                    f"{type(exc).__name__}: {str(exc)[:100]}",
+                    f"resuming from the last checkpoint "
+                    f"({remaining} recovery attempt(s) left)",
+                ),
+            )
+            self.checkpoints.save(
+                session_id, "self_heal",
+                {"at": iso_now(), "error": str(exc)[:500],
+                 "type": type(exc).__name__, "remaining": remaining},
+            )
+            self._mark_job(
+                session_id, "recovering",
+                {"note": f"self-heal: {str(exc)[:160]}"},
+            )
+        except Exception:
+            pass  # audit bookkeeping never blocks the recovery itself
 
     def _fail(self, session_id: str, exc: Exception) -> None:
         self.sessions.update(session_id, status="failed", error=str(exc)[:500])

@@ -461,6 +461,61 @@ async def test_auth_pause_lands_in_durable_paused_status(db, config, session):
     assert cp is not None
 
 
+# =====================================================================
+# Self-heal: an unexpected error recovers; it never kills the session
+# =====================================================================
+@pytest.mark.asyncio
+async def test_self_heal_recovers_transient_error_without_failing(db, config, session):
+    """A mid-run crash (like the hallucinated candidate id that failed a
+    live session at Verification) must heal from the durable checkpoint
+    cursor: the research COMPLETES, the heal is auditable on the event
+    feed, and no research_failed event is ever emitted."""
+    sessions = SessionStore(db, config)
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    calls = {"n": 0}
+    orig = runner._refresh_whitespace
+
+    def flaky(sid: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("candidate cand_true_facts_imprint not found in session x")
+        return orig(sid)
+
+    runner._refresh_whitespace = flaky  # type: ignore[method-assign]
+    await runner.run(session)
+
+    s = sessions.require(session)
+    assert s.status == "completed", s.error
+    assert calls["n"] >= 2, "the flaky call was never retried"
+    actions = [e.action for e in EventLog(db).tail(session)]
+    assert "research_self_heal" in actions, actions
+    assert "research_failed" not in actions, actions
+    # The heal is durable: a recoverable error state + a checkpoint record.
+    assert CheckpointStore(db).get(session, "self_heal") is not None
+
+
+def test_unknown_verdict_candidate_id_is_skipped_not_fatal(db, config, session):
+    """The model may emit a hallucinated candidate id in an adversarial
+    verdict — the exact crash that failed a live session mid-verification.
+    It must be skipped with a durable warning while real verdicts still
+    apply."""
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    real = runner.candidates.create(session, niche="real niche", marketplace="us")
+    runner._apply_phase_effects(
+        session, "adversarial_verification",
+        {
+            "verdicts": [
+                {"candidate_id": "cand_true_facts_imprint", "verdict": "pass"},
+                {"candidate_id": real.id, "verdict": "reject", "reasons": ["weak evidence"]},
+            ]
+        },
+    )
+    # Unknown id skipped; the real candidate's verdict still lands.
+    assert runner.candidates.get(session, real.id).status == "rejected"
+    actions = [e.action for e in EventLog(db).tail(session)]
+    assert "verdict_skipped_unknown_candidate" in actions, actions
+
+
 @pytest.mark.asyncio
 async def test_run_shows_live_phase_and_accumulates_elapsed(db, config, session):
     """Two truths the owner was confused by: the session row must show the
