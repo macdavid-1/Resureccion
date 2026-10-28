@@ -78,6 +78,70 @@ class _Retryable(Exception):
 # request would fail the same way, so surface it at once.
 _STREAM_UNSUPPORTED = frozenset({400, 405, 415, 422, 501})
 
+# Providers spell reasoning differently: DeepInfra documents
+# `reasoning_content`, OpenRouter uses `reasoning` (string) or
+# `reasoning_details` (list of {text}), and a vLLM-hosted reasoner without a
+# reasoning parser leaves the model's ```-think block inside the answer text.
+# All three shapes are normalized here so the owner's chain of thought shows
+# real reasoning regardless of how the endpoint spells it.
+# Built from fragments so the tags never appear as a contiguous literal
+# here (same reason vLLM ships its parser as a string constant).
+_THINK_TAGS = (
+    ("<" + "think>", "</" + "think>"),
+    ("<" + "thinking>", "</" + "thinking>"),
+)
+_THINK_PATTERNS = tuple(
+    re.compile(re.escape(op) + r"(.*?)" + re.escape(cl), re.DOTALL)
+    for op, cl in _THINK_TAGS
+)
+
+# Written into the thought when thinking is ON but the provider exposed no
+# reasoning text at all — the owner gets the REASON instead of the bare
+# "(no reasoning recorded)" placeholder. It is clearly our text, never
+# model output.
+_NO_REASONING_NOTE = (
+    "(No reasoning text was returned by the provider for this call, so there "
+    "is nothing to show — the model answered without exposing "
+    "chain-of-thought. Check MODEL_THINKING / MODEL_REASONING_EFFORT and "
+    "whether the endpoint documents a reasoning field for this model.)"
+)
+
+
+def _reasoning_text(value: Any) -> str:
+    """Normalize any provider spelling of a reasoning field to plain text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("text") or item.get("content") or item.get("reasoning")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "".join(parts)
+    return ""
+
+
+def _split_think(text: str) -> tuple[str, str]:
+    """(think block recovered from the text, text with the block removed).
+
+    The fallback of last resort: the reasoner tagged its thinking but the
+    server never split it into a reasoning field. The thinking is the
+    owner's chain of thought — it must not be lost, and it must not leak
+    into the JSON parse either.
+    """
+    found: list[str] = []
+
+    def _collect(match: "re.Match[str]") -> str:
+        found.append(match.group(1))
+        return ""
+
+    for pattern in _THINK_PATTERNS:
+        text = pattern.sub(_collect, text)
+    return "\n".join(part for part in found if part.strip()), text
+
 
 @dataclass
 class ModelUsage:
@@ -282,6 +346,20 @@ class ModelClient:
                 # the thought, so the text is never recorded twice.
                 self._capture_reasoning(thought_id, message)
                 raw = message.get("content") or ""
+                # A reasoner whose thinking the server never split out keeps
+                # its think block inside the answer text: recover it for the
+                # owner's thought and keep it out of the JSON parse.
+                think, answer = _split_think(raw)
+                if think:
+                    if (
+                        self.thoughts is not None and thought_id is not None
+                        and not self.thoughts.has_detail(thought_id)
+                    ):
+                        try:
+                            self.thoughts.append(thought_id, think)
+                        except Exception:
+                            pass
+                    raw = answer
                 content = _extract_json(raw)
                 usage = data.get("usage") or {}
                 self.usage.calls += 1
@@ -363,21 +441,33 @@ class ModelClient:
         if self.thoughts is None or thought_id is None:
             return
         try:
+            # Thinking is on but nothing reasoning-shaped ever arrived: say
+            # WHY, instead of leaving the owner staring at a placeholder.
+            if (
+                status == STATUS_DONE
+                and self.config.model_thinking_enabled
+                and not self.thoughts.has_detail(thought_id)
+            ):
+                self.thoughts.append(thought_id, _NO_REASONING_NOTE)
             self.thoughts.finish(thought_id, status=status)
         except Exception:
             pass
 
     def _capture_reasoning(self, thought_id: int | None, message: Any) -> None:
-        """Plain (non-streamed) answers carry their reasoning here —
-        DeepInfra documents `message.reasoning_content`, other OpenAI-compatible
-        endpoints use `reasoning`. Captured only when the stream did not
-        already write it into the thought."""
+        """Plain (non-streamed) answers carry their reasoning here under any
+        of the documented spellings (`reasoning_content`, `reasoning`,
+        `reasoning_details`). Captured only when the stream did not already
+        write it into the thought."""
         if self.thoughts is None or thought_id is None or not isinstance(message, dict):
             return
         if self.thoughts.has_detail(thought_id):
             return
-        text = message.get("reasoning_content") or message.get("reasoning")
-        if isinstance(text, str) and text:
+        text = (
+            _reasoning_text(message.get("reasoning_content"))
+            or _reasoning_text(message.get("reasoning"))
+            or _reasoning_text(message.get("reasoning_details"))
+        )
+        if text:
             try:
                 self.thoughts.append(thought_id, text)
             except Exception:
@@ -490,9 +580,10 @@ class ModelClient:
                         delta = ch.get("delta") or {}
                         if not isinstance(delta, dict):
                             continue
-                        for field in ("reasoning_content", "reasoning"):
-                            piece = delta.get(field)
-                            if isinstance(piece, str) and piece:
+                        for field in ("reasoning_content", "reasoning",
+                                      "reasoning_details"):
+                            piece = _reasoning_text(delta.get(field))
+                            if piece:
                                 reasoning_parts.append(piece)
                                 if self.thoughts is not None and thought_id is not None:
                                     try:

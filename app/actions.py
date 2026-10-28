@@ -22,7 +22,11 @@ from typing import Any
 from urllib.parse import quote_plus, urlparse
 
 from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
-from app.browser_manager import BrowserManager, BrowserManagerError
+from app.browser_manager import (
+    BrowserManager,
+    BrowserManagerError,
+    dismiss_amazon_overlays,
+)
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.events import EventLog
 from app.marketplace import (
@@ -744,6 +748,40 @@ class ActionExecutor:
         return ActionResult(
             action="wait", ok=True, marketplace="", url="",
             evidence_ids=[], summary=f"waited {seconds}s",
+        )
+
+    async def _do_dismiss_overlay(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Click Amazon's refusal overlays (shipping-country tooltip, …).
+
+        The backend already dismisses them at navigation, capture and
+        screenshot time; this action exists so the MODEL can force a
+        dismissal the moment it SEES one in a screenshot ("click Dismiss")
+        instead of reading a page an overlay is covering — and again every
+        time it reappears. Only refusal labels are ever clicked; acceptance
+        buttons ("Change Address") would alter the owner's session state.
+        """
+        try:
+            pages = await self.browser.pages()
+        except Exception:
+            pages = []
+        clicked: list[str] = []
+        for page in pages:
+            url = str(getattr(page, "url", "") or "")
+            if marketplace_from_url(url) is None:
+                continue  # only ever click on Amazon pages
+            try:
+                clicked.extend(await dismiss_amazon_overlays(page))
+            except Exception:
+                continue  # dismissal is hygiene, never a research dependency
+        summary = (
+            f"dismissed {len(clicked)} overlay(s): "
+            + ", ".join(sorted(set(clicked)))
+            if clicked else
+            "no overlay was present — nothing needed dismissing"
+        )
+        return ActionResult(
+            action="dismiss_overlay", ok=True, marketplace="", url="",
+            evidence_ids=[], summary=summary,
         )
 
     # ------------------------------------------------------------------ helpers

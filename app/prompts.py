@@ -68,6 +68,13 @@ def build_system_prompt(phase: str) -> str:
         "in the evidence after the shipping-country overlay is dismissed "
         "automatically. Quote that number when you judge competition, and "
         "prefer searches in the relevant department ('books' or 'kindle').\n"
+        "- Amazon overlays: the shipping-country tooltip (\"We're showing you "
+        "items that ship to …\") and similar popups cover the result count "
+        "and steal clicks. The backend dismisses them automatically before "
+        "every capture — but the moment you SEE one in a screenshot or in "
+        "evidence, request the 'dismiss_overlay' action immediately, and do "
+        "it again every time it reappears. Never read, quote or judge a page "
+        "while an overlay is covering it.\n"
         "- If evidence is missing, request more actions; do not guess.\n"
         "- Amazon sign-in is optional. When a page hits a sign-in wall the "
         "action fails and YOU decide: skip that source (e.g. review mining) "
@@ -112,6 +119,7 @@ def build_user_prompt(
     owner_messages: list[str] | None = None,
     pivot_directive: str | None = None,
     phase_gate: dict[str, Any] | None = None,
+    depth_note: str = "",
     census_digest: list[dict[str, Any]] | None = None,
     frontier_terms: list[str] | None = None,
     market_memory: list[dict[str, Any]] | None = None,
@@ -266,6 +274,14 @@ def build_user_prompt(
             "new instruction in your next actions and analyses): "
             + _compact(rendered, limit=2000)
         )
+
+    # --- research depth (how much time the run still owes) ------------------
+    # Deterministic backend figure: while the session is under its minimum
+    # research duration the exit gate above already carries the RAISED
+    # evidence floor — this line tells the model why, so it spends the time
+    # on genuinely new sources instead of re-running searches.
+    if depth_note:
+        parts.append("\nRESEARCH DEPTH: " + depth_note)
 
     # --- timing + anti-stall -------------------------------------------------
     t = timing.digest()

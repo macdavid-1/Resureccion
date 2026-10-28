@@ -197,6 +197,33 @@ async def test_search_targets_a_department_and_reports_amazons_total(wired):
 
 
 @pytest.mark.asyncio
+async def test_dismiss_overlay_action_clears_amazon_overlays(wired):
+    """The model must be able to say 'click Dismiss' the moment it sees the
+    shipping-country overlay — the backend honours it on every open Amazon
+    page, and only ever clicks refusal labels."""
+    executor, *_ = wired
+
+    class Page:
+        url = "https://www.amazon.com/s?k=space+facts"
+
+        async def evaluate(self, _js):
+            return ["dismiss"]
+
+        async def wait_for_timeout(self, _ms):
+            return None
+
+    async def pages():
+        return [Page()]
+
+    executor.browser.pages = pages
+    res = await executor.execute(
+        session_id="s1", action="dismiss_overlay", args={},
+    )
+    assert res.ok, res.error
+    assert "dismiss" in res.summary
+
+
+@pytest.mark.asyncio
 async def test_unknown_action_rejected(wired):
     executor, *_ = wired
     with pytest.raises(ActionError):

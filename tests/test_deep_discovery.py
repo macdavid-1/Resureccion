@@ -414,17 +414,29 @@ def test_mode_profiles_rebalance_the_same_methodology():
     assert mode_profile("nonsense").mode == "keywords"
 
 
-def test_model_ceiling_raises_only_as_far_as_time_allows(db, config):
+def test_model_ceiling_scales_with_the_time_budget(db, config):
+    """The call budget follows the session's TIME budget.
+
+    A fixed cap ended research after ~120 calls — an hour or two into an
+    8-12 hour budget — so the ceiling is derived from the hard wall-clock
+    budget instead, with the runner's floor underneath it.
+    """
     from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     base = runner.rc.max_model_calls_per_session
-    assert runner._model_call_ceiling("prompt") == base
-    assert runner._model_call_ceiling("keywords") > base
+    hours = config.session_hard_timeout_hours
+    per_hour = config.model_calls_per_hour
+    assert runner._model_call_ceiling("prompt") == max(base, hours * per_hour)
+    assert runner._model_call_ceiling("prompt") > base  # an hour or two is not a budget
+    assert runner._model_call_ceiling("keywords") > runner._model_call_ceiling("prompt")
     assert runner._model_call_ceiling("auto") > runner._model_call_ceiling("keywords")
-    # the raise is scaled down when the hard time budget is smaller
+    # A shorter hard budget buys proportionally fewer calls …
     config.session_hard_timeout_hours = 6
-    assert runner._model_call_ceiling("auto") < base + MODE_PROFILES["auto"].extra_calls
+    assert runner._model_call_ceiling("auto") < 12 * per_hour + MODE_PROFILES["auto"].extra_calls
+    # …but never below the runner's safety floor.
+    config.session_hard_timeout_hours = 1
+    assert runner._model_call_ceiling("prompt") >= base
 
 
 def test_phase_iterations_follow_the_session_mode(db, config):

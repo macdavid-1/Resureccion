@@ -142,8 +142,11 @@ engine.
 | `DIVE_PRODUCTS_PER_STORE` | no | `6` | Top competitor product pages opened per store to read their real category breadcrumbs |
 | `DIVE_AUTOCOMPLETE_QUERIES` | no | `24` | Suggestion queries used to mine candidate keyword phrases (one page load, then same-origin fetches) |
 | `DIVE_TIME_BUDGET_SECONDS` | no | `300` | Wall-clock cap per candidate; unmeasured keywords are reported as “not searched”, never as a number |
-| `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | profile | Override the per-session model-call ceiling for a mode. Defaults come from the mode profile (120/140/160) and the raise is scaled down when `SESSION_HARD_TIMEOUT_HOURS` is under 12 |
-| `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | profile | Nine colon-separated integers in phase order (`16:14:12:12:10:8:8:12:8`) overriding that mode's per-phase iteration caps |
+| `RESEARCH_MIN_HOURS` | no | `3` | Minimum wall-clock research duration. While a session is under it, every phase owes a raised new-evidence floor before it may close, so spare hours become deeper research instead of a 1–2 hour finish. `0` disables depth-raising entirely |
+| `DEPTH_EVIDENCE_MULTIPLIER` | no | `2` | How many times its declared new-evidence floor a phase owes while under `RESEARCH_MIN_HOURS` (Phase 1's `8` asks for `16` new records, and the model sees the raised number in its exit gate) |
+| `MODEL_CALLS_PER_HOUR` | no | `45` | Model-call ceiling per hour of `SESSION_HARD_TIMEOUT_HOURS` — the budget follows the time budget instead of a fixed cap, so a run is never stopped by a call counter with hours unspent. At the 12-hour default this is **540 calls per session** (a full two-pass methodology uses ~300). `MODEL_CALLS_<mode>` still overrides it outright |
+| `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | time-scaled | Override the per-session model-call ceiling for a mode. By default the ceiling is `max(120, SESSION_HARD_TIMEOUT_HOURS × MODEL_CALLS_PER_HOUR)` plus the mode's profile extra — 540 + extra at the 12-hour default |
+| `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | profile | Nine colon-separated integers in phase order (`12:16:24:24:16:12:12:20:12` for a briefed run) overriding that mode's per-phase iteration caps |
 
 External (non-Amazon) research actions — `forum_search`, `google_suggest`,
 `goodreads_check` — are not env-configurable: the allow-listed hosts live in

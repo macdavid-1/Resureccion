@@ -161,10 +161,45 @@ class RunnerConfig:
 _PROGRESS_KEYS: tuple[str, ...] = ("distinct_evidence", "candidates")
 
 
+# Keys that never make an analysis row substantive on their own: an item
+# holding nothing but evidence ids (or an activity note) is a placeholder,
+# not a finding — counting it let a phase commit a column of blank rows.
+_NON_SUBSTANTIVE_KEYS = frozenset(
+    {"evidence_ids", "observed_at_evidence_ids", "actions", "activity_note"}
+)
+
+
+def _substantive(value: Any) -> bool:
+    """True when a value carries real analysis content (not blanks/ids only)."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _substantive(v)
+            for k, v in value.items()
+            if str(k) not in _NON_SUBSTANTIVE_KEYS
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_substantive(v) for v in value)
+    return bool(value)
+
+
 def _primary_items(output: dict[str, Any], primary: str) -> int:
-    """How many analysis items a reply holds in its primary contract field."""
+    """How many SUBSTANTIVE analysis items a reply holds in its primary field.
+
+    Only real content counts toward the exit gate: a list of eight rows whose
+    verdicts are all empty strings is not eight findings, and treating it as
+    such is exactly how a report ended up with a demand-verdict column of
+    blanks and a consumer table full of dashes.
+    """
     value = output.get(primary) if isinstance(output, dict) else None
-    return len(value) if isinstance(value, list) else 0
+    if not isinstance(value, list):
+        return 0
+    return sum(1 for item in value if _substantive(item))
 
 
 class ResearchRunner:
@@ -816,6 +851,7 @@ class ResearchRunner:
                     ) if has_images else ""
                 ),
                 screenshot_attached=screenshot_png is not None,
+                depth_note=self._depth_note(session_started),
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
                 census_digest=discovery.get("census") or None,
@@ -830,6 +866,7 @@ class ResearchRunner:
                     baseline=baseline,
                     latest=last_counts,
                     prior_outputs=prior_outputs,
+                    session_started=session_started,
                 ),
             )
             model_calls += 1
@@ -1020,7 +1057,10 @@ class ResearchRunner:
             phase_new_evidence = max(0, counts["evidence_total"] - baseline["evidence_total"])
             primary = spec.output_contract[0]
             items = _primary_items(reply.content, primary)
-            floor = self._output_floor(phase, prior_outputs, counts["candidates"])
+            floor = self._item_floor(
+                spec, self._output_floor(phase, prior_outputs, counts["candidates"])
+            )
+            required_evidence = self._evidence_floor(spec.min_evidence, session_started)
 
             # The model's most complete analysis so far survives a forced or
             # budget exit: whichever reply filled the primary contract with
@@ -1052,17 +1092,48 @@ class ResearchRunner:
             actions_now = reply.content.get("actions")
             exploring = isinstance(actions_now, list) and len(actions_now) > 0
 
-            gates_ok = (
+            # The DECLARED floors (what the phase always owes) …
+            declared_floors_met = (
                 not missing
                 and items >= floor
-                and not exploring
                 and (spec.min_evidence == 0 or phase_new_evidence >= spec.min_evidence)
             )
-            # A fully satisfied gate always commits — being stuck earlier in
-            # the phase is no reason to reject a commit that now meets every
-            # floor. STALL_LIMIT below is what forces a phase that is STILL
-            # exploring with nothing new to hand over what it has.
-            if gates_ok:
+            # … versus the depth-raised floor, which only applies while the
+            # session is still under RESEARCH_MIN_HOURS.
+            depth_pending = required_evidence > spec.min_evidence
+            depth_satisfied = (
+                required_evidence == 0 or phase_new_evidence >= required_evidence
+            )
+            # Depth must never become a spin loop: when the declared research
+            # is in hand but STALL_LIMIT rounds have produced no NEW distinct
+            # source, committing beats re-capturing duplicates forever. The
+            # ceiling is recorded durably so the report can show the session
+            # stopped on its own rather than on a fabricated number.
+            depth_ceiling = stall >= STALL_LIMIT and declared_floors_met
+            gates_ok = (
+                declared_floors_met
+                and not exploring
+                and depth_satisfied
+            )
+            if gates_ok or depth_ceiling:
+                if depth_ceiling and not gates_ok:
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="phase_committed_at_depth_ceiling",
+                        detail={"phase": phase, "iterations": iteration,
+                                "evidence_new": phase_new_evidence,
+                                "evidence_required": required_evidence,
+                                "stall": stall},
+                    )
+                    self.trace.record(
+                        session_id, KIND_PHASE,
+                        pivot_text(
+                            PHASE_TITLES.get(phase, phase),
+                            f"{STALL_LIMIT} rounds without a new distinct source — "
+                            "committing the declared research instead of "
+                            "re-capturing the same pages",
+                        ),
+                    )
                 self.checkpoints.save(
                     session_id, f"phase_output:{phase}",
                     {"output": reply.content, "model": reply.model,
@@ -1110,6 +1181,19 @@ class ResearchRunner:
             recoverable=True,
         )
         if best_output is None:
+            # Durable accounting: a phase that handed over NOTHING is recorded
+            # as such (the report renders it as "produced no output") instead
+            # of silently looking like a completed phase with an empty list.
+            self.events.append(
+                session_id, level="warn", actor="agent",
+                action="phase_contributed_nothing",
+                detail={"phase": phase, "iterations": iteration,
+                        "evidence_new": max(
+                            0,
+                            self._progress_signature(session_id)["evidence_total"]
+                            - baseline["evidence_total"],
+                        )},
+            )
             return {}
         self.checkpoints.save(
             session_id, f"phase_output:{phase}",
@@ -1219,6 +1303,17 @@ class ResearchRunner:
                             str(n.get("demand_hints") or ""),
                         ),
                     )
+        # Account for EVERY niche the analysis actually worked on. Phases 3-7
+        # name niches in their own outputs (competitive maps, consumer maps,
+        # demand verdicts, gap analyses, cross-market checks). When no
+        # candidate row exists for one, the session researched it but the
+        # ledger counted nothing — the report then read "0 candidates
+        # considered" next to four researched niches, the integrity pipeline
+        # had no row to judge (so zero claims, zero rejections, zero
+        # verifications and every quality gate failed). Backfilling makes the
+        # accounting match the work and hands the pipeline real rows, each
+        # seeded with the evidence ids the analysis cited.
+        self._backfill_candidates(session_id, phase, output)
         # Adversarial verdicts move candidate statuses.
         verdicts = output.get("verdicts")
         if isinstance(verdicts, list):
@@ -1424,9 +1519,15 @@ class ResearchRunner:
             pass  # budget accounting must never break the call itself
 
     def _model_call_ceiling(self, mode: str) -> int:
-        """Per-session model-call ceiling: the base budget RAISED by the
-        mode's profile extra — and only as far as the hard time budget
-        allows (a 6-hour hard wall does not buy a 160-call agenda)."""
+        """Per-session model-call ceiling, derived from the TIME budget.
+
+        A fixed cap made the call budget the thing that ended research: on an
+        8–12 hour wall-clock budget, runs died after ~120 calls — an hour or
+        two in — with most of the time unspent. The ceiling now scales with
+        the hard budget (MODEL_CALLS_PER_HOUR × hours, never below the
+        runner's floor) plus the mode's profile extra, so TIME decides when
+        research is finished, not a call counter. A hard timeout still caps
+        the run, and per-phase iteration caps still bound each phase."""
         base = self.rc.max_model_calls_per_session
         try:
             env = int(getattr(self.config, "mode_model_calls", {}).get(mode, 0) or 0)
@@ -1436,8 +1537,29 @@ class ResearchRunner:
             return max(base, env)
         profile = mode_profile(mode)
         hard = max(1, int(getattr(self.config, "session_hard_timeout_hours", 12)))
+        per_hour = max(1, int(getattr(self.config, "model_calls_per_hour", 30) or 30))
         extra = int(round(profile.extra_calls * min(1.0, hard / 12.0)))
-        return base + extra
+        return max(base, hard * per_hour) + extra
+
+    def _evidence_floor(self, min_evidence: int, session_started: float) -> int:
+        """New-evidence floor for a phase, depth-raised while the session is
+        still under its minimum research duration.
+
+        Floors a single capture batch satisfies let a phase close on its
+        first pass; raising them while hours remain is what converts spare
+        time into deeper research instead of an early finish. Once the
+        minimum is met (or RESEARCH_MIN_HOURS=0), the declared floor stands.
+        """
+        if min_evidence <= 0:
+            return 0
+        try:
+            min_seconds = float(getattr(self.config, "research_min_hours", 0) or 0) * 3600
+        except (TypeError, ValueError):
+            min_seconds = 0.0
+        if min_seconds <= 0 or (time.monotonic() - session_started) >= min_seconds:
+            return min_evidence
+        mult = max(1, int(getattr(self.config, "depth_evidence_multiplier", 1) or 1))
+        return int(min_evidence) * mult
 
     # ---------------------------------- census + autocomplete frontier
     async def _discovery_preflight(
@@ -1966,6 +2088,117 @@ class ResearchRunner:
         return any(r.get("kind") in anchor_kinds for r in rows)
 
     # ------------------------------------------------------- integrity layer
+    # Niches analysed by phases 3-7 that must exist as candidate rows:
+    # (output field, field holding the analysis text used as the rationale)
+    _ANALYSIS_FIELDS: tuple[tuple[str, str], ...] = (
+        ("competitive_maps", "saturation"),
+        ("consumer_maps", "praises"),
+        ("demand_assessments", "verdict"),
+        ("gap_analyses", "competitors_fail"),
+        ("cross_market_checks", "notes"),
+    )
+
+    def _backfill_candidates(
+        self, session_id: str, phase: str, output: dict[str, Any]
+    ) -> None:
+        """Create candidate rows for niches the analysis researched but the
+        niche phase never registered.
+
+        Deterministic and additive: a niche already on the ledger is never
+        touched, and everything past the live capacity cap is recorded as
+        backlog (never silently dropped), exactly like Phase 2's output.
+        """
+        if not isinstance(output, dict):
+            return
+        known = {
+            str(c.niche).strip().lower()
+            for c in self.candidates.list(session_id, limit=500)
+        }
+
+        def _already_covered(key: str) -> bool:
+            """Same niche under a slightly different label.
+
+            Analysis phases phrase a niche shorter than niching did ("sudden-
+            loss grief journals" vs "…for adult children"); registering it
+            again would double-count the candidate and make the ledger read
+            four candidates where three were researched. Only substantial
+            labels participate in the containment test, so a short generic
+            word can never swallow a distinct niche.
+            """
+            if key in known:
+                return True
+            if len(key) < 8:
+                return False
+            return any(key in k or (len(k) >= 8 and k in key) for k in known)
+
+        fresh: list[dict[str, Any]] = []
+        for field, text_key in self._ANALYSIS_FIELDS:
+            rows = output.get(field)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                niche = str(row.get("niche") or "").strip()
+                key = niche.lower()
+                # A niche is a market description, not a word: anything under
+                # 8 characters is a fragment and never becomes a ledger row.
+                if not niche or len(niche) < 8 or _already_covered(key):
+                    continue
+                known.add(key)
+                evidence_ids = [
+                    str(e) for e in (row.get("evidence_ids") or []) if str(e)
+                ][:12]
+                fresh.append({
+                    "niche": niche[:200],
+                    "marketplace": str(row.get("marketplace") or "")[:20],
+                    "rationale": str(row.get(text_key) or row.get("niche") or "")[:500],
+                    "evidence_ids": self._valid_evidence_ids(session_id, evidence_ids),
+                    "field": field,
+                })
+        if not fresh:
+            return
+        overflow = fresh[self.rc.max_candidates:]
+        if overflow:
+            self._record_backlog(
+                session_id,
+                [
+                    {
+                        "niche": f["niche"],
+                        "parent_market": "",
+                        "marketplace": f["marketplace"],
+                    }
+                    for f in overflow
+                ],
+                reason="candidate_capacity",
+            )
+        for f in fresh[: self.rc.max_candidates]:
+            meta: dict[str, Any] = {
+                "via": phase,
+                "analysis_field": f["field"],
+            }
+            if f["evidence_ids"]:
+                meta["seed_evidence_ids"] = f["evidence_ids"]
+            c = self.candidates.create(
+                session_id,
+                niche=f["niche"],
+                marketplace=f["marketplace"],
+                rationale=f["rationale"],
+                meta=meta,
+            )
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="candidate_backfilled_from_analysis",
+                detail={"candidate_id": c.id, "niche": f["niche"][:120],
+                        "field": f["field"], "phase": phase},
+            )
+            self.trace.record(
+                session_id, KIND_CANDIDATE,
+                candidate_created_text(
+                    f["niche"], f["marketplace"], f["rationale"]
+                ),
+            )
+
     def _run_integrity_pipeline(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         """Deterministic integrity pipeline, run after Phase 8 and before Phase 9.
 
@@ -2408,6 +2641,36 @@ class ResearchRunner:
         ]
 
     # ------------------------------------------------------------------ digests
+    def _depth_note(self, session_started: float) -> str:
+        """One deterministic line telling the model how much research time is
+        left to spend.
+
+        Depth is a backend decision (raised floors do the enforcing), but the
+        model must know that committing while budget remains wastes hours the
+        session still has — so it opens pages it has not opened instead of
+        re-running searches and stalling.
+        """
+        try:
+            min_hours = float(getattr(self.config, "research_min_hours", 0) or 0)
+        except (TypeError, ValueError):
+            return ""
+        if min_hours <= 0:
+            return ""
+        elapsed = max(0.0, time.monotonic() - session_started)
+        remaining = min_hours * 3600 - elapsed
+        if remaining <= 0:
+            return ""
+        hard = max(1, int(getattr(self.config, "session_hard_timeout_hours", 12)))
+        mins = max(1, int(-(-remaining // 60)))
+        return (
+            f"The session is {max(1, int(elapsed // 60))} min into its research "
+            f"and still owes depth: {mins} min of the {min_hours:g}-hour minimum "
+            f"remain, inside a {hard}-hour budget. Until that minimum is met the "
+            "exit gate demands DEEPER evidence — new sources, competitor product "
+            "pages, reader reviews, category pages you have not opened — never "
+            "the same searches again. Widen and read before considering a commit."
+        )
+
     def _latest_screenshot(self) -> bytes | None:
         """Newest browser screenshot bytes for vision input (may be None)."""
         getter = getattr(self.executor.collector, "last_screenshot", None)
@@ -2500,6 +2763,21 @@ class ResearchRunner:
             return want if candidates_seen else 0
         return want
 
+    @staticmethod
+    def _item_floor(spec: Any, floor: int) -> int:
+        """Items a phase owes before it may commit.
+
+        A phase that DECLARES content (`min_output_items > 0`) may never
+        commit an empty primary list, even when its upstream input is missing
+        — an empty hand-over is what left the report's niche, demand and
+        consumer lists blank. The floor can only ever be at least 1 there;
+        phases 8 and 9 (min 0) stay free, because the deterministic pipeline
+        and the opportunity contract decide those instead of the model.
+        """
+        if getattr(spec, "min_output_items", 0) > 0:
+            return max(int(floor), 1)
+        return int(floor)
+
     def _phase_gate(
         self,
         phase: str,
@@ -2507,16 +2785,25 @@ class ResearchRunner:
         baseline: dict[str, int],
         latest: dict[str, int],
         prior_outputs: dict[str, Any],
+        session_started: float = 0.0,
     ) -> dict[str, Any]:
-        """Deterministic exit-gate snapshot for the model's prompt."""
+        """Deterministic exit-gate snapshot for the model's prompt.
+
+        The floors shown here are the LIVE floors: while the session is still
+        under its minimum research duration the evidence requirement is the
+        depth-raised one, so the model sees exactly how much more research
+        the phase owes before it may close.
+        """
         spec = SPECS[phase]
         primary = spec.output_contract[0]
         evidence_new = max(0, latest["evidence_total"] - baseline["evidence_total"])
-        required = max(0, spec.min_evidence - evidence_new)
+        required = max(
+            0, self._evidence_floor(spec.min_evidence, session_started) - evidence_new
+        )
         return {
             "primary_output": primary,
-            "min_output_items": self._output_floor(
-                phase, prior_outputs, latest["candidates"]
+            "min_output_items": self._item_floor(
+                spec, self._output_floor(phase, prior_outputs, latest["candidates"])
             ),
             "evidence_new": evidence_new,
             "evidence_required": required,

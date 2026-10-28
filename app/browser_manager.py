@@ -856,6 +856,15 @@ class BrowserManager:
 
     # ------------------------------------------------------------- screenshots
     async def screenshot(self, page: Any) -> bytes:
+        # The shipping-country tooltip renders a beat AFTER the page loads,
+        # too late for the dismissal that follows navigation. Dismissing here
+        # — the single chokepoint every screenshot goes through — guarantees
+        # the model's ground truth and the owner's live view are captured on
+        # an unobstructed page (so the printed result total is readable).
+        try:
+            await dismiss_amazon_overlays(page)
+        except Exception:
+            pass
         try:
             data = await page.screenshot(type="png", full_page=False)
         except Exception as exc:

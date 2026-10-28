@@ -146,50 +146,56 @@ class ModeBudgetProfile:
 # Iteration caps per mode, keyed by phase (PHASE_ORDER order). Values are a
 # deliberate rebalancing of the SAME total budget — no phase gets starved,
 # the shape of the research changes with what the owner actually supplied.
+#
+# These caps are CEILINGS, not targets: a phase still closes the moment its
+# deterministic exit gate is satisfied. They exist so a session with hours
+# left on the clock is never the thing that ends research — an earlier build
+# summed to ~98 iterations, which is why runs stopped after an hour or two
+# with most of the time budget unspent and thin, partly-empty analysis.
 MODE_PROFILES: dict[str, ModeBudgetProfile] = {
     "prompt": ModeBudgetProfile(
         mode="prompt",
         extra_calls=0,
         iterations={
-            P1_DISCOVERY: 8,          # the brief already scopes discovery
-            P2_NICHING: 10,
-            P3_COMPETITION: 16,       # …so depth moves downstream
-            P4_CONSUMER: 16,
-            P5_DEMAND: 10,
-            P6_GAP: 8,
-            P7_CROSS_MARKET: 8,
-            P8_ADVERSARIAL: 14,
-            P9_SYNTHESIS: 8,
+            P1_DISCOVERY: 12,         # the brief already scopes discovery
+            P2_NICHING: 16,
+            P3_COMPETITION: 24,       # …so depth moves downstream
+            P4_CONSUMER: 24,
+            P5_DEMAND: 16,
+            P6_GAP: 12,
+            P7_CROSS_MARKET: 12,
+            P8_ADVERSARIAL: 20,
+            P9_SYNTHESIS: 12,
         },
     ),
     "keywords": ModeBudgetProfile(
         mode="keywords",
         extra_calls=20,
         iterations={
-            P1_DISCOVERY: 14,
-            P2_NICHING: 13,
-            P3_COMPETITION: 14,
-            P4_CONSUMER: 14,
-            P5_DEMAND: 10,
-            P6_GAP: 8,
-            P7_CROSS_MARKET: 8,
-            P8_ADVERSARIAL: 12,
-            P9_SYNTHESIS: 8,
+            P1_DISCOVERY: 18,
+            P2_NICHING: 16,
+            P3_COMPETITION: 20,
+            P4_CONSUMER: 20,
+            P5_DEMAND: 14,
+            P6_GAP: 12,
+            P7_CROSS_MARKET: 12,
+            P8_ADVERSARIAL: 18,
+            P9_SYNTHESIS: 12,
         },
     ),
     "auto": ModeBudgetProfile(
         mode="auto",
         extra_calls=40,
         iterations={
-            P1_DISCOVERY: 16,         # no topic: discovery must search wider
-            P2_NICHING: 14,           # …and niching is where candidates born
-            P3_COMPETITION: 12,       # lighter early competitive work
-            P4_CONSUMER: 12,
-            P5_DEMAND: 10,
-            P6_GAP: 8,
-            P7_CROSS_MARKET: 8,
-            P8_ADVERSARIAL: 12,
-            P9_SYNTHESIS: 8,
+            P1_DISCOVERY: 20,         # no topic: discovery must search wider
+            P2_NICHING: 18,           # …and niching is where candidates born
+            P3_COMPETITION: 18,       # lighter early competitive work
+            P4_CONSUMER: 18,
+            P5_DEMAND: 14,
+            P6_GAP: 12,
+            P7_CROSS_MARKET: 12,
+            P8_ADVERSARIAL: 18,
+            P9_SYNTHESIS: 12,
         },
     ),
 }
@@ -253,6 +259,7 @@ SPECS: dict[str, PhaseSpec] = {
             "search_marketplace", "open_category", "autocomplete",
             "bestsellers", "new_releases", "related_products",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -290,6 +297,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "open_category",
             "related_products", "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
         ),
         output_contract=(
             "niches",  # list of {niche, parent_market, chain, evidence_ids, demand_hints}
@@ -320,6 +328,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "related_products",
             "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
         ),
         output_contract=(
             "competitive_maps",  # list of {niche, competitors[], saturation, pricing, patterns}
@@ -349,6 +358,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "open_product", "read_reviews", "capture_evidence",
             "record_observation", "wait", "forum_search", "goodreads_check",
+            "dismiss_overlay",
         ),
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
@@ -379,6 +389,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "kdspy_data",
             "open_product", "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -415,6 +426,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "capture_evidence", "record_observation", "wait", "forum_search",
+            "dismiss_overlay",
         ),
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
@@ -438,6 +450,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "autocomplete",
             "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
         ),
         output_contract=(
             "cross_market_checks",  # list of {niche, marketplace, verdict, notes}
@@ -465,6 +478,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
+            "dismiss_overlay",
         ),
         output_contract=(
             "verdicts",  # list of {niche, verdict: pass|downgrade|reject, contradictions[], reasons}

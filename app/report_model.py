@@ -155,15 +155,25 @@ def build_report_model(
     # "evidence_space_facts_uk"); quoting them would both mislead the owner
     # and trip the validator's "evidence references do not exist" failure.
     known_ids: set[str] | None = None
+    evidence_records_total = 0
     if browser_evidence is not None and evidence is not None:
         known_ids = set()
         for store_ in (browser_evidence, evidence):
             if store_ is None:
                 continue
             try:
-                known_ids |= {str(e.id) for e in store_.list(session_id, limit=5000)}
+                rows = store_.list(session_id, limit=5000)
+                known_ids |= {str(e.id) for e in rows}
+                evidence_records_total += len(rows)
             except Exception:
                 pass
+    # Accounting figures the executive summary must state: how many evidence
+    # records and how many chain-of-custody claims the run actually produced
+    # (the quality gates read the same durable stores).
+    try:
+        claims_total = len(claims.list(session_id, limit=3000))
+    except Exception:
+        claims_total = 0
 
     # Flat lookups -----------------------------------------------------------
     risk_by_cand: dict[str, dict[str, Any]] = {}
@@ -260,9 +270,12 @@ def build_report_model(
             "created_at": session.created_at,
         },
         generated_at="",
-        executive_summary=_exec_summary(session, counts, demand_out, outputs, dossiers),
+        executive_summary=_exec_summary(
+            session, counts, demand_out, outputs, dossiers,
+            evidence_records=evidence_records_total, claims_registered=claims_total,
+        ),
         opportunities=dossiers,
-        consumer_intelligence=_aggregate_consumer(cons_out),
+        consumer_intelligence=_aggregate_consumer(cons_out, niches_out),
         competitors=competitors,
         candidate_ledger=_ledger(cands),
         adjacent_ledger=_adjacent_ledger(
@@ -289,14 +302,33 @@ def _exec_summary(
     demand_out: list[dict[str, Any]],
     outputs: dict[str, Any],
     dossiers: list[dict[str, Any]],
+    evidence_records: int = 0,
+    claims_registered: int = 0,
 ) -> dict[str, Any]:
-    verdicts = [str(d.get("verdict", "")) for d in demand_out]
+    # Blank verdicts are dropped: a column of empty strings is not a finding,
+    # and repeating it made the summary report "eight empty demand verdicts".
+    verdicts = [
+        str(d.get("verdict", "")).strip()
+        for d in demand_out
+        if isinstance(d, dict) and str(d.get("verdict", "")).strip()
+    ]
     findings: list[str] = []
     for d in dossiers[:10]:
         findings.append(
             f"{d['name']} — {d['niche']} for {d['target_reader']} "
             f"(confidence {int(round(d['confidence'] * 100))}%)"
         )
+    if not findings:
+        # No synthesized portfolio yet — still hand the owner what the run
+        # DID establish, from recorded verdicts, so "major findings" never
+        # renders empty when demand research produced something.
+        for d in demand_out[:8]:
+            if not isinstance(d, dict):
+                continue
+            niche = str(d.get("niche") or "").strip()
+            verdict = str(d.get("verdict") or "").strip()
+            if niche and verdict:
+                findings.append(f"{niche} — {verdict}")
     return {
         "what_was_researched": session.prompt or session.objective
         or "Autonomous discovery across Amazon marketplaces — no topic was specified; Resurrección selected signals independently.",
@@ -319,6 +351,8 @@ def _exec_summary(
         "survived_verification": counts.get("verified", 0),
         "demand_verdicts": verdicts,
         "major_findings": findings,
+        "evidence_records": int(evidence_records or 0),
+        "claims_registered": int(claims_registered or 0),
     }
 
 
@@ -781,7 +815,9 @@ def _next_step(o: Any, best_v: Any | None) -> str:
 
 
 # ------------------------------------------------------- consumer aggregate
-def _aggregate_consumer(cons_out: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_consumer(
+    cons_out: list[dict[str, Any]], niches_out: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     themes: dict[str, list[str]] = {
         "praised": [], "complaints": [], "unmet_needs": [],
         "desired_features": [], "frustrations": [], "objections": [],
@@ -805,6 +841,23 @@ def _aggregate_consumer(cons_out: list[dict[str, Any]]) -> dict[str, Any]:
     themes["frustrations"] = themes["complaints"][:6]
     themes["missing_information"] = themes["unmet_needs"][:6]
     themes["what_the_new_book_should_do_differently"] = themes["desired_features"][:8]
+    # Every niche the run researched appears here, even when Phase 4 never
+    # captured reader language for it: a blank table told the owner "nothing
+    # was known" about niches the rest of the report discusses. The row is
+    # present and explicitly marked as not captured — never a dash that
+    # reads like data.
+    seen_niches = {str(m.get("niche") or "").strip().lower() for m in by_niche}
+    for n in niches_out or []:
+        name = str(n.get("niche") or "").strip()
+        if not name or name.lower() in seen_niches:
+            continue
+        seen_niches.add(name.lower())
+        by_niche.append({
+            "niche": name,
+            "praises": [], "complaints": [], "unmet": [],
+            "design_opportunities": [],
+            "not_captured": True,
+        })
     return {"themes": themes, "by_niche": by_niche}
 
 
@@ -996,11 +1049,15 @@ def _trace(outputs: dict[str, Any]) -> list[dict[str, Any]]:
     for phase in PHASE_ORDER:
         out = outputs.get(phase) or {}
         keys = sorted(out.keys()) if isinstance(out, dict) else []
+        # Honest accounting: a phase that handed over nothing is reported as
+        # having produced no output instead of "completed" with an empty
+        # contract list — the owner must be able to see WHERE research fell
+        # short, not just that the methodology ran.
         rows.append({
             "phase": phase,
             "title": PHASE_TITLES[phase],
             "outputs": keys,
-            "completed": True,
+            "completed": bool(keys) and any(bool(v) for v in out.values()),
         })
     return rows
 
@@ -1294,7 +1351,9 @@ def render_markdown(model: ReportModel) -> str:
     a(
         f"**Scale.** {ex.get('candidates_considered', 0)} candidates considered · "
         f"{ex.get('candidates_rejected', 0)} rejected by deterministic filters and adversarial "
-        f"verification · {ex.get('survived_verification', 0)} survived with full verification."
+        f"verification · {ex.get('survived_verification', 0)} survived with full verification · "
+        f"{ex.get('evidence_records', 0)} evidence records captured · "
+        f"{ex.get('claims_registered', 0)} claims registered with evidence chain-of-custody."
     )
     a("")
     a(f"**Methodology.** {ex.get('methodology', '—')}")
@@ -1402,10 +1461,20 @@ def render_markdown(model: ReportModel) -> str:
         a("| Niche | Praise | Complaints | Unmet needs |")
         a("|---|---|---|---|")
         for m in ci["by_niche"][:20]:
+            def _cell(key: str) -> str:
+                vals = m.get(key) or []
+                if vals:
+                    return "; ".join(str(v) for v in vals[:3])
+                # Honest cell: never an em-dash that reads like a measurement.
+                return (
+                    "not captured in this session"
+                    if m.get("not_captured") else "none recorded"
+                )
+
+            niche_txt = str(m.get("niche") or "—").replace("|", "\\|")
             a(
-                f"| {m['niche']} | {'; '.join(m['praises'][:3]) or '—'} | "
-                f"{'; '.join(m['complaints'][:3]) or '—'} | "
-                f"{'; '.join(m['unmet'][:3]) or '—'} |"
+                f"| {niche_txt} | {_cell('praises')} | "
+                f"{_cell('complaints')} | {_cell('unmet')} |"
             )
         a("")
 
@@ -1502,8 +1571,14 @@ def render_markdown(model: ReportModel) -> str:
     a("## Methodology trace")
     a("")
     for t in model.methodology_trace:
-        extra = f" ({', '.join(t['outputs'])})" if t.get("outputs") else ""
-        a(f"- **{t['title']}** — completed{extra}")
+        if t.get("completed"):
+            extra = f" ({', '.join(t['outputs'])})" if t.get("outputs") else ""
+            a(f"- **{t['title']}** — completed{extra}")
+        else:
+            a(
+                f"- **{t['title']}** — produced no output this session "
+                "(research ended before this phase handed over analysis)"
+            )
     for p in model.focus_pivots:
         a(
             f"- **Strategic pivot (round {p.get('round') or '—'})** — deep "

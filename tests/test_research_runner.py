@@ -962,7 +962,13 @@ async def test_evidence_floor_counts_phase_new_not_session_total(db, config, ses
     # earlier phases already exist: with the old session-wide count the
     # requirement read 0 and Phase 1 committed on its first reply.
     first_p1 = model.user_prompts["opportunity_discovery"][0]
-    assert ScriptedModel._evidence_required(first_p1) == SPECS["opportunity_discovery"].min_evidence
+    # Depth-raised while the session is under RESEARCH_MIN_HOURS: the gate
+    # asks for the declared floor times DEPTH_EVIDENCE_MULTIPLIER, so spare
+    # hours turn into deeper research instead of an early finish.
+    assert ScriptedModel._evidence_required(first_p1) == (
+        SPECS["opportunity_discovery"].min_evidence
+        * config.depth_evidence_multiplier
+    )
     assert len(model.user_prompts["opportunity_discovery"]) > 1, model.calls
     events = EventLog(db).tail(session)
     p1 = [e for e in events if e.action == "phase_completed"
@@ -988,7 +994,20 @@ async def test_phase_commits_only_without_pending_actions(db, config, session):
         if phase == "opportunity_synthesis":
             continue
         last = prompts[-1]
-        assert ScriptedModel._evidence_required(last) == 0, phase
+        # A phase may close on its DECLARED floors when it is stuck deepening:
+        # no new distinct source for STALL_LIMIT rounds, but every declared
+        # requirement met. That commit is recorded as `phase_committed_at_
+        # depth_ceiling`, so the raised floor can never become a spin loop.
+        if ScriptedModel._evidence_required(last) != 0:
+            ceilings = [
+                e for e in EventLog(db).tail(session)
+                if e.action == "phase_committed_at_depth_ceiling"
+                and e.detail.get("phase") == phase
+            ]
+            assert ceilings, (
+                f"{phase} closed without meeting its gate and without a "
+                "depth-ceiling record"
+            )
 
 
 @pytest.mark.asyncio

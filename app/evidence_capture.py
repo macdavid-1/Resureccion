@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.artifacts import ArtifactStore
-from app.browser_manager import BrowserManager, BrowserManagerError
+from app.browser_manager import (
+    BrowserManager,
+    BrowserManagerError,
+    dismiss_amazon_overlays,
+)
 from app.browser_store import BrowserEvidence, BrowserEvidenceStore
 from app.marketplace import Marketplace, marketplace_from_url
 from app.redact import redact, scrub_url
@@ -91,6 +95,13 @@ class EvidenceCollector:
           why the shipping-country overlay is dismissed first
           (app.browser_manager.dismiss_amazon_overlays).
         """
+        # The overlay pops AFTER load and covers the printed total; dismiss
+        # it right before reading so `total_results` is captured even when
+        # the navigation-time dismissal ran too early.
+        try:
+            await dismiss_amazon_overlays(page)
+        except Exception:
+            pass
         items = await _extract_search_items(page, max_items)
         data = {
             "query": query,

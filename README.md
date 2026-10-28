@@ -364,10 +364,32 @@ filter, a gate or a verification verdict:
 
 Supporting changes:
 
+- **Research depth instead of an early finish** — runs were ending after an
+  hour or two on an 8–12 hour budget. Two deterministic knobs fix that:
+  while a session is under `RESEARCH_MIN_HOURS` (default 3) every phase owes
+  `DEPTH_EVIDENCE_MULTIPLIER` times its declared new-evidence floor before it
+  may close (the model sees the raised number and a time-remaining line in
+  every prompt), and the model-call ceiling is now
+  `SESSION_HARD_TIMEOUT_HOURS × MODEL_CALLS_PER_HOUR` instead of a fixed
+  cap. Depth never becomes a spin loop: when the declared floors are met and
+  no NEW distinct source appears for `STALL_LIMIT` rounds, the phase commits
+  and records `phase_committed_at_depth_ceiling` rather than re-capturing
+  duplicates forever.
+- **Accounting that matches the work** — a phase may no longer commit a list
+  of blank rows (an empty verdict is not a finding), niches researched in
+  Phases 3–7 are backfilled into the candidate ledger so counts, claims,
+  rejections and verifications reflect what was actually analyzed, the
+  executive summary states evidence-record and claim counts alongside
+  candidate counts, blank demand verdicts are dropped, every researched
+  niche appears in the consumer table (marked *not captured* rather than a
+  dash), and a phase that produced nothing is reported as
+  *produced no output* instead of *completed*.
 - **Per-mode budget profiles** (`app/methodology.MODE_PROFILES`) — a detailed
   brief spends on competition/verification, no topic at all spends on
-  discovery/niching; the model-call ceiling is raised for those modes and
-  scaled by the hard time budget. Env-overridable per mode.
+  discovery/niching; iteration caps are ceilings (not targets) sized so a
+  session with hours left is never the thing that ends research, and the
+  model-call ceiling scales with the hard time budget. Env-overridable per
+  mode.
 - **No more silently dropped niches** — candidates past the live cap land in
   a durable backlog and appear in the report's ledger.
 - **Adjacent-opportunities ledger** — surviving-but-unfunded candidates,

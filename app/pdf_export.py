@@ -263,7 +263,9 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
     p(
         f"Scale: {ex.get('candidates_considered', 0)} candidates considered · "
         f"{ex.get('candidates_rejected', 0)} rejected · "
-        f"{ex.get('survived_verification', 0)} survived verification."
+        f"{ex.get('survived_verification', 0)} survived verification · "
+        f"{ex.get('evidence_records', 0)} evidence records captured · "
+        f"{ex.get('claims_registered', 0)} claims registered with evidence chain-of-custody."
     )
     p(f"Methodology: {ex.get('methodology', '—')}")
     p(f"Marketplaces investigated: {', '.join(str(m) for m in ex.get('marketplaces_investigated', [])) or '—'}")
@@ -429,14 +431,21 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
             h3("What the new book should do differently")
             for it in diff:
                 li(it)
+        def _cell(m: dict[str, Any], key: str) -> str:
+            vals = m.get(key) or []
+            if vals:
+                return "; ".join(str(v) for v in vals[:3])
+            # Honest cell: never an em-dash that reads like a measurement.
+            return "not captured in this session" if m.get("not_captured") else "none recorded"
+
         table(
             ["Niche", "Praise", "Complaints", "Unmet needs"],
             [
                 [
                     m.get("niche", ""),
-                    "; ".join(m.get("praises", [])[:3]) or "—",
-                    "; ".join(m.get("complaints", [])[:3]) or "—",
-                    "; ".join(m.get("unmet", [])[:3]) or "—",
+                    _cell(m, "praises"),
+                    _cell(m, "complaints"),
+                    _cell(m, "unmet"),
                 ]
                 for m in ci["by_niche"][:20]
             ],
@@ -526,7 +535,13 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
         h2("Methodology Trace")
         for t in trace:
             extra = f" ({', '.join(t['outputs'])})" if t.get("outputs") else ""
-            li(f"{t.get('title', t.get('phase', ''))} — completed{extra}")
+            if t.get("completed"):
+                li(f"{t.get('title', t.get('phase', ''))} — completed{extra}")
+            else:
+                li(
+                    f"{t.get('title', t.get('phase', ''))} — produced no output "
+                    "this session (research ended before this phase handed over analysis)"
+                )
 
     # ------------------------------------------------------------- quality
     q = model.get("quality_statement", {}) or {}
