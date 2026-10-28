@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.integrity import KIND_FILTER
+from app.integrity import KIND_FILTER, KIND_VERIFICATION
 from app.methodology import PHASE_ORDER, PHASE_TITLES
 from app.marketplace import AMAZON_MARKETPLACES
 
@@ -75,6 +75,10 @@ class ReportModel:
     evidence_appendix: list[dict[str, Any]] = field(default_factory=list)
     quality_statement: dict[str, Any] = field(default_factory=dict)
     validation: dict[str, Any] = field(default_factory=dict)
+    # Analyst prose written BY THE MODEL from the verified data above
+    # (app.report_narrative). The model never computes figures; these are
+    # interpretation sections rendered alongside the deterministic ones.
+    narrative: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +97,7 @@ class ReportModel:
             "evidence_appendix": self.evidence_appendix,
             "quality_statement": self.quality_statement,
             "validation": self.validation,
+            "narrative": self.narrative,
         }
 
     def to_json(self) -> str:
@@ -111,7 +116,7 @@ class ReportModel:
             "opportunities", "consumer_intelligence", "competitors",
             "candidate_ledger", "adjacent_ledger", "headroom_ranking",
             "methodology_trace", "focus_pivots", "evidence_appendix",
-            "quality_statement", "validation",
+            "quality_statement", "validation", "narrative",
         ):
             default: Any = [] if f in list_fields else {}
             setattr(m, f, data.get(f, default))
@@ -135,6 +140,7 @@ def build_report_model(
     whitespace_by_candidate: dict[str, Any] | None = None,
     backlog: list[dict[str, Any]] | None = None,
     adjacency: list[dict[str, Any]] | None = None,
+    evidence: Any | None = None,
 ) -> ReportModel:
     """Assemble the structured report model from durable state. Deterministic."""
     ws = dict(whitespace_by_candidate or {})
@@ -143,6 +149,21 @@ def build_report_model(
     opps = opportunities.list(session_id, limit=50)
     outputs = phase_outputs or {}
     cand_by_id = {c.id: c for c in cands}
+
+    # Chain-of-custody: every evidence id the report may CITE must actually
+    # exist in this session. The model sometimes echoes invented ids (e.g.
+    # "evidence_space_facts_uk"); quoting them would both mislead the owner
+    # and trip the validator's "evidence references do not exist" failure.
+    known_ids: set[str] | None = None
+    if browser_evidence is not None and evidence is not None:
+        known_ids = set()
+        for store_ in (browser_evidence, evidence):
+            if store_ is None:
+                continue
+            try:
+                known_ids |= {str(e.id) for e in store_.list(session_id, limit=5000)}
+            except Exception:
+                pass
 
     # Flat lookups -----------------------------------------------------------
     risk_by_cand: dict[str, dict[str, Any]] = {}
@@ -177,6 +198,9 @@ def build_report_model(
     # Browser evidence: competitors + appendix --------------------------------
     ev_rows = browser_evidence.list(session_id, limit=600)
     competitors = _build_competitors(comp_out, ev_rows, session_id)
+    # Final-candidate deep dive: measured backend keywords + the separate
+    # Kindle Store / Books category maps, indexed by the niche they belong to.
+    dive_by_niche = _dive_index(ev_rows)
 
     # ---------------------------------------------------------------- dossier
     dossiers: list[dict[str, Any]] = []
@@ -214,9 +238,10 @@ def build_report_model(
             "keywords": _keyword_clusters(o.keywords, o.niche),
             "keyword_plan": _keyword_plan(o.keywords, ev_rows),
             "category_plan": _category_plan(ev_ids, ev_rows),
+            "backend_research": dive_by_niche.get(_norm_kw(o.niche)) or {},
             "demand_accommodation": demand_acc_by_cand.get(o.candidate_id) or {},
             "whitespace": ws.get(o.candidate_id) or {},
-            "evidence_ids": ev_ids[:24],
+            "evidence_ids": _only_known(ev_ids, known_ids)[:24],
             "next_step": _next_step(o, best_v),
         })
 
@@ -243,6 +268,7 @@ def build_report_model(
         adjacent_ledger=_adjacent_ledger(
             cands, ws, opportunities_ids={o.candidate_id for o in opps},
             backlog=backlog or [], adjacency=adjacency or [],
+            known_ids=known_ids,
         ),
         headroom_ranking=_headroom_ranking(dossiers),
         methodology_trace=_trace(outputs),
@@ -284,8 +310,11 @@ def _exec_summary(
             "synthesis), followed by deterministic filtering, an adversarial "
             "verification engine, KDP risk screening, and quality gates."
         ),
-        "candidates_considered": counts.get("discovered", 0) + counts.get("rejected", 0)
-        + counts.get("verifying", 0) + counts.get("verified", 0),
+        "candidates_considered": counts.get("total")
+        or (
+            counts.get("discovered", 0) + counts.get("rejected", 0)
+            + counts.get("verifying", 0) + counts.get("verified", 0)
+        ),
         "candidates_rejected": counts.get("rejected", 0),
         "survived_verification": counts.get("verified", 0),
         "demand_verdicts": verdicts,
@@ -357,9 +386,9 @@ def _demand_for(niche: str, demand_out: list[dict[str, Any]]) -> dict[str, Any]:
     for d in demand_out:
         if str(d.get("niche", "")).lower() in n or n in str(d.get("niche", "")).lower():
             return {
-                "verdict": str(d.get("verdict", "not assessed")),
-                "signals": [str(s) for s in _as_list(d.get("signals"))][:8],
-                "demand_risks": [str(s) for s in _as_list(d.get("risks"))][:6],
+                "verdict": _plain(d.get("verdict")) or "not assessed",
+                "signals": [_plain(s) for s in _as_list(d.get("signals")) if _plain(s)][:8],
+                "demand_risks": [_plain(s) for s in _as_list(d.get("risks")) if _plain(s)][:6],
             }
     return {"verdict": "not separately assessed", "signals": [], "demand_risks": []}
 
@@ -371,10 +400,11 @@ def _comp_summary(comp_out: list[dict[str, Any]], niche: str) -> str:
             parts = []
             comps = _as_list(m.get("competitors"))
             if comps:
-                parts.append(f"{len(comps)} competitors inspected ({', '.join(str(c) for c in comps[:6])})")
+                names = ", ".join(_plain(c) for c in comps[:6] if _plain(c))
+                parts.append(f"{len(comps)} competitors inspected ({names})")
             for k, label in (("saturation", "saturation"), ("pricing", "pricing"), ("patterns", "patterns")):
                 if m.get(k):
-                    parts.append(f"{label}: {m[k]}")
+                    parts.append(f"{label}: {_plain(m[k])}")
             return "; ".join(parts) or "—"
     return "—"
 
@@ -387,7 +417,9 @@ def _consumer_summary(cons_out: list[dict[str, Any]], niche: str) -> str:
             for k, label in (("complaints", "complaints"), ("unmet", "unmet needs"), ("praises", "praise")):
                 v = _as_list(m.get(k))
                 if v:
-                    bits.append(f"{label}: {'; '.join(str(x) for x in v[:4])}")
+                    rendered = [s for s in (_plain(x) for x in v[:4]) if s]
+                    if rendered:
+                        bits.append(f"{label}: {'; '.join(rendered)}")
             return "; ".join(bits) or "—"
     return "—"
 
@@ -447,7 +479,7 @@ def _marketplace_analysis(
         "strongest": strongest,
         "related_demand_elsewhere": [r for r in related if r][:6],
         "differences": [
-            f"{c.get('marketplace')}: {c.get('verdict')} — {c.get('notes', '')}".strip(" —")
+            f"{c.get('marketplace')}: {_plain(c.get('verdict'))} — {_plain(c.get('notes', ''))}".strip(" —")
             for c in checks
         ][:6],
         "language_considerations": (
@@ -491,8 +523,8 @@ def _angles_for(
     unmet = _as_list((cmap or {}).get("unmet"))
     for i, op in enumerate(design_ops[:5]):
         problem = (
-            str(complaints[i]) if i < len(complaints)
-            else str(unmet[i]) if i < len(unmet)
+            _plain(complaints[i]) if i < len(complaints)
+            else _plain(unmet[i]) if i < len(unmet)
             else "Recurring reader frustration observed in reviews"
         )
         angles.append({
@@ -592,10 +624,18 @@ def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[di
             results = list(d.get("results") or [])[:10]
             reviews = [int(r.get("review_count") or 0) for r in results
                        if r.get("review_count") is not None]
+            total = d.get("total_results")
             plan.append({
                 "keyword": k,
                 "measured": True,
                 "result_count": int(d.get("result_count") or 0),
+                # Amazon's own printed total — the real competition figure
+                # (captured count above is only how many rows were pulled).
+                "total_results": total if isinstance(total, int) else None,
+                "total_results_are_approximate": d.get(
+                    "total_results_are_approximate"
+                ),
+                "results_text": str(d.get("results_text") or ""),
                 "top10_review_median": _median_int(reviews),
                 "marketplace": str(_ev_field(match, "marketplace") or ""),
                 "evidence_id": str(_ev_field(match, "id") or ""),
@@ -603,16 +643,18 @@ def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[di
         else:
             plan.append({
                 "keyword": k, "measured": False, "result_count": None,
-                "top10_review_median": None, "marketplace": "", "evidence_id": "",
+                "total_results": None, "top10_review_median": None,
+                "marketplace": "", "evidence_id": "",
             })
     measured = [p for p in plan if p["measured"]]
     unmeasured = [p for p in plan if not p["measured"]]
-    # Measured first: lightest entry barrier wins; ties → fewer results,
-    # then alphabetical for determinism.
+    # Measured first: lightest entry barrier wins; ties → fewest competing
+    # results (Amazon's own total when it was printed), then alphabetical.
     measured.sort(key=lambda p: (
         p["top10_review_median"] is None,
         p["top10_review_median"] if p["top10_review_median"] is not None else 0,
-        p["result_count"] if p["result_count"] is not None else 0,
+        p.get("total_results") if p.get("total_results") is not None
+        else (p["result_count"] if p["result_count"] is not None else 0),
         p["keyword"].lower(),
     ))
     return measured + unmeasured
@@ -655,6 +697,51 @@ def _category_plan(ev_ids: list[str], ev_rows: list[dict[str, Any]]) -> dict[str
     # lighter review barrier is friendlier for a new entrant.
     items.sort(key=lambda s: (-s["observed_books"], s["median_reviews"] if s["median_reviews"] is not None else -1))
     return {"basis": basis, "items": items[:5]}
+
+
+def _dive_index(ev_rows: list[Any]) -> dict[str, dict[str, Any]]:
+    """Index the final-candidate deep-dive evidence by normalized niche.
+
+    Two evidence records exist per finalist: `keyword_research` (measured
+    backend keywords) and `category_research` (the separate Kindle Store
+    and Books category trees). A candidate the dive never reached simply has
+    no entry — absence is rendered as absence, never as an empty claim.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for e in ev_rows:
+        kind = _ev_field(e, "kind")
+        if kind not in ("keyword_research", "category_research"):
+            continue
+        d = _ev_field(e, "data") or {}
+        key = _norm_kw(str(d.get("niche") or ""))
+        if not key:
+            continue
+        slot = out.setdefault(key, {
+            "niche": str(d.get("niche") or ""),
+            "keywords": [], "keyword_evidence_id": "", "department": "",
+            "ranked_by": "",
+            "books": [], "kindle_store": [], "category_evidence_id": "",
+            "category_note": "",
+        })
+        if kind == "keyword_research" and not slot["keywords"]:
+            slot["keywords"] = [
+                k for k in (d.get("keywords") or []) if isinstance(k, dict)
+            ]
+            slot["keyword_evidence_id"] = str(_ev_field(e, "id") or "")
+            slot["department"] = str(d.get("department") or "")
+            slot["ranked_by"] = str(d.get("ranked_by") or "")
+        elif kind == "category_research" and not (
+            slot["books"] or slot["kindle_store"]
+        ):
+            slot["books"] = [
+                k for k in (d.get("books") or []) if isinstance(k, dict)
+            ]
+            slot["kindle_store"] = [
+                k for k in (d.get("kindle_store") or []) if isinstance(k, dict)
+            ]
+            slot["category_evidence_id"] = str(_ev_field(e, "id") or "")
+            slot["category_note"] = str(d.get("note") or "")
+    return out
 
 
 def _keyword_clusters(keywords: list[str], niche: str) -> dict[str, Any]:
@@ -704,15 +791,15 @@ def _aggregate_consumer(cons_out: list[dict[str, Any]]) -> dict[str, Any]:
     for m in cons_out:
         by_niche.append({
             "niche": str(m.get("niche", "")),
-            "praises": [str(x) for x in _as_list(m.get("praises"))][:8],
-            "complaints": [str(x) for x in _as_list(m.get("complaints"))][:8],
-            "unmet": [str(x) for x in _as_list(m.get("unmet"))][:8],
-            "design_opportunities": [str(x) for x in _as_list(m.get("design_opportunities"))][:8],
+            "praises": [_plain(x) for x in _as_list(m.get("praises")) if _plain(x)][:8],
+            "complaints": [_plain(x) for x in _as_list(m.get("complaints")) if _plain(x)][:8],
+            "unmet": [_plain(x) for x in _as_list(m.get("unmet")) if _plain(x)][:8],
+            "design_opportunities": [_plain(x) for x in _as_list(m.get("design_opportunities")) if _plain(x)][:8],
         })
-        themes["praised"] += [str(x) for x in _as_list(m.get("praises"))]
-        themes["complaints"] += [str(x) for x in _as_list(m.get("complaints"))]
-        themes["unmet_needs"] += [str(x) for x in _as_list(m.get("unmet"))]
-        themes["desired_features"] += [str(x) for x in _as_list(m.get("design_opportunities"))]
+        themes["praised"] += [_plain(x) for x in _as_list(m.get("praises")) if _plain(x)]
+        themes["complaints"] += [_plain(x) for x in _as_list(m.get("complaints")) if _plain(x)]
+        themes["unmet_needs"] += [_plain(x) for x in _as_list(m.get("unmet")) if _plain(x)]
+        themes["desired_features"] += [_plain(x) for x in _as_list(m.get("design_opportunities")) if _plain(x)]
     # Dedupe, preserve order, bound.
     themes = {k: list(dict.fromkeys(v))[:12] for k, v in themes.items()}
     themes["frustrations"] = themes["complaints"][:6]
@@ -800,6 +887,7 @@ def _adjacent_ledger(
     opportunities_ids: set[str],
     backlog: list[dict[str, Any]],
     adjacency: list[dict[str, Any]],
+    known_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Surviving-but-unfunded demand: candidates the run discovered and did
     NOT turn into an opportunity, plus capacity backlog and measured
@@ -824,7 +912,7 @@ def _adjacent_ledger(
             "origin": origin,
             "whitespace": sc.get("score"),
             "measured": bool(sc.get("measured")),
-            "evidence_ids": [str(e) for e in (evidence_ids or [])][:6],
+            "evidence_ids": _only_known(evidence_ids or [], known_ids)[:6],
             "rationale": str(rationale or "")[:200],
         })
 
@@ -933,6 +1021,44 @@ def _pivot_rows(pivots: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     return rows
 
 
+# Evidence kinds rendered in plain language for a non-developer reader.
+# `kdspy_panel` is explicitly marked as an estimate: a third-party
+# extension's numbers are never presented as observations.
+_KIND_LABELS = {
+    "search_results": "search results",
+    "product_page": "product page",
+    "reviews": "reader reviews",
+    "autocomplete": "search suggestions",
+    "related_products": "related products",
+    "page_state": "page snapshot",
+    "census": "category census",
+    "autocomplete_frontier": "buyer-language frontier",
+    "demand_language": "buyer language",
+    "kdspy_panel": "KDSpy Pro panel (third-party estimate)",
+    "keyword_research": "backend keyword research",
+    "category_research": "store category research",
+}
+
+
+def _kind_label(kind: Any) -> str:
+    k = str(kind or "")
+    return _KIND_LABELS.get(k, k.replace("_", " "))
+
+
+def _competition_of(total: int | None, captured: Any = None) -> str:
+    """Plain-language competition bucket for a measured keyword.
+
+    Amazon's own total is the input; when it was never printed the keyword
+    is honestly 'not measured' instead of being guessed from the number of
+    rows a capture happened to pull.
+    """
+    if not isinstance(total, int):
+        return "not measured"
+    from app.final_dive import competition_label
+
+    return competition_label(total)
+
+
 def _evidence_appendix(ev_rows: list[Any], limit: int = 120) -> list[dict[str, Any]]:
     rows = []
     for row in ev_rows[:limit]:
@@ -972,16 +1098,38 @@ def _quality_statement(
             if isinstance(val, dict) and str(val.get("outcome", "")).lower() in ("limited", "partial", "inconclusive"):
                 limitations.append(f"{k}: {val.get('note', 'limited coverage')}")
     limitations = list(dict.fromkeys(limitations))[:10]
+
+    # Rejection reasons must be the recorded DECISION, not the creation
+    # hint: filters and the verification engine each persist their reason as
+    # a durable integrity assessment keyed by candidate id.
+    rej_reasons: dict[str, str] = {}
+    if assessments is not None:
+        for kind in (KIND_FILTER, KIND_VERIFICATION):
+            for a in assessments.list(session_id, kind=kind, limit=800):
+                if a.outcome == "fail" and a.subject_id and a.reason:
+                    rej_reasons.setdefault(str(a.subject_id), str(a.reason))
+
+    total_candidates = counts.get("total") or (
+        counts.get("discovered", 0) + counts.get("rejected", 0)
+        + counts.get("verifying", 0) + counts.get("verified", 0)
+    )
     return {
         "investigated": (
-            f"{counts.get('discovered', 0) + counts.get('rejected', 0)} candidates discovered "
-            f"across the methodology; {len(claims.list(session_id, limit=3000))} claims registered "
+            f"{total_candidates} candidates researched across the methodology; "
+            f"{len(claims.list(session_id, limit=3000))} claims registered "
             "with evidence chain-of-custody."
         ),
-        "verified": counts.get("verified", 0),
+        "verified": counts.get("opportunities", 0),
         "rejected": counts.get("rejected", 0),
         "rejection_reasons": [
-            {"niche": c.niche, "rationale": (c.rationale or "")[:200]} for c in rejected[:10]
+            {
+                "niche": c.niche,
+                "rationale": (
+                    rej_reasons.get(c.id)
+                    or (c.rationale or "rejected by deterministic screening")
+                )[:200],
+            }
+            for c in rejected[:10]
         ],
         "focus_pivots": [
             (
@@ -994,6 +1142,14 @@ def _quality_statement(
         ],
         "remains_uncertain": uncertain,
         "verification_limitations": limitations,
+        "estimate_policy": (
+            "Figures read from the KDSpy Pro extension (its sales, keyword and "
+            "competition estimates) are third-party estimates: they are shown "
+            "and labelled as estimates, they never count as evidence on their "
+            "own, and no candidate is verified or rejected on them. Every "
+            "verdict in this report rests on pages the research browser "
+            "actually opened."
+        ),
         "certainty_policy": (
             "This report states only what the recorded evidence supports. Where "
             "evidence was insufficient, the candidate was rejected or explicitly "
@@ -1019,6 +1175,95 @@ def _as_list(v: Any) -> list[Any]:
     if isinstance(v, str) and v.strip():
         return [v]
     return []
+
+
+def _only_known(ids: list[Any], known: set[str] | None) -> list[str]:
+    """Keep evidence ids that exist in this session (order-preserving).
+
+    `known is None` means the stores were not wired — keep everything and
+    let the validator's existence check decide.
+    """
+    out: list[str] = []
+    for i in ids:
+        s = str(i)
+        if (known is None or s in known) and s not in out:
+            out.append(s)
+    return out
+
+
+# Friendly labels for the structured records phase outputs emit. The owner
+# is not a developer: an evidence record must read as a sentence, never as
+# `{'asin': '0241477905', 'observed_at_evidence_ids': [...]}`.
+_PLAIN_LABELS = {
+    "title": "title", "subtitle": "subtitle", "query": "search",
+    "asin": "ASIN", "marketplace": "marketplace", "price": "price",
+    "rating": "rating", "review_count": "reviews", "reviews": "reviews",
+    "best_seller_rank": "best-seller rank", "rank": "rank",
+    "category_path": "category", "positioning": "positioning",
+    "notes": "note", "note": "note", "verdict": "verdict",
+    "result_count": "results found", "outcome": "outcome",
+    "total_results": "Amazon's total results",
+    "total_results_are_approximate": "approximate total",
+    "results_text": "results line printed on the page",
+    "captured_results": "results captured",
+    "competition": "competition",
+    "demand_score": "demand score",
+    "suggestion_hits": "search-suggestion hits",
+    "department": "store searched",
+    "store": "store",
+    "breadcrumb": "category path",
+    "ranked_by": "how these were ranked",
+    "phrases_mined": "candidate phrases found",
+    "requested": "keywords requested",
+    "books": "Books store categories",
+    "kindle_store": "Kindle Store categories",
+    "top10_review_median": "median reviews, top 10",
+    "top_asins": "top competing ASINs",
+    "cover": "cover", "url": "source", "niche": "niche",
+    "complaints": "complaints", "praises": "praise", "unmet": "unmet needs",
+    "evidence_ids": "evidence", "observed_at_evidence_ids": "evidence",
+}
+_PLAIN_LEADS = ("title", "niche", "query", "name")
+
+
+def _plain(v: Any, depth: int = 0) -> str:
+    """Turn any structured record into one plain-language line.
+
+    Deterministic formatting only — no inference, no invented values:
+      {"title": "Ocean: Facts", "price": "\u00a35.99", "rating": 4.8}
+    becomes
+      "Ocean: Facts (price \u00a35.99, rating 4.8)"
+    """
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (str, int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "; ".join(s for s in (_plain(x, depth + 1) for x in v) if s)
+    if isinstance(v, dict):
+        lead = next((str(v.get(k)) for k in _PLAIN_LEADS if v.get(k)), "")
+        parts: list[str] = []
+        for k, val in v.items():
+            key = str(k)
+            if key.startswith(_PLAIN_LEADS) and lead:
+                continue
+            if key.startswith("_") or val in (None, "", [], {}):
+                continue
+            label = _PLAIN_LABELS.get(key, key.replace("_", " "))
+            if key in ("evidence_ids", "observed_at_evidence_ids"):
+                ids = [str(i) for i in _as_list(val)]
+                if ids:
+                    shown = ", ".join(i[:10] + ("\u2026" if len(i) > 10 else "") for i in ids[:3])
+                    parts.append(f"{label} {shown}")
+                continue
+            parts.append(f"{label} {_plain(val, depth + 1)}")
+        body = ", ".join(parts)
+        if lead:
+            return f"{lead} ({body})" if body else lead
+        return body
+    return str(v)
 
 
 # ------------------------------------------------------------------ markdown
@@ -1062,6 +1307,21 @@ def render_markdown(model: ReportModel) -> str:
             a(f"- {f}")
         a("")
 
+    # ------------------------------------------- analyst overview (AI prose)
+    narrative = model.narrative if isinstance(model.narrative, dict) else {}
+    if narrative.get("overview"):
+        a("## Analyst's overview")
+        a("")
+        a(
+            "*Written by the research model from the verified data in this "
+            "report. Observed facts come from the evidence records; "
+            "interpretations are labeled.*"
+        )
+        a("")
+        for line in str(narrative["overview"]).splitlines():
+            a(line)
+        a("")
+
     # -------------------------------------------------------------- portfolio
     if model.opportunities:
         a("## Opportunity portfolio")
@@ -1072,8 +1332,13 @@ def render_markdown(model: ReportModel) -> str:
             "survivors — opportunities are never manufactured to reach a quota."
         )
         a("")
+        analyses = (
+            narrative.get("opportunity_analyses")
+            if isinstance(narrative.get("opportunity_analyses"), dict) else {}
+        )
         for i, o in enumerate(model.opportunities, 1):
-            _render_opportunity(lines, i, o)
+            analysis = analyses.get(str(o.get("niche") or "").strip().lower(), "")
+            _render_opportunity(lines, i, o, analysis=analysis)
     else:
         a("## Opportunity portfolio")
         a("")
@@ -1225,6 +1490,14 @@ def render_markdown(model: ReportModel) -> str:
             )
         a("")
 
+    # --------------------------------- risks & open questions (AI prose)
+    if narrative.get("risks"):
+        a("## Risks, caveats and open questions")
+        a("")
+        for line in str(narrative["risks"]).splitlines():
+            a(line)
+        a("")
+
     # ------------------------------------------------------------ methodology
     a("## Methodology trace")
     a("")
@@ -1270,6 +1543,9 @@ def render_markdown(model: ReportModel) -> str:
         for l in q["verification_limitations"]:
             a(f"- {l}")
         a("")
+    if q.get("estimate_policy"):
+        a(f"**Estimates vs observations.** {q['estimate_policy']}")
+        a("")
     a(f"**Certainty policy.** {q.get('certainty_policy', '—')}")
     a("")
 
@@ -1293,7 +1569,7 @@ def render_markdown(model: ReportModel) -> str:
                 if e.get("screenshot_artifact_id") else "—"
             )
             a(
-                f"| {e['id'][:12]}… | {e['kind']} | {e.get('marketplace') or '—'} | "
+                f"| {e['id'][:12]}… | {_kind_label(e['kind'])} | {e.get('marketplace') or '—'} | "
                 f"{src} | {e.get('captured_at', '')[:19]} | {shot} |"
             )
         a("")
@@ -1307,7 +1583,9 @@ def render_markdown(model: ReportModel) -> str:
     return "\n".join(lines)
 
 
-def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
+def _render_opportunity(
+    lines: list[str], i: int, o: dict[str, Any], *, analysis: str = ""
+) -> None:
     a = lines.append
     a(f"### {i}. {o['name']}")
     a("")
@@ -1331,6 +1609,14 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
     for label, value in rows:
         a(f"- **{label}:** {value if value not in (None, '') else '—'}")
     a("")
+
+    # Analyst's take — model-written interpretation of THIS opportunity.
+    if analysis:
+        a("**Analyst's take:**")
+        a("")
+        for line in str(analysis).splitlines():
+            a(line)
+        a("")
 
     # Niching hierarchy.
     chain = o.get("niching_chain") or []
@@ -1467,18 +1753,111 @@ def _render_opportunity(lines: list[str], i: int, o: dict[str, Any]) -> None:
           "lighter top-10 review barriers first; keywords the research never "
           "searched are marked, never assumed)")
         a("")
-        a("| Rank | Keyword | Results captured | Median reviews (top 10) | Marketplace |")
-        a("|---|---|---|---|---|")
+        a("| Rank | Keyword | Amazon results | Competition | Median reviews (top 10) | Marketplace |")
+        a("|---|---|---|---|---|---|")
         for i, e in enumerate(kp, 1):
             kw = str(e.get("keyword", "")).replace("|", "\\|")
             if e.get("measured"):
                 med = e.get("top10_review_median")
-                a(f"| {i} | {kw} | {e.get('result_count', '—')} "
+                total = e.get("total_results")
+                if isinstance(total, int):
+                    approx = (
+                        "over " if e.get("total_results_are_approximate") else ""
+                    )
+                    total_txt = f"{approx}{total:,}"
+                else:
+                    total_txt = (
+                        f"{e.get('result_count', 0)} captured"
+                        " (Amazon total not printed)"
+                    )
+                a(f"| {i} | {kw} | {total_txt} "
+                  f"| {_competition_of(total if isinstance(total, int) else None, e.get('result_count'))} "
                   f"| {med if med is not None else '—'} "
                   f"| {e.get('marketplace') or '—'} |")
             else:
-                a(f"| {i} | {kw} | not searched | not searched | — |")
+                a(f"| {i} | {kw} | not searched | not searched | not searched | — |")
         a("")
+
+    # Finalist deep dive — measured backend keywords + BOTH store category
+    # maps (Kindle Store and Books keep separate category systems).
+    br = o.get("backend_research") or {}
+    bkw = [k for k in (br.get("keywords") or []) if isinstance(k, dict)]
+    if bkw:
+        dept = str(br.get("department") or "books")
+        dept_label = "Kindle Store" if dept == "kindle" else "Books store"
+        a("**Backend keywords researched for this niche**")
+        a("")
+        a(
+            "Every phrase below came from Amazon's own search suggestions "
+            "(language shoppers actually type) and was then searched for "
+            "real. **Amazon results** is Amazon's own printed result total "
+            "for that search — the crowd you would be entering against — "
+            f"measured in the {dept_label} search."
+        )
+        a("")
+        if br.get("ranked_by"):
+            a(f"*Ranking: {br['ranked_by']}.*")
+            a("")
+        a("| # | Backend keyword | Competition | Amazon results | Median reviews, top 10 | Demand |")
+        a("|---|---|---|---|---|---|")
+        for i, k in enumerate(bkw, 1):
+            kw_txt = str(k.get("keyword") or "—").replace("|", "\\|")
+            demand = k.get("demand_score")
+            demand_txt = str(demand) if demand is not None else "—"
+            if k.get("measured"):
+                total = k.get("total_results")
+                if isinstance(total, int):
+                    approx = "over " if k.get("total_results_are_approximate") else ""
+                    total_txt = f"{approx}{total:,}"
+                else:
+                    total_txt = str(k.get("results_text") or "not printed by Amazon")
+                med = k.get("top10_review_median")
+                a(
+                    f"| {i} | {kw_txt} | {k.get('competition') or 'not measured'} | "
+                    f"{total_txt} | {med if med is not None else '—'} | {demand_txt} |"
+                )
+            else:
+                a(
+                    f"| {i} | {kw_txt} | not searched in this run | — | — | "
+                    f"{demand_txt} |"
+                )
+        a("")
+        if br.get("keyword_evidence_id"):
+            a(f"- **Evidence record:** {br['keyword_evidence_id']}")
+            a("")
+
+    books_rows = [r for r in (br.get("books") or []) if isinstance(r, dict)]
+    kindle_rows = [r for r in (br.get("kindle_store") or []) if isinstance(r, dict)]
+    if books_rows or kindle_rows:
+        a("**Store categories researched for this niche**")
+        a("")
+        a(
+            "Amazon runs the Kindle Store and the Books store as two "
+            "separate category systems, so both were mapped independently "
+            "from real product pages in each department."
+        )
+        a("")
+        if br.get("category_note"):
+            a(f"*{br['category_note']}*")
+            a("")
+        for label, rows in (("Books store", books_rows), ("Kindle Store", kindle_rows)):
+            if not rows:
+                a(f"- **{label}:** not captured in this run")
+                a("")
+                continue
+            a(f"**{label}** ({len(rows)} observed)")
+            a("")
+            for r in rows[:10]:
+                cat = str(r.get("category") or "—")
+                bc = str(r.get("breadcrumb") or "")
+                if bc and bc != cat:
+                    a(f"- {cat} — found under {bc}")
+                else:
+                    a(f"- {cat}")
+            a("")
+        if br.get("category_evidence_id"):
+            a(f"- **Evidence record:** {br['category_evidence_id']}")
+            a("")
 
     # KDP risk.
     risk = o.get("kdp_risk") or {}

@@ -89,11 +89,15 @@ class ReportValidator:
         failures: list[str] = []
         per_opportunity: list[dict[str, Any]] = []
 
-        # 1. Quality gates (blocking gates must pass).
+        # 1. Quality gates (blocking gates must pass). The failure line
+        # carries the gate's own plain-language reason so PROVISIONAL tells
+        # the owner WHAT was wrong, not just an internal gate name.
         gate_report: GateReport = self.gate_runner.run(session_id)
         if not gate_report.passed:
+            reasons = {g.name: g.reason for g in gate_report.results}
             failures.extend(
-                f"quality gate failed: {name}" for name in gate_report.failed_blocking
+                f"quality gate failed: {name} — {reasons.get(name, '')}".rstrip(" —")
+                for name in gate_report.failed_blocking
             )
 
         # 2. Per-opportunity adversarial checks.

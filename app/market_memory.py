@@ -356,6 +356,12 @@ def harvest_session(
                     {
                         "query": query,
                         "result_count": data.get("result_count"),
+                        # Amazon's own printed total — the real competition
+                        # figure, present only when the line was visible.
+                        "total_results": data.get("total_results"),
+                        "total_results_are_approximate": data.get(
+                            "total_results_are_approximate"
+                        ),
                         "top10_review_median": _top10_median(
                             [r for r in (data.get("results") or []) if isinstance(r, dict)]
                         ),
@@ -386,6 +392,31 @@ def harvest_session(
                         captured_at=e.captured_at,
                     )
                     written[KIND_COMPETITOR] += 1
+            elif e.kind == "keyword_research":
+                # Finalist deep dive: each MEASURED backend keyword is a
+                # cross-session competition measurement (Amazon's own
+                # printed total), reusable by later runs as fact.
+                for k in (data.get("keywords") or []):
+                    if not isinstance(k, dict) or not k.get("measured"):
+                        continue
+                    kw = str(k.get("keyword") or "").strip()
+                    if not kw:
+                        continue
+                    store.remember(
+                        KIND_KEYWORD,
+                        kw,
+                        {
+                            "query": kw,
+                            "total_results": k.get("total_results"),
+                            "top10_review_median": k.get("top10_review_median"),
+                            "competition": k.get("competition"),
+                            "marketplace": e.marketplace,
+                        },
+                        marketplace=e.marketplace,
+                        session_id=session_id,
+                        captured_at=e.captured_at,
+                    )
+                    written[KIND_KEYWORD] += 1
             elif e.kind == "product_page":
                 asin = str(data.get("asin") or "").strip()
                 if asin:

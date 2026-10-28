@@ -17,6 +17,15 @@ as direct evidence):
     model_inference      the model's reasoning, no page behind it
     uncertain_observation page data was ambiguous/incomplete at capture
 
+**extension_derived is the ESTIMATE class.** A third-party extension's
+rendered figures (sales estimates, keyword scores, competition ratings) are
+computed by the vendor, not observed on the page, so they are treated as
+estimates UNTIL deeper research corroborates them with a real capture:
+they carry the lowest usable confidence weight, they never satisfy an
+evidence-coverage or corroboration requirement on their own, and a claim
+resting only on them counts as unsupported (see `ESTIMATE_KINDS` /
+`claim_is_estimate_backed`). No final decision may rest on them.
+
 Reliability weights are used to compute claim confidence and to compute the
 supported-claim ratio used by the quality gates.
 """
@@ -51,12 +60,28 @@ EVIDENCE_QUALITY_CLASSES: tuple[str, ...] = (
 # Reliability weight per class (0.0-1.0). Used for claim confidence math.
 EVIDENCE_QUALITY_WEIGHTS: dict[str, float] = {
     EQ_DIRECT: 1.0,
-    EQ_EXTENSION: 0.95,
+    # An ESTIMATE, not an observation: useful context, but it must not be
+    # able to carry a claim on its own. Deliberately below the
+    # uncertain-observation floor's peers and far below any captured page.
+    EQ_EXTENSION: 0.5,
     EQ_REPEATED: 0.9,
     EQ_CORROBORATED: 0.85,
     EQ_INFERENCE: 0.25,
     EQ_UNCERTAIN: 0.4,
 }
+
+# Evidence kinds that are ESTIMATES by construction. Everything in this set
+# is excluded from evidence-coverage / corroboration math and makes a claim
+# that cites ONLY it "estimate-backed" — i.e. not supported — until deeper
+# research produces a real page capture behind the same fact.
+ESTIMATE_KINDS: frozenset[str] = frozenset({"kdspy_panel"})
+
+# Page captures that ARE observations of the live marketplace.
+PAGE_CAPTURE_KINDS: frozenset[str] = frozenset({
+    "search_results", "product_page", "reviews", "autocomplete",
+    "related_products", "page_state", "census", "autocomplete_frontier",
+    "demand_language", "keyword_research", "category_research",
+})
 
 # Claim lifecycle.
 CLAIM_OPEN = "open"
@@ -92,19 +117,53 @@ def evidence_quality_from_kind(kind: str) -> str:
     """Map a browser-evidence `kind` onto an evidence quality class.
 
     Deterministic: only actually-captured page data can be 'direct';
-    KDSpy-derived records are 'extension_derived'. Everything the model
-    asserts without a capture is 'model_inference' by construction.
+    KDSpy-derived records are 'extension_derived' (the ESTIMATE class).
+    Everything the model asserts without a capture is 'model_inference' by
+    construction.
     """
-    mapping = {
-        "search_results": EQ_DIRECT,
-        "product_page": EQ_DIRECT,
-        "reviews": EQ_DIRECT,
-        "autocomplete": EQ_DIRECT,
-        "related_products": EQ_DIRECT,
-        "kdspy_panel": EQ_EXTENSION,
-        "page_state": EQ_DIRECT,
-    }
-    return mapping.get(kind, EQ_UNCERTAIN)
+    if kind == "kdspy_panel":
+        return EQ_EXTENSION
+    if kind in PAGE_CAPTURE_KINDS:
+        return EQ_DIRECT
+    return EQ_UNCERTAIN
+
+
+def is_estimate_kind(kind: str) -> bool:
+    """True for evidence kinds that are vendor estimates, not observations."""
+    return str(kind) in ESTIMATE_KINDS
+
+
+def estimate_evidence_ids(evidence_records: list[Any]) -> set[str]:
+    """Ids of every ESTIMATE-grade record in a session's evidence list.
+
+    Accepts dicts and store objects interchangeably (the two shapes that
+    flow through verification and the quality gates).
+    """
+    out: set[str] = set()
+    for e in evidence_records or []:
+        if isinstance(e, dict):
+            kind, eid = e.get("kind"), e.get("id")
+        else:
+            kind, eid = getattr(e, "kind", None), getattr(e, "id", None)
+        if eid and is_estimate_kind(str(kind or "")):
+            out.add(str(eid))
+    return out
+
+
+def claim_is_estimate_backed(claim: "Claim", estimate_ids: set[str] | None) -> bool:
+    """True when a claim's ONLY support is extension-derived estimates.
+
+    Such a claim is treated exactly like an unsupported one by the
+    verification engine and the quality gates: an estimate is a hypothesis
+    that deeper research must confirm, never a foundation for a verdict.
+    Claims with no evidence ids are already unsupported by construction.
+    """
+    ids = [str(i) for i in (claim.evidence_ids or [])]
+    if not ids:
+        return False
+    if estimate_ids is None:
+        return False
+    return all(i in estimate_ids for i in ids)
 
 
 @dataclass
@@ -167,12 +226,21 @@ class ClaimStore:
         candidate_id: str | None = None,
         interpretation: str = "",
         meta: dict[str, Any] | None = None,
+        evidence_kinds: dict[str, str] | None = None,
     ) -> Claim:
         if kind not in CLAIM_KINDS:
             raise ClaimError(f"invalid claim kind {kind!r}")
         evidence_ids = [str(e) for e in (evidence_ids or []) if str(e).strip()]
         if quality is None:
-            quality = EQ_INFERENCE if not evidence_ids else _best_quality(evidence_ids)
+            if not evidence_ids:
+                quality = EQ_INFERENCE
+            elif evidence_kinds is not None:
+                # Honest class from the REAL kinds of the cited records: a
+                # claim resting on a KDSpy panel is extension_derived (an
+                # estimate), never "direct observation".
+                quality = _quality_from_kinds(evidence_ids, evidence_kinds)
+            else:
+                quality = _best_quality(evidence_ids)
         if quality not in EVIDENCE_QUALITY_CLASSES:
             raise ClaimError(f"invalid evidence quality class {quality!r}")
         statement = statement.strip()
@@ -310,6 +378,23 @@ class ClaimStore:
             interpretation=row["interpretation"],
             meta=json.loads(row["meta"]),
         )
+
+
+def _quality_from_kinds(evidence_ids: list[str], kinds: dict[str, str]) -> str:
+    """Best quality class actually present among a claim's cited records.
+
+    Unknown ids are ignored for the ranking (their absence is already
+    enforced elsewhere); when NOTHING is resolvable the legacy
+    count-based guess applies.
+    """
+    classes = [
+        evidence_quality_from_kind(kinds.get(i, ""))
+        for i in evidence_ids
+        if kinds.get(i)
+    ]
+    if not classes:
+        return _best_quality(evidence_ids)
+    return max(classes, key=lambda q: EVIDENCE_QUALITY_WEIGHTS.get(q, 0.0))
 
 
 def _best_quality(evidence_ids: list[str]) -> str:

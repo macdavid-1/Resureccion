@@ -135,6 +135,13 @@ engine.
 | `MEMORY_ENABLED` | no | `true` | Cross-session market memory: verified niches, measured keyword result counts, competitors, near-misses and census stats shared between runs |
 | `MEMORY_FRESH_DAYS` | no | `7` | Reuse measurements younger than this as fact; older ones are carried as stale hints the model must cheaply re-verify |
 | `MEMORY_MAX_DIGEST` | no | `40` | Memory rows handed to a single run |
+| `DIVE_ENABLED` | no | `true` | Finalist deep dive: once the report's candidates are chosen, measure their backend keywords and map both store category trees before the report is written |
+| `DIVE_MAX_CANDIDATES` | no | `8` | Report candidates that get the deep dive |
+| `DIVE_MAX_KEYWORDS` | no | `20` | Backend keywords measured per candidate (mined from Amazon suggestions, each measured with a real Books-department search) |
+| `DIVE_MAX_CATEGORIES` | no | `10` | Categories mapped **per store** — the Kindle Store and the Books store are counted separately |
+| `DIVE_PRODUCTS_PER_STORE` | no | `6` | Top competitor product pages opened per store to read their real category breadcrumbs |
+| `DIVE_AUTOCOMPLETE_QUERIES` | no | `24` | Suggestion queries used to mine candidate keyword phrases (one page load, then same-origin fetches) |
+| `DIVE_TIME_BUDGET_SECONDS` | no | `300` | Wall-clock cap per candidate; unmeasured keywords are reported as “not searched”, never as a number |
 | `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | profile | Override the per-session model-call ceiling for a mode. Defaults come from the mode profile (120/140/160) and the raise is scaled down when `SESSION_HARD_TIMEOUT_HOURS` is under 12 |
 | `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | profile | Nine colon-separated integers in phase order (`16:14:12:12:10:8:8:12:8`) overriding that mode's per-phase iteration caps |
 
@@ -183,6 +190,14 @@ the kdspy.com sign-in so the owner's subscription applies to the persistent
 profile. Every research run gets the KDSpy panel without leaving the
 anti-detect engine.
 
+**KDSpy data is an estimate, never a verdict.** Figures rendered by the
+extension (sales, keyword and competition scores) are third-party estimates:
+they are labelled as such in the report, they never satisfy an evidence-
+coverage or corroboration requirement, a claim resting only on them counts as
+unsupported, and the deterministic demand filter ignores them. Deeper
+research has to confirm the same fact on a real page capture before it
+carries any weight — that is what `ESTIMATE_KINDS` in `app/claims.py`
+enforces.
 **Egress with cloudflare-warp (your own VPS as the exit — the supported
 shape):** WARP needs root + a TUN device, so it cannot run inside an HF Space
 container — run it on the VPS and point `BROWSER_PROXY` at it. Two supported

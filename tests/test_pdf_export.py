@@ -608,3 +608,87 @@ class TestExportReports:
                 db, config, session, models=[],
                 artifacts=ArtifactStore(db, config),
             )
+
+
+class TestRendererCrashRecovery:
+    """The VPS failure: Node killed by SIGABRT with EMPTY stderr (address-
+    space/memory squeeze). It must be retried once, and a persistent death
+    must produce a diagnosis — never the old bare '(exit -6):' with nothing
+    after the colon."""
+
+    def test_renderer_cmd_uses_jitless_when_supported(self, monkeypatch):
+        import app.pdf_export as pex
+
+        monkeypatch.setattr(pex, "_jitless_ok", True)
+        cmd = pex._renderer_cmd()
+        assert cmd[0] == "node"
+        assert "--jitless" in cmd
+        assert cmd[-1].endswith("render_pdf.js")
+
+    def test_renderer_cmd_falls_back_without_jitless(self, monkeypatch):
+        import app.pdf_export as pex
+
+        monkeypatch.setattr(pex, "_jitless_ok", False)
+        cmd = pex._renderer_cmd()
+        assert "--jitless" not in cmd
+
+    def test_signal_death_is_retried_once_then_succeeds(self, monkeypatch, tmp_path):
+        import app.pdf_export as pex
+
+        out = tmp_path / "r.pdf"
+        attempts: list[int] = []
+
+        class Killed:
+            returncode = -6
+            stderr = b""
+
+        class Ok:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(cmd, **kw):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return Killed()
+            out.write_bytes(b"%PDF-1.3\n" + b"x" * 600)
+            return Ok()
+
+        monkeypatch.setattr(pex.subprocess, "run", fake_run)
+        monkeypatch.setattr(pex.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(pex, "_jitless_ok", True)
+        result = pex._render_to_tmp({"out": str(out), "blocks": []})
+        assert result == out
+        assert len(attempts) == 2, "signal death must be retried exactly once"
+
+    def test_persistent_signal_death_reports_a_diagnosis(self, monkeypatch, tmp_path):
+        import app.pdf_export as pex
+
+        class Killed:
+            returncode = -6
+            stderr = b""
+
+        calls = {"self_check": 0}
+
+        def fake_run(cmd, **kw):
+            if "process.stdout.write" in " ".join(str(c) for c in cmd):
+                calls["self_check"] += 1
+
+                class SC:
+                    returncode = 0
+                    stdout = b"ok"
+
+                return SC()
+            return Killed()
+
+        monkeypatch.setattr(pex.subprocess, "run", fake_run)
+        monkeypatch.setattr(pex.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(pex, "_jitless_ok", True)
+        with pytest.raises(PdfExportError) as exc:
+            pex._render_to_tmp({"out": str(tmp_path / "r.pdf"), "blocks": []})
+        msg = str(exc.value)
+        assert "SIGABRT" in msg, msg
+        assert "killed silently" in msg, "empty-stderr death must explain itself"
+        assert "node self-check" in msg
+        assert calls["self_check"] == 1
+        # No stray temp file is left behind by the failed render.
+        assert not (tmp_path / "r.pdf").exists()

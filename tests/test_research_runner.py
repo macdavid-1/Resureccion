@@ -351,7 +351,10 @@ async def test_vision_screenshot_attached_to_every_research_call(db, config, ses
             self.shots: list[Any] = []
 
         async def call(self, session_id: str, *, system: str, user: str, **k: Any) -> Any:
-            self.shots.append(k.get("screenshot_png"))
+            # The post-research narrative call is not a research call: it
+            # runs after every phase and never receives the screen.
+            if not user.startswith("SESSION DATA (verified"):
+                self.shots.append(k.get("screenshot_png"))
             return await super().call(session_id, system=system, user=user, **k)
 
     model = ScreenshotRecordingModel(PHASE_OUTPUTS)
@@ -513,6 +516,46 @@ def test_unknown_verdict_candidate_id_is_skipped_not_fatal(db, config, session):
     # Unknown id skipped; the real candidate's verdict still lands.
     assert runner.candidates.get(session, real.id).status == "rejected"
     actions = [e.action for e in EventLog(db).tail(session)]
+    assert "verdict_skipped_unknown_candidate" in actions, actions
+
+
+def test_string_niches_still_create_candidates(db, config, session):
+    """Accounting bug: when the model emitted niches as plain strings the
+    dict-only filter silently created ZERO candidates — a productive session
+    then showed '0 candidates' and failed the candidate gate."""
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    runner._apply_phase_effects(
+        session, "aggressive_niching",
+        {"niches": ["swimmer journals", "triathlete logbooks",
+                    {"niche": "dict niche", "marketplace": "us"}, "  "]},
+    )
+    cands = runner.candidates.list(session)
+    niches = sorted(c.niche for c in cands)
+    assert niches == ["dict niche", "swimmer journals", "triathlete logbooks"]
+
+
+def test_verdict_with_unknown_id_falls_back_to_its_niche(db, config, session):
+    """A verdict about a REAL candidate must land even when the model
+    invented the candidate id: match the niche, correct the id durably,
+    and only skip when neither id nor niche resolves to a real row."""
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    real = runner.candidates.create(session, niche="ocean fact books", marketplace="uk")
+    orphan = runner.candidates.create(session, niche="never named", marketplace="us")
+    runner._apply_phase_effects(
+        session, "adversarial_verification",
+        {
+            "verdicts": [
+                {"candidate_id": "cand_invented_123", "niche": "Ocean Fact Books",
+                 "verdict": "pass"},
+                {"candidate_id": "cand_also_invented", "niche": "a niche nobody has",
+                 "verdict": "reject"},
+            ]
+        },
+    )
+    assert runner.candidates.get(session, real.id).status == "verified"
+    assert runner.candidates.get(session, orphan.id).status == "discovered"
+    actions = [e.action for e in EventLog(db).tail(session)]
+    assert "verdict_id_corrected_by_niche" in actions, actions
     assert "verdict_skipped_unknown_candidate" in actions, actions
 
 

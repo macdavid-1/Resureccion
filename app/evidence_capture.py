@@ -79,13 +79,25 @@ class EvidenceCollector:
         max_items: int = 20,
         screenshot: bool = True,
     ) -> list[CapturedEvidence]:
-        """Extract organic results (rank/ASIN/title/price/rating/reviews)."""
+        """Extract organic results (rank/ASIN/title/price/rating/reviews).
+
+        Two different numbers live here and they mean different things:
+
+        - ``result_count``  how many results this capture actually pulled
+          (capped by ``max_items``) — never a market-size claim.
+        - ``total_results`` the TOTAL Amazon itself printed on the page
+          ("1-16 of over 4,000 results for …") — the real competition
+          figure. It is only present when that line was visible, which is
+          why the shipping-country overlay is dismissed first
+          (app.browser_manager.dismiss_amazon_overlays).
+        """
         items = await _extract_search_items(page, max_items)
         data = {
             "query": query,
             "result_count": len(items),
             "results": items,
         }
+        data.update(await _extract_results_summary(page))
         return [await self._persist(
             page,
             session_id=session_id,
@@ -233,6 +245,65 @@ class EvidenceCollector:
 
 
 # ------------------------------------------------------------- DOM extraction
+# Amazon's own "1-16 of over 4,000 results for <query>" line. It is the
+# competition measurement the whole low-competition analysis rests on, so it
+# is read straight from the page text and stored verbatim alongside the
+# parsed number.
+_RESULTS_SUMMARY_RE = re.compile(
+    r"((?:\d[\d,]*\s*[-\u2013]\s*\d[\d,]*\s+)?)of\s+"
+    r"(over\s+|about\s+|more\s+than\s+)?([\d,]+)?\s*results",
+    re.IGNORECASE,
+)
+# Layout variant without the "of": "over 7,000,000 results". It still has
+# to carry a number, so an unnumbered "results" never becomes a count.
+_RESULTS_BARE_RE = re.compile(
+    r"(over\s+|about\s+)?(\d[\d,]*)\s+results", re.IGNORECASE
+)
+
+
+def _parse_total(approx_word: str, digits: str) -> tuple[bool, int | None]:
+    total: int | None = None
+    if digits:
+        try:
+            total = int(digits.replace(",", ""))
+        except ValueError:
+            total = None
+    return bool(approx_word), total
+
+
+async def _extract_results_summary(page: Any) -> dict[str, Any]:
+    """Read Amazon's printed total-result line, if the page shows one.
+
+    Returns an empty dict when no line is found — absence is recorded as
+    absence, never as a zero ("no results" and "count not visible" are
+    different facts).
+    """
+    try:
+        text = await page.inner_text("body")
+    except Exception:
+        return {}
+    text = (text or "").replace("\u00a0", " ")
+    m = _RESULTS_SUMMARY_RE.search(text) or _RESULTS_BARE_RE.search(text)
+    if not m:
+        return {}
+    raw = " ".join(m.group(0).split())
+    groups = m.groups()
+    if len(groups) == 3:  # the "… of … results" form
+        approx, total = _parse_total(groups[1] or "", groups[2] or "")
+    else:                 # the bare "… results" form
+        approx, total = _parse_total(groups[0] or "", groups[1] or "")
+    out: dict[str, Any] = {"results_text": raw}
+    if total is not None:
+        out["total_results"] = total
+        out["total_results_are_approximate"] = approx
+    else:
+        # "of over results" — Amazon printed the word without the figure
+        # (region-dependent rendering). Keep the fact that it was OVER
+        # something without inventing the number.
+        out["total_results_are_approximate"] = True if approx else None
+    return out
+
+
 async def _extract_search_items(page: Any, max_items: int) -> list[dict[str, Any]]:
     """Pull structured data from Amazon search result DOM (best-effort)."""
     items: list[dict[str, Any]] = []
@@ -304,7 +375,9 @@ async def _extract_kdspy_panel(page: Any) -> dict[str, Any] | None:
     defensive: we look for common extension iframe/panel patterns and only
     return data actually rendered. Returns None when nothing is found.
     """
-    # 1. Extension iframes (chrome-extension:// scheme).
+    # 1. Extension iframes. The engine is Firefox, so live frames use the
+    #    moz-extension:// scheme — the Chrome-era chrome-extension:// check
+    #    alone never matched and the agent was blind to rendered panels.
     frames = []
     try:
         frames = page.frames
@@ -312,18 +385,20 @@ async def _extract_kdspy_panel(page: Any) -> dict[str, Any] | None:
         frames = []
     for frame in frames:
         url = getattr(frame, "url", "") or ""
-        if "chrome-extension://" in url:
+        scheme = next((s for s in ("moz-extension://", "chrome-extension://") if s in url), None)
+        if scheme is None:
+            continue
+        body = ""
+        try:
+            body = (await frame.inner_text("body"))[:8000]
+        except Exception:
             body = ""
-            try:
-                body = (await frame.inner_text("body"))[:8000]
-            except Exception:
-                body = ""
-            if body.strip():
-                return {
-                    "source": "extension_frame",
-                    "frame_url_host": url.split("chrome-extension://")[-1].split("/")[0],
-                    "text_excerpt": body[:2000],
-                }
+        if body.strip():
+            return {
+                "source": "extension_frame",
+                "frame_url_host": url.split(scheme)[-1].split("/")[0],
+                "text_excerpt": body[:2000],
+            }
     # 2. Injected shadow/host panels with kdspy-ish hints.
     for sel in ("[class*='kdspy' i]", "[id*='kdspy' i]", "[data-kdspy]"):
         try:

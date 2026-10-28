@@ -72,6 +72,76 @@ class BrowserManagerError(Exception):
     pass
 
 
+# Amazon renders interstitial overlays on top of the page — the shipping-
+# country tooltip ("We're showing you items that ship to Nigeria…"),
+# delivery popovers and saved-list toasts. They hide the
+# "1-16 of over N results" line the research needs as competition evidence
+# and they swallow clicks aimed at the page underneath, so every research
+# navigation dismisses them automatically before anything is captured.
+#
+# ONLY refusal labels are ever clicked ("Dismiss", "No thanks", …): clicking
+# something like "Change Address" or "Accept" would alter the owner's
+# session state, which research must never do.
+_OVERLAY_DISMISS_JS = """() => {
+  const clicked = [];
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const REFUSALS = new Set(['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip']);
+  const visible = (el) => {
+    try {
+      if (!el.getClientRects || !el.getClientRects().length) return false;
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+      if (Number(st.opacity || 1) < 0.15) return false;
+      return true;
+    } catch (e) { return false; }
+  };
+  let nodes = [];
+  try {
+    nodes = Array.from(document.querySelectorAll(
+      'button, [role="button"], a.a-button-link, input[type="button"], input[type="submit"]'
+    ));
+  } catch (e) { return clicked; }
+  for (const el of nodes) {
+    if (clicked.length >= 4) break;
+    const label = norm(el.innerText || el.value || el.getAttribute('aria-label'));
+    if (!REFUSALS.has(label)) continue;
+    if (!visible(el)) continue;
+    const inOverlay = !!el.closest(
+      '.a-popover, [role="dialog"], .a-modal, .a-modal-scroller, ' +
+      '.a-notification-container, #sp-cc-banner, .glow-ingress'
+    );
+    // "Dismiss" on its own is unambiguous; the softer labels only count
+    // when they are inside a real overlay.
+    if (!inOverlay && label !== 'dismiss') continue;
+    try { el.click(); clicked.push(label); } catch (e) {}
+  }
+  return clicked;
+}"""
+
+
+async def dismiss_amazon_overlays(page: Any) -> list[str]:
+    """Click away blocking Amazon overlays (shipping-country tooltip, …).
+
+    Best-effort by design: a page without the overlay, a fake test page, or
+    a script error all return an empty list — this never affects the
+    navigation it follows. Returns the labels that were actually clicked so
+    callers can journal the dismissal.
+    """
+    try:
+        clicked = await page.evaluate(_OVERLAY_DISMISS_JS)
+    except Exception:
+        return []
+    if not isinstance(clicked, list) or not clicked:
+        return []
+    try:
+        # Give the overlay's close animation a beat so the next capture
+        # (screenshot / result-count read) sees the unobstructed page.
+        await page.wait_for_timeout(250)
+    except Exception:
+        pass
+    return [str(c) for c in clicked][:4]
+
+
 # Consecutive browser-level proxy refusals (no successful navigation in
 # between) that force egress to direct despite a passing probe. Two is the
 # minimum that proves the refusal is not a one-off blip (one refusal is the
@@ -342,14 +412,27 @@ class BrowserManager:
         """KDSpy state after a camoufox launch.
 
         The KDSpy Firefox add-on (XPI) loads natively on this engine, so an
-        installed add-on is validated and recorded.
+        installed add-on is validated and recorded — but only when the build
+        can actually load add-ons. A stale build silently drops the ``addons``
+        config key; recording "validated" there would claim *Loaded in
+        browser* in Settings while every page shows plain Amazon. When the
+        build is incapable, the durable state becomes a precise failure with
+        the exact fix command instead of a comfortable lie.
         """
-        if self.kdspy.firefox_addon_is_configured():
-            self.kdspy.firefox_addon_state()
-            self.kdspy.record_firefox_runtime_validated(
-                str(self.kdspy.firefox_addon_path)
+        if not self.kdspy.firefox_addon_is_configured():
+            return
+        self.kdspy.firefox_addon_state()
+        if camoufox_engine.addons_supported() is False:
+            self.kdspy.record_firefox_runtime_failure(
+                "this Camoufox build cannot load add-ons — run: "
+                "python scripts/camoufox_ensure.py --fetch, then restart the app"
             )
-            self._kdspy_extension_id = "camoufox-addon"
+            self._kdspy_extension_id = None
+            return
+        self.kdspy.record_firefox_runtime_validated(
+            str(self.kdspy.firefox_addon_path)
+        )
+        self._kdspy_extension_id = "camoufox-addon"
 
     async def _teardown_context(self) -> None:
         if self._context is not None:
@@ -479,6 +562,13 @@ class BrowserManager:
             # Never leave a half-navigated page behind.
             await self.close_page(page)
             raise
+        # Dismiss blocking overlays BEFORE any auth classification,
+        # extraction or screenshot: the shipping-country tooltip otherwise
+        # covers the search-result count and steals the first click.
+        try:
+            await dismiss_amazon_overlays(page)
+        except Exception:
+            pass  # dismissal is hygiene, never a research dependency
         self._touch()
         return page
 

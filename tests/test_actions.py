@@ -146,6 +146,57 @@ async def test_search_marketplace_extracts_results_list(wired):
 
 
 @pytest.mark.asyncio
+async def test_search_targets_a_department_and_reports_amazons_total(wired):
+    """Kindle Store and Books are separate catalogues, and Amazon's own
+    printed result total is the competition figure the model must see."""
+    executor, _, browser, store, _ = wired
+
+    async def fake_extract(page: Any, max_items: int) -> list[dict]:
+        return []
+
+    class _Page(FakePage):
+        async def inner_text(self, _sel: str) -> str:
+            return "1-16 of over 4,000 results for space facts book for kids"
+
+    browser.page = _Page()
+    import app.evidence_capture as ec
+
+    orig_fn = ec._extract_search_items
+    ec._extract_search_items = fake_extract
+    try:
+        res = await executor.execute(
+            session_id="s1", action="search_marketplace",
+            args={"query": "space facts", "department": "kindle",
+                  "screenshot": False},
+        )
+    finally:
+        ec._extract_search_items = orig_fn
+
+    assert res.ok, res.error
+    code, path = browser.opened[-1]
+    assert code == "us" and "i=digital-text" in path
+    rec = store.get(res.evidence_ids[0])
+    assert rec.data["total_results"] == 4000
+    assert rec.data["total_results_are_approximate"] is True
+    assert "4,000 total results" in res.summary
+    assert "kindle department" in res.summary
+
+    # The default stays exactly as it was: no department parameter.
+    await executor.execute(
+        session_id="s1", action="search_marketplace",
+        args={"query": "space facts", "screenshot": False},
+    )
+    assert "i=" not in browser.opened[-1][1]
+
+    # An unknown department is rejected instead of silently ignored.
+    bad = await executor.execute(
+        session_id="s1", action="search_marketplace",
+        args={"query": "x", "department": "toys"},
+    )
+    assert not bad.ok and "department" in (bad.error or "")
+
+
+@pytest.mark.asyncio
 async def test_unknown_action_rejected(wired):
     executor, *_ = wired
     with pytest.raises(ActionError):

@@ -30,6 +30,9 @@ from app.claims import (
     CLAIM_UNSUPPORTED,
     ClaimStore,
     EQ_INFERENCE,
+    claim_is_estimate_backed,
+    estimate_evidence_ids,
+    is_estimate_kind,
 )
 from app.integrity import KIND_QUALITY_GATE, IntegrityAssessmentStore
 from app.research_data import (
@@ -99,6 +102,7 @@ class QualityGateRunner:
         *,
         browser_evidence_count: int = 0,
         observation_count: int = 0,
+        evidence_stores: tuple[Any, ...] = (),
     ) -> None:
         self.t = thresholds
         self.claims = claims
@@ -108,6 +112,49 @@ class QualityGateRunner:
         self.assessments = assessments
         self.browser_evidence_count = browser_evidence_count
         self.observation_count = observation_count
+        # Optional (browser_evidence, evidence) stores: when wired, the
+        # evidence gate counts only citations that REALLY exist in this
+        # session — an invented id must never satisfy it.
+        self.evidence_stores = tuple(s for s in evidence_stores if s is not None)
+        self._known_ids_cache: set[str] | None | bool = False
+        self._estimate_cache: set[str] | bool = False
+
+    def _known_ids(self, session_id: str) -> set[str] | None:
+        """Every evidence id that exists in this session, or None when the
+        stores are not wired (legacy callers keep the old behavior)."""
+        if self._known_ids_cache is not False:
+            return self._known_ids_cache  # type: ignore[return-value]
+        if not self.evidence_stores:
+            self._known_ids_cache = None
+            return None
+        known: set[str] = set()
+        for store_ in self.evidence_stores:
+            try:
+                known |= {str(e.id) for e in store_.list(session_id, limit=5000)}
+            except Exception:
+                pass
+        self._known_ids_cache = known
+        return known
+
+    def _estimate_ids(self, session_id: str) -> set[str]:
+        """Evidence ids that are VENDOR ESTIMATES (KDSpy panel figures).
+
+        Empty when the stores are not wired — the gate then behaves exactly
+        as before rather than guessing.
+        """
+        if not self.evidence_stores:
+            return set()
+        if self._estimate_cache is not False:
+            return self._estimate_cache  # type: ignore[return-value]
+        rows: list[Any] = []
+        for store_ in self.evidence_stores:
+            try:
+                rows.extend(list(store_.list(session_id, limit=5000)))
+            except Exception:
+                pass
+        ids = estimate_evidence_ids(rows)
+        self._estimate_cache = ids
+        return ids
 
     # ------------------------------------------------------------------ run
     def run(self, session_id: str) -> GateReport:
@@ -161,18 +208,48 @@ class QualityGateRunner:
         cited: set[str] = set()
         for c in claims:
             cited.update(c.evidence_ids)
+        # An opportunity's own cited evidence backs its conclusions too —
+        # the chain-of-custody validator holds it to the same existence
+        # rule, so counting it here measures reality, not optimism.
+        for o in self.opportunities.list(session_id, limit=100):
+            ids = (o.meta or {}).get("evidence_ids") or []
+            if isinstance(ids, list):
+                cited.update(str(e) for e in ids)
+        known = self._known_ids(session_id)
+        cited_before = len(cited)
+        if known is not None:
+            cited &= known
+        phantom = cited_before - len(cited) if known is not None else 0
+        # Extension-derived ids are vendor ESTIMATES: they may be cited as
+        # context, but they never count as proof behind a conclusion.
+        estimates = self._estimate_ids(session_id)
+        estimate_cited = len(cited & estimates)
+        cited -= estimates
         ok = len(cited) >= self.t.min_independent_sources
+        est_txt = (
+            f" ({estimate_cited} KDSpy estimate(s) cited but not counted as proof)"
+            if estimate_cited else ""
+        )
         return GateResult(
             name="evidence_gate",
             passed=ok,
             blocking=True,
             reason=(
-                f"{len(cited)} distinct evidence records cited by claims"
+                f"{len(cited)} distinct evidence records cited by claims/opportunities"
+                + (f" ({phantom} invented id(s) ignored)" if phantom else "")
+                + est_txt
                 if ok else
-                f"claims cite {len(cited)} evidence records; need >= "
-                f"{self.t.min_independent_sources} independent sources before conclusions are allowed"
+                f"conclusions cite {len(cited)} real evidence records"
+                + (f" ({phantom} invented id(s) ignored)" if phantom else "")
+                + est_txt
+                + f"; need >= {self.t.min_independent_sources} independent sources "
+                "before conclusions are allowed"
             ),
-            metrics={"cited_evidence": len(cited), "required": self.t.min_independent_sources},
+            metrics={
+                "cited_evidence": len(cited),
+                "estimate_evidence_ignored": estimate_cited,
+                "required": self.t.min_independent_sources,
+            },
         )
 
     def _candidate_gate(self, session_id: str) -> GateResult:
@@ -237,9 +314,20 @@ class QualityGateRunner:
                 reason="no claims registered — conclusions would rest on nothing",
                 metrics={"claims": 0},
             )
-        unsupported = sum(1 for c in claims if not c.evidence_ids or c.status == CLAIM_UNSUPPORTED)
+        estimates = self._estimate_ids(session_id)
+        unsupported = sum(
+            1 for c in claims
+            if not c.evidence_ids
+            or c.status == CLAIM_UNSUPPORTED
+            or claim_is_estimate_backed(c, estimates)
+        )
+        estimate_only = sum(1 for c in claims if claim_is_estimate_backed(c, estimates))
         ratio = 1.0 - (unsupported / len(claims))
         ok = ratio >= self.t.min_supported_claim_ratio
+        est_txt = (
+            f"; {estimate_only} rest only on KDSpy estimates and count as unsupported"
+            if estimate_only else ""
+        )
         return GateResult(
             name="supported_claims_gate",
             passed=ok,
@@ -247,11 +335,18 @@ class QualityGateRunner:
             reason=(
                 f"{len(claims) - unsupported}/{len(claims)} claims are evidence-backed "
                 f"(ratio {ratio:.2f})"
+                + est_txt
                 if ok else
                 f"only {ratio:.2f} of claims are evidence-backed (< {self.t.min_supported_claim_ratio:.2f}) — "
                 "the session's conclusions rest on model assertion"
+                + est_txt
             ),
-            metrics={"claims": len(claims), "unsupported": unsupported, "ratio": round(ratio, 3)},
+            metrics={
+                "claims": len(claims),
+                "unsupported": unsupported,
+                "estimate_backed": estimate_only,
+                "ratio": round(ratio, 3),
+            },
         )
 
     def _inference_load_gate(self, session_id: str) -> GateResult:

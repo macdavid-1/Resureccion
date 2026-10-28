@@ -80,6 +80,28 @@ def test_corrupt_manifest_is_failure(kdspy, config) -> None:
     assert state.status == EXT_FAILED
 
 
+def test_unsupported_build_records_honest_runtime_failure(
+    kdspy, config, monkeypatch
+) -> None:
+    """A build that cannot load add-ons must NOT be recorded as validated:
+    Settings would show 'Loaded in browser' while every page shows plain
+    Amazon. The failure must carry the exact upgrade command."""
+    config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
+    (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))
+    kdspy.validate_installation()
+
+    from app import browser_manager, camoufox_engine
+
+    monkeypatch.setattr(camoufox_engine, "addons_supported", lambda *a, **k: False)
+    mgr = browser_manager.BrowserManager(config, kdspy, evidence=None)
+    mgr._validate_kdspy_on_camoufox()
+
+    state = kdspy.firefox_addon_state_stored()
+    assert state.status == EXT_FAILED
+    assert "camoufox_ensure" in json.dumps(state.detail)
+    assert mgr.status().kdspy_loaded is False
+
+
 def test_runtime_validation_roundtrip(kdspy, config) -> None:
     config.kdspy_firefox_path.mkdir(parents=True, exist_ok=True)
     (config.kdspy_firefox_path / "manifest.json").write_text(json.dumps(FX_MANIFEST))

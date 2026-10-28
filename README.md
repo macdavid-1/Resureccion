@@ -48,6 +48,7 @@ app/
   browser_manager.py  # Persistent Camoufox (anti-detect Firefox) via Playwright (lifecycle, pages, crashes)
   amazon_auth.py      # Amazon auth state detection + one-shot login window + cookie import
   evidence_capture.py # Structured, redacted page/evidence extraction + screenshots
+  final_dive.py       # Finalist deep dive: measured backend keywords + per-store category maps
   routes/
     auth.py
     sessions.py
@@ -102,7 +103,7 @@ Space setup checklist:
 1. **SDK:** Docker (`sdk: docker`, `app_port: 7860` — already in this README's frontmatter).
 2. **Persistent storage:** enable a persistent bucket in the Space settings; the image sets `DATA_DIR=/data`, which is where the bucket mounts. Everything durable (SQLite DB, artifacts, recordings, PDFs, uploads, browser profile with Amazon/KDSpy auth) lives under it.
 3. **Secrets** (Space → Settings → Variables and secrets): `OWNER_PASSWORD` (the login password — the simple option) or `OWNER_PASSWORD_HASH` (generate with `python -m app.scripts.set_password`), plus `AUTH_SECRET`, `MODEL_API_KEY`, and recommended `BROWSER_LOGIN_SECRET`. Full list: `ENV_VARS.md`.
-4. **KDSpy Pro:** one-tap install from Mozilla Add-ons — Settings → KDSpy Firefox add-on → Install from AMO (or upload the XPI). No shell access needed.
+4. **KDSpy Pro:** one-tap install from Mozilla Add-ons — Settings → KDSpy Firefox add-on → Install from AMO (or upload the XPI). No shell access needed. The Camoufox **browser build must support add-on loading**: `run.sh` checks this at every boot and upgrades stale builds in place (`python scripts/camoufox_ensure.py`); if it can't, Settings records the add-on as *failed* with the fix command instead of claiming it loaded.
 
 The browser runs without the Chromium sandbox flag entirely (Firefox/Camoufox
 does not use it; containers run without user namespaces).
@@ -350,6 +351,16 @@ filter, a gate or a verification verdict:
   `MEMORY_FRESH_DAYS` are reused as fact; older rows are carried as stale
   hints the model must cheaply re-verify. Every run stops paying twice for
   the same numbers, and autonomous runs get smarter over time.
+- **Finalist deep dive** (`app/final_dive.py`) — once the methodology has
+  chosen the candidates that will reach the report, each one gets measured
+  backend keywords (mined from Amazon's suggestion box, then each searched
+  for real so Amazon's own printed result total is the competition figure,
+  up to `DIVE_MAX_KEYWORDS`) plus its category map for **both** stores — the
+  Kindle Store and the Books store keep separate category trees, so both are
+  walked independently (up to `DIVE_MAX_CATEGORIES` each). Results land in
+  `browser_evidence` as ordinary records: the report renders them, the
+  analyst model may only interpret them, and an unmeasured keyword is
+  printed as "not searched in this run" rather than as a number.
 
 Supporting changes:
 

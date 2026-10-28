@@ -35,6 +35,15 @@ from app.redact import redact, scrub_url
 
 # Search-path templates per marketplace for Amazon search URLs.
 _SEARCH_PATH = "/s?k={query}"
+# Amazon departments are SEPARATE catalogues: the Books store and the
+# Kindle Store keep different category trees, so research can target either
+# explicitly (kindle == "digital-text"). 'all' keeps the historical
+# behaviour — no `i=` parameter at all.
+_DEPARTMENT_PARAM = {
+    "all": "",
+    "books": "&i=stripbooks",
+    "kindle": "&i=digital-text",
+}
 
 
 class ActionError(Exception):
@@ -300,8 +309,18 @@ class ActionExecutor:
         query = str(args.get("query") or "").strip()
         if not query:
             raise ActionError("search_marketplace requires 'query'")
+        # Optional department: 'all' (default) | 'books' | 'kindle'.
+        department = str(args.get("department") or "all").strip().lower()
+        if department not in _DEPARTMENT_PARAM:
+            raise ActionError(
+                f"unknown department {department!r} — use 'all', 'books' or 'kindle'"
+            )
         mkt = self._marketplace_for(args)
-        page = await self.browser.open_marketplace(mkt, _SEARCH_PATH.format(query=quote_plus(query)))
+        path = (
+            _SEARCH_PATH.format(query=quote_plus(query))
+            + _DEPARTMENT_PARAM[department]
+        )
+        page = await self.browser.open_marketplace(mkt, path)
         try:
             await self._check_auth_wall(page, session_id)
             captured = await self.collector.capture_search_results(
@@ -309,12 +328,22 @@ class ActionExecutor:
                 max_items=int(args.get("max_items", 20)),
                 screenshot=bool(args.get("screenshot", True)),
             )
-            result_count = captured[0].record.data.get("result_count", 0) if captured else 0
+            data = captured[0].record.data if captured else {}
+            result_count = int(data.get("result_count") or 0)
             evidence_ids = [c.record.id for c in captured]
+            # Amazon's OWN total is the competition figure; the captured
+            # count is only how many rows this capture pulled.
+            total = data.get("total_results")
+            if isinstance(total, int):
+                approx = "over " if data.get("total_results_are_approximate") else ""
+                count_txt = f"{result_count} shown, Amazon reports {approx}{total:,} total results"
+            else:
+                count_txt = f"{result_count} results"
+            suffix = f" ({department} department)" if department != "all" else ""
             return ActionResult(
                 action="search_marketplace", ok=True, marketplace=mkt.code,
                 url=scrub_url(page.url), evidence_ids=evidence_ids,
-                summary=f"searched {query!r} on {mkt.code}: {result_count} results",
+                summary=f"searched {query!r} on {mkt.code}{suffix}: {count_txt}",
             )
         finally:
             await self.browser.close_page(page)

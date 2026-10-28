@@ -33,6 +33,7 @@ from app.claims import (
     VERDICT_LIMITED,
     VERDICT_REJECTED,
     VERDICT_VERIFIED,
+    claim_is_estimate_backed,
 )
 from app.integrity import KIND_VERIFICATION, IntegrityAssessmentStore
 from app.kdp_risk import KdpRiskScreening, record_screening, screen_candidate
@@ -103,21 +104,40 @@ class VerificationEngine:
         *,
         evidence_records: list[dict[str, Any]],
         model_verdict: str | None = None,
+        estimate_ids: set[str] | None = None,
     ) -> VerificationReport:
+        """Adversarially audit one candidate.
+
+        ``estimate_ids`` are evidence records that are VENDOR ESTIMATES
+        (KDSpy panel figures) rather than page observations. They are
+        excluded from coverage and corroboration, and a claim resting only
+        on them counts as unsupported — an estimate is a hypothesis for
+        deeper research, never proof.
+        """
         claims = self.claims.list(session_id, candidate_id=candidate.id, limit=500)
         important = [c for c in claims if c.kind in ("demand", "competition", "consumer_need", "market_gap")]
 
+        # Estimates are context, not coverage: strip them from the observed
+        # record before any count is taken.
+        estimates = set(estimate_ids or ())
+        observed = [
+            e for e in evidence_records if str(e.get("id") or "") not in estimates
+        ]
+
         # --- deterministic checks -------------------------------------------
-        evidence_urls = {str(e.get("url") or "") for e in evidence_records}
+        evidence_urls = {str(e.get("url") or "") for e in observed}
         evidence_urls.discard("")
 
-        n_evidence = len(evidence_records)
+        n_evidence = len(observed)
+        n_estimates = len(evidence_records) - n_evidence
         coverage_ok = n_evidence >= max(2, self.t.min_independent_sources)
 
         n_important = len(important)
         n_unsupported = sum(
             1 for c in important
-            if not c.evidence_ids or c.status == CLAIM_UNSUPPORTED
+            if not c.evidence_ids
+            or c.status == CLAIM_UNSUPPORTED
+            or claim_is_estimate_backed(c, estimates)
         )
         supported_ratio = (
             (n_important - n_unsupported) / n_important if n_important else 0.0
@@ -147,8 +167,12 @@ class VerificationEngine:
         problems: list[str] = []
         if not coverage_ok:
             problems.append(
-                f"evidence coverage too thin: {n_evidence} records (need >= "
-                f"{max(2, self.t.min_independent_sources)})"
+                f"evidence coverage too thin: {n_evidence} observed record(s)"
+                + (
+                    f" ({n_estimates} extension estimate(s) not counted)"
+                    if n_estimates else ""
+                )
+                + f" (need >= {max(2, self.t.min_independent_sources)})"
             )
         if not claim_ok:
             if n_important == 0:
@@ -198,6 +222,7 @@ class VerificationEngine:
             model_verdict=model_verdict,
             checks={
                 "evidence_records": n_evidence,
+                "estimate_records_ignored": n_estimates,
                 "distinct_evidence_urls": len(evidence_urls),
                 "important_claims": n_important,
                 "supported_claim_ratio": round(supported_ratio, 3),

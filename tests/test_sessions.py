@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.research_data import CandidateStore, OpportunityStore
 from app.sessions import MODE_AUTO, MODE_KEYWORDS, MODE_PROMPT, SessionStore
 
 
@@ -85,7 +86,41 @@ def test_counts_and_touch(store) -> None:
     s = store.create(mode=MODE_AUTO)
     store.touch(s.id)
     counts = store.counts(s.id)
-    assert counts == {"discovered": 0, "rejected": 0, "verifying": 0, "verified": 0}
+    assert counts == {
+        "discovered": 0, "rejected": 0, "verifying": 0, "verified": 0,
+        "opportunities": 0, "total": 0,
+    }
+
+
+def test_counts_keep_verified_candidates_and_opportunities_apart(db, store) -> None:
+    """The dashboard bug: the opportunity count overwrote the verified-
+    candidate count, so both tiles showed the same (often 0) number."""
+    s = store.create(mode=MODE_AUTO)
+    cands = CandidateStore(db)
+    opps = OpportunityStore(db)
+    rejected = cands.create(s.id, niche="dead niche")
+    cands.set_status(s.id, rejected.id, "rejected")
+    cands.create(s.id, niche="live niche")          # stays discovered
+    verified = cands.create(s.id, niche="verified niche")
+    cands.set_status(s.id, verified.id, "verified")
+    opps.create(s.id, candidate_id=verified.id, title="T", niche="verified niche",
+                marketplace="us")
+    counts = store.counts(s.id)
+    assert counts["verified"] == 1, "verified must count CANDIDATES"
+    assert counts["opportunities"] == 1, "opportunities have their own number"
+    assert counts["rejected"] == 1
+    assert counts["total"] == 3, "total = every candidate row, any status"
+
+
+def test_counts_many_matches_counts(db, store) -> None:
+    s = store.create(mode=MODE_AUTO)
+    cands = CandidateStore(db)
+    c = cands.create(s.id, niche="a niche")
+    cands.set_status(s.id, c.id, "rejected")
+    one = store.counts(s.id)
+    many = store.counts_many([s.id])[s.id]
+    assert one == many
+    assert many["total"] == 1 and many["rejected"] == 1
 
 
 def test_bump_resume(store) -> None:

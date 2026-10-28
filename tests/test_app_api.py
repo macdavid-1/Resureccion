@@ -90,7 +90,10 @@ def test_login_and_session_flow(client) -> None:
     res = client.get(f"/api/sessions/{sid}", headers=headers)
     assert res.status_code == 200
     body = res.json()["session"]
-    assert body["counts"] == {"discovered": 0, "rejected": 0, "verifying": 0, "verified": 0}
+    assert body["counts"] == {
+        "discovered": 0, "rejected": 0, "verifying": 0, "verified": 0,
+        "opportunities": 0, "total": 0,
+    }
 
     res = client.get(f"/api/sessions/{sid}/events", headers=headers)
     assert res.status_code == 200

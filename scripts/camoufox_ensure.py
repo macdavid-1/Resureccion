@@ -35,7 +35,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.camoufox_engine import CAMOUFOX_AVAILABLE, camoufox_cache_present  # noqa: E402
+from app.camoufox_engine import (  # noqa: E402
+    CAMOUFOX_AVAILABLE,
+    addons_supported,
+    camoufox_cache_present,
+)
 
 INSTALL_SPEC = "camoufox[geoip]"
 # The engine imports browserforge directly. camoufox declares it as a
@@ -152,6 +156,41 @@ def main(argv: list[str]) -> int:
 
     force = "--fetch" in argv
     if not force and camoufox_cache_present():
+        # A present-but-stale build is still broken for KDSpy: builds without
+        # the add-on loader silently ignore the addons config key, so the
+        # browser works while the extension never loads. Upgrade in place.
+        if addons_supported() is False:
+            print(
+                "[camoufox] browser build predates add-on support — "
+                "upgrading (camoufox sync + fetch, ~80 MB if a newer build exists)",
+                file=sys.stderr,
+            )
+            subprocess.run(  # noqa: S603
+                [sys.executable, "-m", "camoufox", "sync"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            proc = subprocess.run(  # noqa: S603
+                [sys.executable, "-m", "camoufox", "fetch"],
+                check=False,
+            )
+            if proc.returncode != 0:
+                print(
+                    f"[camoufox] `camoufox fetch` failed (exit {proc.returncode})",
+                    file=sys.stderr,
+                )
+            if addons_supported() is False:
+                print(
+                    "[camoufox] the installed build STILL cannot load add-ons — "
+                    "KDSpy will be recorded as failed at launch. Fix: "
+                    "python -m camoufox fetch --replace (or remove ~/.cache/camoufox "
+                    "and re-run this script)",
+                    file=sys.stderr,
+                )
+                return 0
+            print("[camoufox] browser binary upgraded — add-on loading supported")
+            return 0
         print("[camoufox] browser binary present")
         return 0
 

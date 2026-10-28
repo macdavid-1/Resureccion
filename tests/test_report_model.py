@@ -227,6 +227,55 @@ class TestReportModelFromRealRun:
         assert "differentiate" in c["lesson"]
 
 
+class TestPlainLanguageRecords:
+    """The owner is not a developer: structured records must read as plain
+    language, never as `{'asin': '0241477905', 'observed_at_evidence_ids': …}`."""
+
+    def test_plain_formats_an_evidence_record_as_a_sentence(self):
+        from app.report_model import _plain
+
+        rec = {
+            "asin": "0241477905", "marketplace": "uk",
+            "observed_at_evidence_ids": ["0c4dd02547d0404b9e5cf1193238a9a8",
+                                         "evidence_space_facts_uk"],
+            "title": "Ocean: Facts at Your Fingertips (Pocket Eyewitness)",
+            "price": "\u00a35.99", "rating": 4.8, "review_count": 86,
+            "best_seller_rank": 31784, "category_path": [],
+            "positioning": "Established DK imprint, pocket reference format",
+            "notes": "Price anchor for UK fact books (\u00a35.99-\u00a37.99)",
+        }
+        s = _plain(rec)
+        assert "Ocean: Facts at Your Fingertips" in s
+        assert "\u00a35.99" in s and "86" in s
+        assert "Price anchor" in s
+        assert "{" not in s, "raw dict repr leaked into owner-facing text"
+        assert "observed_at_evidence_ids" not in s, "snake_case internals leaked"
+        assert "category_path" not in s
+
+    def test_plain_handles_lists_scalars_and_nesting(self):
+        from app.report_model import _plain
+
+        assert _plain("just text") == "just text"
+        assert _plain(None) == ""
+        assert _plain(["a", {"title": "B", "price": "$1"}]) == "a; B (price $1)"
+        assert "{" not in _plain({"outer": {"inner": "value"}})
+
+    def test_consumer_aggregate_never_emits_raw_dicts(self):
+        from app.report_model import _aggregate_consumer
+
+        ci = _aggregate_consumer([{
+            "niche": "fact books",
+            "complaints": [{"asin": "B001", "price": "\u00a35.99", "notes": "anchor"}],
+            "praises": ["clear layout"],
+            "unmet": [], "design_opportunities": [],
+        }])
+        items = ci["themes"]["complaints"]
+        assert all(isinstance(x, str) and not x.lstrip().startswith("{") for x in items)
+        assert "\u00a35.99" in items[0]
+        assert ci["by_niche"][0]["complaints"][0].lstrip() != ""
+        assert ci["by_niche"][0]["complaints"][0][0] != "{"
+
+
 class TestReportPersistenceAndRerender:
     @pytest.mark.asyncio
     async def test_model_json_is_round_trippable(self, db, config, session):

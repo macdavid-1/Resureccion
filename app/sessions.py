@@ -261,28 +261,47 @@ class SessionStore:
 
     def counts(self, session_id: str) -> dict[str, int]:
         """Candidate/verification/opportunity counters for the dashboard.
-        Single grouped query — this is on the archive-list hot path."""
+        Single grouped query — this is on the archive-list hot path.
+
+        `verified` counts VERIFIED CANDIDATES and `opportunities` counts
+        synthesized opportunities — they used to share one SQL key, so the
+        opportunity row silently overwrote the verified-candidate count and
+        the dashboard showed the wrong number (or zero) for both.
+        `total` is every candidate row regardless of status: a session whose
+        candidates were all rejected still researched N candidates.
+        """
         with self.db.read() as conn:
             rows = conn.execute(
                 """
                 SELECT 'c' AS src, status AS k, COUNT(*) AS n FROM candidates
                  WHERE session_id = ? GROUP BY status
                 UNION ALL
-                SELECT 'o' AS src, 'verified' AS k, COUNT(*) AS n FROM opportunities
+                SELECT 'o' AS src, 'opportunities' AS k, COUNT(*) AS n FROM opportunities
                  WHERE session_id = ?
                 """,
                 (session_id, session_id),
             ).fetchall()
-        out = {"discovered": 0, "rejected": 0, "verifying": 0, "verified": 0}
+        out = {
+            "discovered": 0, "rejected": 0, "verifying": 0, "verified": 0,
+            "opportunities": 0, "total": 0,
+        }
         for r in rows:
             if r["k"] in out:
                 out[r["k"]] = int(r["n"])
+        out["total"] = (
+            out["discovered"] + out["rejected"] + out["verifying"] + out["verified"]
+        )
         return out
 
     def counts_many(self, session_ids: list[str]) -> dict[str, dict[str, int]]:
         """Batched counters for the archive list: one grouped query for all
         sessions instead of 4N point queries (mobile archive refresh)."""
-        result = {sid: {"discovered": 0, "rejected": 0, "verifying": 0, "verified": 0} for sid in session_ids}
+        def _blank() -> dict[str, int]:
+            return {
+                "discovered": 0, "rejected": 0, "verifying": 0, "verified": 0,
+                "opportunities": 0, "total": 0,
+            }
+        result = {sid: _blank() for sid in session_ids}
         if not session_ids:
             return result
         placeholders = ",".join("?" for _ in session_ids)
@@ -308,7 +327,13 @@ class SessionStore:
         for r in opps:
             sid = r["session_id"]
             if sid in result:
-                result[sid]["verified"] = int(r["n"])
+                # Opportunities are their own number — never folded into the
+                # verified-candidate count.
+                result[sid]["opportunities"] = int(r["n"])
+        for sid, c in result.items():
+            c["total"] = (
+                c["discovered"] + c["rejected"] + c["verifying"] + c["verified"]
+            )
         return result
 
     # ------------------------------------------------------------- recovery

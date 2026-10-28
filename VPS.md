@@ -300,6 +300,7 @@ browser binary if it is missing (a fresh box has no cache):
 | Symptom | Missing piece |
 |---|---|
 | Toast: "camoufox is not installed" | The Python package — every browser path (Amazon sign-in, KDSpy, research) fails at launch |
+| Settings says KDSpy loaded but Amazon shows no panel / agent gets "panel not present" | The installed Camoufox build predates add-on loading and silently drops it. Run `python scripts/camoufox_ensure.py --fetch` (boot also auto-upgrades), restart the app, then re-check Settings |
 | Error: "official/stable is not installed" | The browser binary — the package is there but never fetched |
 
 ```bash

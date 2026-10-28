@@ -37,6 +37,48 @@ def _has_camoufox_install(cache_home: str) -> bool:
     return (root / "browsers").is_dir() or (root / "version.json").is_file()
 
 
+def addons_supported(path: Path | None = None) -> bool | None:
+    """True when the installed Camoufox build can load add-ons at launch.
+
+    The ``addons`` config key reaches the browser through the CAMOU_CONFIG_*
+    environment variables; a build whose ``properties.json`` predates
+    add-on support silently ignores it (camoufox's ``validate_config`` only
+    prints "Skipping unknown patch addons ...") — the browser starts fine,
+    every page loads, and no error ever says the KDSpy add-on was dropped.
+    Returns True/False, or None when no build could be inspected (camoufox
+    not installed, unpackaged build, unreadable file).
+    """
+    if path is None:
+        if not CAMOUFOX_AVAILABLE:
+            return None
+        candidates: list[Path] = []
+        try:
+            from camoufox.multiversion import get_active_path
+
+            active = get_active_path()
+            if active:
+                candidates.append(Path(active) / "properties.json")
+        except Exception:
+            pass
+        try:
+            from camoufox.pkgman import INSTALL_DIR
+
+            candidates.append(Path(INSTALL_DIR) / "properties.json")
+        except Exception:
+            pass
+        for candidate in candidates:
+            if candidate.is_file():
+                path = candidate
+                break
+        if path is None:
+            return None
+    try:
+        props = json.loads(path.read_bytes())
+        return "addons" in {p.get("property") for p in props}
+    except Exception:
+        return None
+
+
 def camoufox_cache_present() -> bool:
     """True when the resolved cache actually holds a downloaded browser.
 
@@ -195,6 +237,13 @@ FIREFOX_USER_PREFS: dict[str, Any] = {
     # a rate-limited bridge can 429. Pacing spreads those opens out.
     "network.http.pacing.requests.enabled": True,
     "network.http.pacing.requests.min-parallelism": 1,
+    # Extension sideload hardening. Firefox silently disables a first-run
+    # sideloaded add-on unless autoDisableScopes is 0, and signature
+    # enforcement refuses unpacked add-ons loaded from disk. Camoufox's
+    # temporary-install path bypasses both today, but the prefs cost nothing
+    # and cover sideload-style loaders / older builds.
+    "extensions.autoDisableScopes": 0,
+    "xpinstall.signatures.required": False,
 }
 
 
@@ -396,6 +445,11 @@ def launch_kwargs(
         # window dimensions drive layout instead of Playwright's fixed
         # viewport fighting the spoof.
         "no_viewport": True,
+        # Add-ons must be able to open tabs: KDSpy's install/welcome flow and
+        # its popup's default-category jump all call tabs.create. Camoufox
+        # REJECTS every extension-initiated tab ("Rejected by Camoufox")
+        # unless this is enabled.
+        "allow_addon_new_tab": True,
     }
     # Firefox privacy/anti-leak prefs, with the host-specific content-process
     # count substituted over the module default (see FIREFOX_USER_PREFS).

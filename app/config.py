@@ -135,6 +135,22 @@ class Config:
         self.adjacency_min_whitespace = float(
             os.environ.get("ADJACENCY_MIN_WHITESPACE", "0.55").strip() or "0.55"
         )
+        # Final-candidate deep dive (deterministic, runs once the report's
+        # candidates are chosen, before the report is written): measured
+        # backend keywords per surviving niche plus SEPARATE category maps
+        # for the Kindle Store and the Books store (different category
+        # systems). Every figure lands in browser_evidence as evidence.
+        self.dive_enabled = _flag("DIVE_ENABLED", True)
+        self.dive_max_candidates = max(1, _int_env("DIVE_MAX_CANDIDATES", 8))
+        self.dive_max_keywords = max(0, _int_env("DIVE_MAX_KEYWORDS", 20))
+        self.dive_max_categories = max(0, _int_env("DIVE_MAX_CATEGORIES", 10))
+        self.dive_products_per_store = max(1, _int_env("DIVE_PRODUCTS_PER_STORE", 6))
+        self.dive_autocomplete_queries = max(
+            0, _int_env("DIVE_AUTOCOMPLETE_QUERIES", 24)
+        )
+        self.dive_time_budget_seconds = max(
+            60, _int_env("DIVE_TIME_BUDGET_SECONDS", 300)
+        )
         # Cross-session market memory: verified niches, measured keyword
         # result counts, competitors and near-misses, reused by later runs.
         # Evidence fresher than memory_fresh_days is reused as fact; older is

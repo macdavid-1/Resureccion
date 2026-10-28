@@ -185,7 +185,7 @@
     const { session } = await api(`/api/sessions/${id}`);
     state.current = session;
     updateWsHead(session);
-    renderCounts(session.counts || { discovered: 0, rejected: 0, verifying: 0, verified: 0 });
+    renderCounts(session.counts || { discovered: 0, rejected: 0, verifying: 0, verified: 0, opportunities: 0, total: 0 });
     // Terminal sessions have nothing new to stream; skip the connection.
     if (!["completed", "failed", "cancelled"].includes(session.status)) connectStream(id);
     else state.lastRefresh = Date.now();
@@ -623,10 +623,14 @@
 
   function renderCounts(c) {
     if (!c) return;
-    $("#st-cand").textContent = (c.discovered ?? 0) + (c.verifying ?? 0) + (c.verified ?? 0);
+    // "Candidates" = every candidate the session actually researched (any
+    // status) — a run whose candidates were all rejected did NOT research
+    // zero candidates. Opportunities get their own number.
+    const total = c.total ?? ((c.discovered ?? 0) + (c.rejected ?? 0) + (c.verifying ?? 0) + (c.verified ?? 0));
+    $("#st-cand").textContent = total;
     $("#st-ver").textContent = c.verified ?? 0;
     $("#st-rej").textContent = c.rejected ?? 0;
-    $("#st-opp").textContent = c.verified ?? 0;
+    $("#st-opp").textContent = c.opportunities ?? 0;
   }
 
   function renderCandidates(cands) {

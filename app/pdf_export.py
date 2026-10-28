@@ -20,8 +20,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,11 @@ _SIDECAR = Path(__file__).resolve().parent.parent / "scripts" / "render_pdf.js"
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 LOGO_FILE = _STATIC_DIR / "logo.png"
 _node_ok: bool | None = None  # probe once per process
+_jitless_ok: bool | None = None  # probe once per process
+# One render at a time. Two concurrent Node renderers double the peak memory
+# on a host where the browser already runs in-process — the exact condition
+# that made the renderer die from SIGABRT on the VPS.
+_RENDER_LOCK = threading.Lock()
 
 
 def logo_file() -> Path | None:
@@ -66,6 +74,65 @@ def node_available() -> bool:
     if _node_ok is None:
         _node_ok = shutil.which("node") is not None and _SIDECAR.is_file()
     return _node_ok
+
+
+def _jitless_supported() -> bool:
+    """True when this Node build accepts --jitless.
+
+    --jitless disables the JIT: no executable-code ranges, no JIT heap, far
+    smaller address-space footprint. A report-sized render reserves ~1.5 GB
+    of virtual address space with the JIT on and silently aborts (SIGABRT,
+    empty stderr — `ulimit -v 1G` reproduces it byte-for-byte) on a host
+    under memory pressure; with --jitless the same render fits under 1 GB.
+    Rendering is not CPU-critical, so the interpreter is the right trade.
+    """
+    global _jitless_ok
+    if _jitless_ok is None:
+        try:
+            proc = subprocess.run(
+                ["node", "--jitless", "-e", "process.exit(0)"],
+                capture_output=True,
+                timeout=20,
+            )
+            _jitless_ok = proc.returncode == 0
+        except Exception:
+            _jitless_ok = False
+    return _jitless_ok
+
+
+def _renderer_cmd() -> list[str]:
+    cmd = ["node"]
+    if _jitless_supported():
+        cmd.append("--jitless")
+    cmd.append(str(_SIDECAR))
+    return cmd
+
+
+def _signal_name(returncode: int) -> str:
+    if returncode >= 0:
+        return ""
+    try:
+        return signal.Signals(-returncode).name
+    except ValueError:
+        return f"signal {-returncode}"
+
+
+def _node_self_check() -> str:
+    """Does the Node runtime work AT ALL in this environment right now?
+
+    Included in failure messages so a broken runtime is never mistaken for
+    a content problem (and vice versa). Best-effort: never raises.
+    """
+    try:
+        proc = subprocess.run(
+            ["node", "-e", "process.stdout.write('ok')"],
+            capture_output=True,
+            timeout=20,
+        )
+        out = proc.stdout.decode("utf-8", "replace").strip()
+        return f"node self-check: rc={proc.returncode} out={out[:40]!r}"
+    except Exception as exc:
+        return f"node self-check failed: {type(exc).__name__}: {exc}"
 
 
 def _resolve_figures(
@@ -134,6 +201,17 @@ def _resolve_figures(
 
 
 # --------------------------------------------------------------------- blocks
+def _kw_total_txt(k: dict[str, Any]) -> str:
+    """Amazon's printed total for a measured keyword, honestly labelled."""
+    total = k.get("total_results")
+    if isinstance(total, int):
+        approx = "over " if k.get("total_results_are_approximate") else ""
+        return f"{approx}{total:,}"
+    if k.get("measured"):
+        return str(k.get("results_text") or "not printed by Amazon")
+    return "not searched in this run"
+
+
 def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]]]:
     """Transform the structured report model into designed PDF blocks.
 
@@ -259,6 +337,63 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
                 li(f"{label} keywords: {', '.join(str(x) for x in items)}")
         if k.get("relevance_rationale"):
             p(f"Why these keywords: {k['relevance_rationale']}")
+
+        # Finalist deep dive: measured backend keywords + BOTH store
+        # category maps (Kindle Store and Books are different systems).
+        br = o.get("backend_research") or {}
+        bkw = [x for x in (br.get("keywords") or []) if isinstance(x, dict)]
+        if bkw:
+            dept = str(br.get("department") or "books")
+            dept_label = "Kindle Store" if dept == "kindle" else "Books store"
+            h3("Backend keywords researched for this niche")
+            p(
+                "Each phrase came from Amazon's own search suggestions "
+                "(language shoppers actually type) and was then searched for "
+                "real. 'Amazon results' is Amazon's own printed total for that "
+                f"search — the competition you would enter against, measured "
+                f"in the {dept_label} search."
+            )
+            table(
+                ["#", "Backend keyword", "Amazon results", "Competition",
+                 "Median reviews (top 10)", "Demand"],
+                [
+                    [
+                        i,
+                        str(k.get("keyword") or "—"),
+                        _kw_total_txt(k),
+                        str(k.get("competition") or "not measured"),
+                        (
+                            k.get("top10_review_median")
+                            if k.get("top10_review_median") is not None else "—"
+                        ),
+                        k.get("demand_score") if k.get("demand_score") is not None else "—",
+                    ]
+                    for i, k in enumerate(bkw, 1)
+                ],
+            )
+            if br.get("keyword_evidence_id"):
+                p(f"Evidence record: {br['keyword_evidence_id']}")
+        books_rows = [r for r in (br.get("books") or []) if isinstance(r, dict)]
+        kindle_rows = [r for r in (br.get("kindle_store") or []) if isinstance(r, dict)]
+        if books_rows or kindle_rows:
+            h3("Store categories researched for this niche")
+            p("Amazon runs the Kindle Store and the Books store as two separate "
+              "category systems, so both were mapped independently from real "
+              "product pages in each department.")
+            for label, rows in (("Books store", books_rows), ("Kindle Store", kindle_rows)):
+                if not rows:
+                    p(f"{label}: not captured in this run")
+                    continue
+                table(
+                    [label, "Where it was observed"],
+                    [
+                        [str(r.get("category") or "—"), str(r.get("breadcrumb") or "—")]
+                        for r in rows[:10]
+                    ],
+                )
+            if br.get("category_evidence_id"):
+                p(f"Evidence record: {br['category_evidence_id']}")
+
         risk = o.get("kdp_risk") or {}
         if risk.get("warnings"):
             p(f"KDP risk ({risk.get('level', '—')}): "
@@ -410,6 +545,8 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
         h3("Recorded verification limitations")
         for l in q["verification_limitations"]:
             li(l)
+    if q.get("estimate_policy"):
+        p(f"Estimates vs observations: {q['estimate_policy']}")
     p(f"Certainty policy: {q.get('certainty_policy', '—')}")
 
     # ------------------------------------------------------------ appendix
@@ -593,13 +730,33 @@ def _render_to_tmp(job: dict[str, Any]) -> Path:
         )
     pdf_tmp = Path(job["out"])
     try:
-        proc = subprocess.run(
-            ["node", str(_SIDECAR)],
-            input=json.dumps(job, ensure_ascii=False).encode("utf-8"),
-            capture_output=True,
-            # Combined multi-report PDFs are larger than single ones.
-            timeout=300,
-        )
+        # Serialized: never two renderers at once (peak-memory guard), and a
+        # renderer killed by a transient memory squeeze gets ONE retry before
+        # the failure is reported to the owner.
+        with _RENDER_LOCK:
+            run_kwargs: dict[str, Any] = {
+                "input": json.dumps(job, ensure_ascii=False).encode("utf-8"),
+                "capture_output": True,
+                # Combined multi-report PDFs are larger than single ones.
+                "timeout": 300,
+            }
+            proc = subprocess.run(_renderer_cmd(), **run_kwargs)
+            if proc.returncode < 0:
+                time.sleep(1.5)
+                proc = subprocess.run(_renderer_cmd(), **run_kwargs)
+        if proc.returncode < 0:
+            name = _signal_name(proc.returncode)
+            detail = (
+                proc.stderr.decode("utf-8", "replace").strip()[:300]
+                or "no error output — the Node.js process was killed silently, "
+                   "which happens when the host is short on memory or "
+                   "address space (browser + app + renderer at once)"
+            )
+            raise PdfExportError(
+                f"PDF renderer killed by {name} (exit {proc.returncode}): {detail}. "
+                f"{_node_self_check()}. Retry when the browser is idle, or free "
+                "memory on the host (pm2 logs resurreccion shows memory kills)."
+            )
         if proc.returncode != 0:
             raise PdfExportError(
                 f"PDF renderer failed (exit {proc.returncode}): "

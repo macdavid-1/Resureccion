@@ -30,12 +30,13 @@ from app.artifacts import ArtifactStore
 from app.browser_manager import BrowserManager, BrowserManagerError
 from app.browser_store import BrowserAuthStore, BrowserEvidenceStore, LoginWindowStore
 from app.census import CategoryCensus
-from app.claims import ClaimStore, EQ_INFERENCE
+from app.claims import ClaimStore, EQ_INFERENCE, estimate_evidence_ids
 from app.config import Config
 from app.db import Database
 from app.events import EventLog
 from app.evidence_capture import EvidenceCollector
 from app.filters import CandidateFilterEngine
+from app.final_dive import FinalCandidateDive
 from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
@@ -75,6 +76,7 @@ from app.redact import redact
 from app.quality_gates import QualityGateRunner
 from app.reports import ReportStore
 from app.research_data import (
+    CAND_VERIFIED,
     CandidateStore,
     EvidenceStore,
     ObservationStore,
@@ -657,7 +659,7 @@ class ResearchRunner:
 
             self.agent.transition(session_id, "reporting", substate="synthesis_done")
             self.trace.record(session_id, KIND_REPORT, "Generating the final research report")
-            self._write_final_report(session_id, phase_outputs)
+            await self._write_final_report(session_id, phase_outputs)
 
             self.sessions.update(session_id, status="completed", progress=1.0)
             self.agent.transition(session_id, "done")
@@ -1168,12 +1170,21 @@ class ResearchRunner:
         # Niching produces/updates candidate rows.
         niches = output.get("niches")
         if isinstance(niches, list):
+            # The contract says niches are objects, but a model under pressure
+            # emits plain strings — a string is a REAL discovered niche, and
+            # silently dropping it is exactly how a session ends up with
+            # "0 candidates" despite productive research. Normalize first.
+            norm: list[dict[str, Any]] = []
+            for n in niches:
+                if isinstance(n, str) and n.strip():
+                    norm.append({"niche": n.strip()[:200]})
+                elif isinstance(n, dict) and str(n.get("niche") or "").strip():
+                    norm.append(n)
             # Everything past the live cap is RECORDED as backlog — the tail
             # past 24 is where odd gems live, and silently dropping it was
             # throwing away discovered demand.
             overflow = [
-                n for n in niches[self.rc.max_candidates:]
-                if isinstance(n, dict) and str(n.get("niche") or "").strip()
+                n for n in norm[self.rc.max_candidates:]
             ]
             if overflow:
                 self._record_backlog(
@@ -1188,9 +1199,7 @@ class ResearchRunner:
                     ],
                     reason="candidate_capacity",
                 )
-            for n in niches[: self.rc.max_candidates]:
-                if not isinstance(n, dict) or not str(n.get("niche") or "").strip():
-                    continue
+            for n in norm[: self.rc.max_candidates]:
                 if not n.get("candidate_id"):
                     c = self.candidates.create(
                         session_id,
@@ -1217,29 +1226,60 @@ class ResearchRunner:
                 if not isinstance(v, dict):
                     continue
                 cid = str(v.get("candidate_id") or "").strip()
-                if not cid:
-                    continue
-                if self.candidates.get(session_id, cid) is None:
+                niche_hint = str(v.get("niche") or "").strip()
+                if cid and self.candidates.get(session_id, cid) is None:
                     # The model referenced a candidate id that does not
-                    # exist — a hallucinated slug, not a real row. A verdict
-                    # is model output: an unknown id is skipped with a
-                    # durable warning, never allowed to abort the run. (This
-                    # exact crash failed a live session mid-verification:
-                    # "candidate cand_... not found in session ...").
+                    # exist — a hallucinated slug, not a real row. Before
+                    # dropping the verdict, fall back to the niche text when
+                    # it names ONE real candidate: a verdict about a real
+                    # candidate must land even when its id was invented
+                    # (dropping it silently left real candidates stuck in
+                    # "discovered" and the dashboard count at zero).
+                    match = (
+                        self._find_candidate_by_niche(session_id, niche_hint)
+                        if niche_hint else None
+                    )
+                    if match is None:
+                        self.events.append(
+                            session_id, level="warn", actor="agent",
+                            action="verdict_skipped_unknown_candidate",
+                            detail={
+                                "candidate_id": cid[:80],
+                                "niche": niche_hint[:120],
+                                "verdict": str(v.get("verdict") or "")[:40],
+                                "phase": phase,
+                            },
+                        )
+                        continue
                     self.events.append(
                         session_id, level="warn", actor="agent",
-                        action="verdict_skipped_unknown_candidate",
-                        detail={
-                            "candidate_id": cid[:80],
-                            "verdict": str(v.get("verdict") or "")[:40],
-                            "phase": phase,
-                        },
+                        action="verdict_id_corrected_by_niche",
+                        detail={"candidate_id": cid[:80], "matched": match.id,
+                                "niche": niche_hint[:120], "phase": phase},
                     )
-                    continue
-                verdict = str(v.get("verdict") or "").lower()
-                if verdict == "pass":
+                    cid = match.id
+                if not cid:
+                    match = (
+                        self._find_candidate_by_niche(session_id, niche_hint)
+                        if niche_hint else None
+                    )
+                    if match is None:
+                        self.events.append(
+                            session_id, level="warn", actor="agent",
+                            action="verdict_skipped_unknown_candidate",
+                            detail={
+                                "candidate_id": "",
+                                "niche": niche_hint[:120],
+                                "verdict": str(v.get("verdict") or "")[:40],
+                                "phase": phase,
+                            },
+                        )
+                        continue
+                    cid = match.id
+                verdict = str(v.get("verdict") or "").lower().strip()
+                if verdict in ("pass", "verified"):
                     self.candidates.set_status(session_id, str(cid), "verified")
-                elif verdict == "reject":
+                elif verdict in ("reject", "rejected"):
                     self.candidates.set_status(session_id, str(cid), "rejected")
                 elif verdict == "downgrade":
                     # A downgrade is a serious finding, not a death sentence:
@@ -1943,6 +1983,14 @@ class ResearchRunner:
             session_id, level="info", actor="agent", action="integrity_pipeline_started", detail={},
         )
         all_evidence = self._all_browser_evidence(session_id)
+        evidence_kinds = {
+            str(e.get("id") or ""): str(e.get("kind") or "")
+            for e in all_evidence if e.get("id")
+        }
+        # Extension-derived records are VENDOR ESTIMATES: they are excluded
+        # from coverage/corroboration and cannot support a claim on their
+        # own until deeper research corroborates them (app.claims).
+        estimate_ids = estimate_evidence_ids(all_evidence)
         candidates = [
             c for c in self.candidates.list(session_id, limit=self.rc.max_candidates)
             if c.status != "rejected"
@@ -1952,7 +2000,9 @@ class ResearchRunner:
         downgraded = 0
         rejected = 0
         for cand in candidates:
-            self._register_candidate_claims(session_id, cand, phase_outputs)
+            self._register_candidate_claims(
+                session_id, cand, phase_outputs, evidence_kinds=evidence_kinds
+            )
             claims = self.claims.list(session_id, candidate_id=cand.id, limit=500)
             ev = evidence_for_candidate(cand, all_evidence, claims=claims)
 
@@ -1984,6 +2034,7 @@ class ResearchRunner:
             model_verdict = self._model_verdict_for(phase_outputs, cand.niche)
             vr = self.verification_engine.verify(
                 session_id, cand, evidence_records=ev, model_verdict=model_verdict,
+                estimate_ids=estimate_ids,
             )
             new_status = self.verification_engine.apply(
                 session_id, vr, candidates=self.candidates,
@@ -2228,7 +2279,11 @@ class ResearchRunner:
         return out
 
     def _register_candidate_claims(
-        self, session_id: str, cand: Any, phase_outputs: dict[str, Any]
+        self,
+        session_id: str,
+        cand: Any,
+        phase_outputs: dict[str, Any],
+        evidence_kinds: dict[str, str] | None = None,
     ) -> None:
         """Register the candidate's important factual claims from the durable
         phase analyses. Claims the model asserted WITHOUT evidence ids are
@@ -2260,6 +2315,7 @@ class ResearchRunner:
                 candidate_id=cand.id,
                 interpretation=interpretation,
                 meta={"source": "phase_analysis"},
+                evidence_kinds=evidence_kinds,
             )
             existing.add(statement.lower())
 
@@ -2681,11 +2737,245 @@ class ResearchRunner:
             detail={"error": str(exc)[:300], "trace": traceback.format_exc()[-800:]},
         )
 
-    def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
+    async def _analyst_narrative(self, session_id: str, model: Any) -> dict[str, Any]:
+        """Model-written, deterministically grounded analyst prose.
+
+        The backend owns every accounting figure; the model only
+        interprets the verified digest (app.report_narrative). Unknown
+        numbers cause one corrective retry and are then stripped — an
+        invented figure never reaches the report. ANY failure degrades to
+        the deterministic report: the narrative is additive, never a
+        dependency, and a session must complete without it.
+        """
+        from app.report_narrative import (
+            NARRATIVE_FIELDS,
+            NARRATIVE_SYSTEM,
+            allowed_numbers,
+            build_digest,
+            correction_prompt,
+            digest_json,
+            normalize_narrative,
+            user_prompt,
+        )
+
+        try:
+            data = digest_json(build_digest(model.to_dict()))
+        except Exception:
+            return {}
+        allowed = allowed_numbers(data)
+        prompt = user_prompt(data)
+        narrative: dict[str, Any] = {}
+        unresolved: list[str] = []
+        for attempt in (1, 2):
+            try:
+                reply = await self.model.call(
+                    session_id,
+                    system=NARRATIVE_SYSTEM,
+                    user=prompt,
+                    expect_fields=NARRATIVE_FIELDS,
+                    label="Writing the analyst report",
+                )
+            except Exception as exc:  # CancelledError is BaseException — passes
+                self.events.append(
+                    session_id, level="warn", actor="agent",
+                    action=(
+                        "report_narrative_unavailable" if attempt == 1
+                        else "report_narrative_retry_failed"
+                    ),
+                    detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
+                )
+                break  # keep a previously grounded narrative, else deterministic
+            try:
+                self._record_model_usage(session_id, reply)
+            except Exception:
+                pass
+            narrative, unresolved = normalize_narrative(
+                getattr(reply, "content", None), allowed=allowed
+            )
+            if narrative and not unresolved:
+                break
+            if attempt == 1:
+                prompt = correction_prompt(
+                    data, unresolved or ["an unusable section structure"]
+                )
+        if not narrative:
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="report_narrative_skipped",
+                detail={"unresolved_figures": len(unresolved)},
+            )
+            return {}
+        self.events.append(
+            session_id, level="info", actor="agent",
+            action="report_narrative_written",
+            detail={
+                "sections": sorted(narrative.keys()),
+                "opportunities_analyzed": len(
+                    narrative.get("opportunity_analyses") or {}
+                ),
+                "figures_removed": len(unresolved),
+            },
+        )
+        return narrative
+
+    # -------------------------------------- final-candidate deep dive
+    def _final_candidates(self, session_id: str) -> list[Any]:
+        """The candidates that actually reach this report, in report order.
+
+        Opportunity dossiers lead (they ARE the report's portfolio), then
+        every other verified survivor — the candidate ledger prints those
+        too, so they get the same measured keywords and category maps.
+        Rejected and still-unverified candidates never do: they are not
+        final. Capped by `dive_max_candidates` so the walk stays bounded.
+        """
+        cands = {c.id: c for c in self.candidates.list(session_id, limit=500)}
+        ordered: list[Any] = []
+        seen: set[str] = set()
+        for o in self.opportunities.list(session_id, limit=50):
+            c = cands.get(o.candidate_id)
+            if c is not None and c.id not in seen:
+                seen.add(c.id)
+                ordered.append(c)
+        for c in cands.values():
+            if c.id in seen or c.status != CAND_VERIFIED:
+                continue
+            seen.add(c.id)
+            ordered.append(c)
+        cap = int(getattr(self.config, "dive_max_candidates", 8))
+        return ordered[:max(1, cap)]
+
+    async def _final_deep_dive(self, session_id: str) -> None:
+        """Measure backend keywords + both store category maps for every
+        candidate that will appear in the report.
+
+        Deterministic (no model) and durable: each finalist's dive is
+        checkpointed under `final_dive:<candidate_id>`, so a resumed report
+        reuses finished dives and never re-walks. A failure — budget, pause,
+        a page that will not open — degrades to fewer measured rows and is
+        journaled; it never blocks the report itself.
+        """
+        cfg = self.config
+        if not getattr(cfg, "dive_enabled", True):
+            return
+        targets = self._final_candidates(session_id)
+        if not targets:
+            return
+        pending: list[Any] = []
+        for cand in targets:
+            try:
+                cp = self.checkpoints.get_safe(session_id, f"final_dive:{cand.id}")
+                payload = (cp.payload or {}) if cp else {}
+            except Exception:
+                payload = {}
+            if payload.get("done"):
+                continue
+            pending.append(cand)
+        if not pending:
+            return
+        try:
+            session = self.sessions.require(session_id)
+            marketplaces, _mode = self._resolve_marketplaces(session)
+        except Exception as exc:
+            self.events.append(
+                session_id, level="warn", actor="system",
+                action="final_dive_skipped",
+                detail={"error": f"{type(exc).__name__}: {exc}"[:200]},
+            )
+            return
+        max_kw = int(getattr(cfg, "dive_max_keywords", 20))
+        max_cat = int(getattr(cfg, "dive_max_categories", 10))
+        self.events.append(
+            session_id, level="info", actor="system", action="final_dive_started",
+            detail={
+                "candidates": [c.id for c in pending],
+                "max_keywords_per_candidate": max_kw,
+                "max_categories_per_store": max_cat,
+                "stores": ["kindle_store", "books"],
+            },
+        )
+        self.trace.record(
+            session_id, KIND_DISCOVERY,
+            f"Finalist deep dive: measuring up to {max_kw} backend keywords and "
+            f"up to {max_cat} categories each for the Kindle Store and the Books "
+            f"store on {len(pending)} report candidate(s) — measured, not guessed",
+        )
+        dive = FinalCandidateDive(
+            self.browser,
+            self.browser_evidence,
+            self.events,
+            max_keywords=max_kw,
+            max_categories=max_cat,
+            autocomplete_queries=int(getattr(cfg, "dive_autocomplete_queries", 24)),
+            products_per_store=int(getattr(cfg, "dive_products_per_store", 6)),
+            time_budget_seconds=float(getattr(cfg, "dive_time_budget_seconds", 300)),
+            should_stop=lambda: self._cancelled or self._pause_requested,
+        )
+        wrote_evidence = False
+        for cand in pending:
+            if self._cancelled or self._pause_requested:
+                break
+            res = await dive.run(
+                session_id=session_id,
+                marketplaces=marketplaces,
+                niche=cand.niche,
+                candidate_id=cand.id,
+            )
+            if res.evidence_ids:
+                wrote_evidence = True
+            try:
+                self.checkpoints.save(
+                    session_id, f"final_dive:{cand.id}",
+                    {"done": bool(res.done), **res.to_dict()},
+                )
+            except Exception:
+                pass  # the measured evidence is already durable
+            self.events.append(
+                session_id,
+                level="warn" if res.error else "info",
+                actor="system",
+                action=(
+                    "final_dive_candidate_failed" if res.error
+                    else "final_dive_candidate_completed"
+                ),
+                detail={
+                    "candidate_id": cand.id,
+                    "niche": cand.niche[:120],
+                    "keywords_measured": res.keywords_measured,
+                    "books_categories": len(res.books_categories),
+                    "kindle_categories": len(res.kindle_categories),
+                    "stopped_reason": res.stopped_reason,
+                    **({"error": res.error} if res.error else {}),
+                },
+            )
+            if res.error:
+                self.errors.record(
+                    session_id, scope="final_dive", severity="warning",
+                    message=res.error[:300], recoverable=True,
+                )
+        if wrote_evidence:
+            # The normal memory harvest ran BEFORE this dive (it is part of
+            # the post-Phase-8 work). Distill the new measurements too, so
+            # the next session never has to pay for them again.
+            self._harvest_memory(session_id)
+
+    async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         from app.quality_gates import QualityGateRunner
         from app.report_model import build_report_model, render_markdown
         from app.report_validation import ReportValidator
         from app.research_data import VerificationStore
+
+        # Finalist deep dive FIRST: every candidate that reaches this report
+        # gets its backend keywords measured and BOTH store category maps
+        # (Kindle Store and Books are different category systems). The
+        # results are ordinary evidence, so the model below interprets them
+        # instead of inventing them. It degrades — never blocks — the report.
+        try:
+            await self._final_deep_dive(session_id)
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="final_dive", severity="warning",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
 
         # Structured model first — the report is a RENDERING of durable
         # research state, never a free-form string.
@@ -2712,7 +3002,14 @@ class ResearchRunner:
             },
             backlog=self._backlog_items(session_id),
             adjacency=self._adjacency_rows(session_id),
+            evidence=self.evidence,
         )
+        # Analyst prose: the model interprets the verified records above;
+        # it never computes a figure. Empty on any failure — the report
+        # renders deterministically without it.
+        narrative = await self._analyst_narrative(session_id, model)
+        if narrative:
+            model.narrative = narrative
         body = render_markdown(model)
 
         # Adversarial validation of the deliverable: gates + per-opportunity
@@ -2727,6 +3024,7 @@ class ResearchRunner:
             self.assessments,
             browser_evidence_count=self.browser_evidence.count(session_id),
             observation_count=self.observations.count(session_id),
+            evidence_stores=(self.browser_evidence, self.evidence),
         )
         validation = ReportValidator(
             self.claims, self.opportunities, VerificationStore(self.db),

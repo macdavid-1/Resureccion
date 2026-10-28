@@ -85,6 +85,31 @@ def test_content_process_count_follows_config(cfg: Config) -> None:
     assert kw["firefox_user_prefs"]["privacy.donottrackheader.enabled"] is True
 
 
+@requires_camoufox
+def test_launch_kwargs_enable_addon_tabs_and_sideload_prefs(cfg: Config) -> None:
+    """Camoufox rejects every extension-initiated tab unless
+    allow_addon_new_tab is on (KDSpy's install/welcome flow needs tabs),
+    and the sideload prefs must reach the browser."""
+    kw = ce.launch_kwargs(cfg)
+    assert kw["allow_addon_new_tab"] is True
+    prefs = kw["firefox_user_prefs"]
+    assert prefs["extensions.autoDisableScopes"] == 0
+    assert prefs["xpinstall.signatures.required"] is False
+
+
+def test_addons_supported_reads_properties_json(tmp_path: Path) -> None:
+    """The capability probe must detect builds that would silently drop the
+    addons config key (old properties.json with no 'addons' entry)."""
+    props = tmp_path / "properties.json"
+    props.write_text(
+        json.dumps([{"property": "addons", "type": "str"}, {"property": "fonts", "type": "str"}])
+    )
+    assert ce.addons_supported(path=props) is True
+    props.write_text(json.dumps([{"property": "fonts", "type": "str"}]))
+    assert ce.addons_supported(path=props) is False
+    assert ce.addons_supported(path=tmp_path / "missing.json") is None
+
+
 def test_content_processors_are_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
     """A typo must never starve or overcommit the browser: clamp to 1-8."""
     monkeypatch.setenv("BROWSER_CONTENT_PROCESSORS", "1000")

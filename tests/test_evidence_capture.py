@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.evidence_capture import (
+    _extract_kdspy_panel,
     _first_price,
     _parse_int,
     _parse_rating,
@@ -35,6 +36,43 @@ def test_int_extraction() -> None:
 def test_stamp_shape() -> None:
     s = _stamp()
     assert len(s) == 16 and s.endswith("Z") and "T" in s
+
+
+class _FakeFrame:
+    def __init__(self, url: str, body: str) -> None:
+        self.url = url
+        self._body = body
+
+    async def inner_text(self, _sel: str) -> str:
+        return self._body
+
+
+class _FakePage:
+    def __init__(self, frames: list[_FakeFrame]) -> None:
+        self.frames = frames
+
+    async def query_selector(self, _sel: str):
+        return None
+
+
+async def test_extract_panel_finds_moz_extension_frames() -> None:
+    """The engine is Firefox: extension frames are moz-extension://, and the
+    Chrome-era chrome-extension-only check left the agent blind to panels."""
+    page = _FakePage(
+        [
+            _FakeFrame("https://www.amazon.com/s?k=x", ""),
+            _FakeFrame("moz-extension://abcd-1234/pages/panel.html", "KDSpy panel data"),
+        ]
+    )
+    out = await _extract_kdspy_panel(page)
+    assert out is not None
+    assert out["source"] == "extension_frame"
+    assert out["frame_url_host"] == "abcd-1234"
+    assert "KDSpy panel data" in out["text_excerpt"]
+
+
+async def test_extract_panel_returns_none_without_extension_frames() -> None:
+    assert await _extract_kdspy_panel(_FakePage([])) is None
 
 
 def test_collector_requires_real_page_for_kdspy() -> None:

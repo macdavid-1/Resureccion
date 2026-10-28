@@ -686,13 +686,19 @@ def _competitor_records(evidence_records: list[dict[str, Any]]) -> list[dict[str
 
 def _demand_signal_count(evidence_records: list[dict[str, Any]]) -> int:
     """Count demand-bearing observations: review counts, rankings, prices on
-    live product/search captures, KDSpy demand panels."""
+    live product/search captures.
+
+    KDSpy panels are deliberately NOT counted: a third-party extension's
+    figures are estimates (app.claims.ESTIMATE_KINDS), and an estimate must
+    never be able to move a filter verdict on its own. It only matters
+    once a real page capture corroborates the same fact.
+    """
     signals = 0
     for e in evidence_records:
         data = e.get("data") or {}
         kind = e.get("kind", "")
         if kind == "kdspy_panel":
-            signals += 1
+            continue
         elif kind == "search_results":
             results = data.get("results") or []
             if any((r.get("review_count") or 0) > 0 for r in results):
