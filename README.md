@@ -255,6 +255,14 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
   verification → opportunity synthesis. The model reasons *inside* each
   phase; it never invents its own process. Exit gates (min evidence, output
   contracts) are enforced by the orchestrator.
+- **Phase switching + niche target** — the model may leave a phase at will
+  with an optional `goto_phase` field (durable jump budget), and a target
+  stated in the brief ("I need 10 niches", or `TARGET_NICHES`) re-opens the
+  earlier phases after verification when too few niches survived — so the
+  run works until the target is met instead of ending short. Switching never
+  loses data: phase analyses are merged (never blanked), verified candidates
+  are never re-verified, rejected niches stay rejected, and everything is
+  checkpointed per pass.
 - **Model**: GLM-5.3-Flash on DeepInfra by default (OpenAI-compatible API,
   native vision, prompt caching, 1M context) — set `MODEL_API_KEY` in the
   environment; see `ENV_VARS.md`.

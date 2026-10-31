@@ -17,6 +17,8 @@ Executes the deterministic methodology (app/methodology.py) phase by phase:
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -152,6 +154,10 @@ class RunnerConfig:
     # A strategic focus pivot spends a whole new P1→P9 pass, so it only
     # fires while this fraction of the session's hard time budget remains.
     min_remaining_session_fraction_for_pivot: float = 0.5
+    # Model-directed phase switches ("goto_phase") allowed per session.
+    # Deterministic and durable: the count survives restarts, so a looping
+    # model can never jump forever.
+    max_phase_jumps: int = 10
 
 
 # Signature keys that count as REAL progress for the anti-stall guard.
@@ -200,6 +206,73 @@ def _primary_items(output: dict[str, Any], primary: str) -> int:
     if not isinstance(value, list):
         return 0
     return sum(1 for item in value if _substantive(item))
+
+
+# Cap on a merged list field: a phase that re-runs many times must never
+# grow an unbounded analysis list (prompts and report stay bounded).
+_MERGED_LIST_CAP = 500
+
+# Phrases in a brief / owner message that state the owner's Niche TARGET
+# ("I need 10 niches", "niche target of 12", "target: 8 niches"). Deliberately
+# narrow: "target" alone never counts — "target 20 keywords" must not become
+# a niche target. The number must sit next to a niche word.
+_TARGET_RES: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\b(\d{1,3})\s+(?:top\s+|verified\s+|final\s+|strong\s+)?(?:niches|opportunities)\b", re.I),
+    re.compile(r"\bniche\s+target\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\b", re.I),
+    re.compile(r"\btarget\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\s+(?:verified\s+)?niches\b", re.I),
+)
+
+
+def _phase_content(output: dict[str, Any]) -> dict[str, Any]:
+    """The phase's analysis, without orchestrator control keys the model
+    may add on top of the contract (e.g. 'goto_phase')."""
+    return {k: v for k, v in output.items() if k != "goto_phase"}
+
+
+def _dedup_rows(rows: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    out: list[Any] = []
+    for row in rows:
+        try:
+            key = json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            key = str(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+        if len(out) >= _MERGED_LIST_CAP:
+            break
+    return out
+
+
+def _merge_phase_output(prior: Any, new: Any) -> dict[str, Any]:
+    """Combine a RE-RUN phase's output with what that phase already produced.
+
+    When the model switches back to a phase (or a target refill re-opens the
+    earlier phases), the re-run must never go back empty: the new analysis is
+    merged ON TOP of the old one — list fields accumulate (deduplicated), a
+    blank new value never erases prior content, and scalars/objects take the
+    new value when present. Deterministic; no model involved.
+    """
+    if not isinstance(prior, dict) or not prior:
+        return new if isinstance(new, dict) else {}
+    if not isinstance(new, dict) or not new:
+        return prior
+    out = dict(prior)
+    for key, value in new.items():
+        old = out.get(key)
+        if value is None or value == "" or value == [] or value == {}:
+            continue  # blank must not erase prior work
+        if isinstance(old, list) and isinstance(value, list):
+            out[key] = _dedup_rows(list(old) + list(value))
+        elif isinstance(old, dict) and isinstance(value, dict):
+            merged = dict(old)
+            merged.update(value)
+            out[key] = merged
+        else:
+            out[key] = value
+    return out
 
 
 class ResearchRunner:
@@ -561,26 +634,34 @@ class ResearchRunner:
             # integrity pipeline) leaves ZERO verified candidates, discovery
             # re-enters on a fresh focus, bounded by config.max_focus_pivots.
             timings = self._timings_for(session_id)
-            # Durable resume cursor. The pivot count is restored from the
-            # 'focus_pivots' checkpoint so the pivot budget survives
+            # Durable resume cursor. The PASS number (focus pivots + target
+            # refills) is restored from checkpoints so budgets survive
             # restarts, and every phase committed in the CURRENT pass is
             # reused from its 'phase_output' checkpoint: a resumed session
             # continues at the first incomplete phase — it never re-runs
             # the methodology from Phase 1.
-            pivot_round = self._pivot_rounds(session_id)
+            pass_round = self._pass_round(session_id)
             phase_outputs: dict[str, Any] = {}
             completed_phases: set[str] = set()
             for phase in PHASE_ORDER:
-                prior_out = self._load_phase_output(session_id, phase, pivot_round)
+                prior_out = self._load_phase_output(session_id, phase, pass_round)
                 if prior_out is not None:
                     phase_outputs[phase] = prior_out
                     completed_phases.add(phase)
+            # A model-directed phase switch that was in flight when the
+            # session died is re-applied, so the jump is never silently lost.
+            if self._reapply_pending_goto(session_id, pass_round, completed_phases):
+                self.events.append(
+                    session_id, level="info", actor="agent",
+                    action="phase_switch_resumed",
+                    detail={"completed_phases": sorted(completed_phases)},
+                )
             if completed_phases:
                 self.events.append(
                     session_id, level="info", actor="agent",
                     action="research_resumed_from_checkpoints",
                     detail={"completed_phases": sorted(completed_phases),
-                            "pass": pivot_round},
+                            "pass": pass_round},
                 )
                 self.trace.record(
                     session_id, KIND_PHASE,
@@ -588,9 +669,13 @@ class ResearchRunner:
                     f"phase(s) from durable checkpoints and continuing at the first "
                     f"incomplete phase — nothing researched is lost",
                 )
+            # The for-loop can start mid-methodology after a goto; a sweep
+            # that did not start at Phase 1 may not declare the pass done.
+            loop_start = 0
             while True:
                 completed_all_phases = True
-                for phase in PHASE_ORDER:
+                goto_start: int | None = None
+                for phase in PHASE_ORDER[loop_start:]:
                     if self._cancelled:
                         raise _Cancelled()
                     if self._pause_requested:
@@ -607,14 +692,23 @@ class ResearchRunner:
                         # the interrupt hit between the phase commit and
                         # that work, run it now before skipping onward.
                         if phase == P8_ADVERSARIAL and not self._post_p8_done(session_id):
-                            if self._post_adversarial(
+                            restart = self._post_adversarial(
                                 session_id, session, phase_outputs,
-                                pivot_round, session_started,
-                            ):
-                                pivot_round += 1
-                                phase_outputs = {}
-                                completed_phases = set()
+                                session_started,
+                            )
+                            if restart:
                                 completed_all_phases = False
+                                pass_round += 1
+                                if restart == "pivot":
+                                    # The dead focus's decisions must not
+                                    # masquerade as the new pass's. Its full
+                                    # record survives in the candidate ledger,
+                                    # events, trace, and 'focus_pivots'.
+                                    phase_outputs = {}
+                                # restart == "refill": phase_outputs are KEPT
+                                # — rediscovery continues from everything
+                                # already analyzed, never from empty.
+                                completed_phases = set()
                                 break
                         else:
                             self._bump_progress(
@@ -634,6 +728,17 @@ class ResearchRunner:
                     output = await self._run_phase(
                         session_id, session, phase, phase_outputs, session_started
                     )
+                    if output.get("_goto"):
+                        # Model-directed phase switch: this phase stays OPEN
+                        # (its mid-phase cursor is checkpointed each
+                        # iteration) and every completed phase at or after
+                        # the target re-opens — nothing after the jump point
+                        # may stand on work the model is about to redo.
+                        target = str(output["_goto"])
+                        goto_start = PHASE_ORDER.index(target)
+                        self._reopen_from_goto(session_id, target, completed_phases, pass_round)
+                        completed_all_phases = False
+                        break
                     phase_outputs[phase] = output
                     # Owner pause hit INSIDE the phase: stop here. Falling
                     # through would record the phase as complete, finish its
@@ -654,8 +759,12 @@ class ResearchRunner:
                     self.checkpoints.save(
                         session_id, f"phase_complete:{phase}",
                         {"completed_at": iso_now(), "output_keys": sorted(output.keys()),
-                         "pass": pivot_round},
+                         "pass": pass_round},
                     )
+                    # Completed for the rest of this pass: later sweeps
+                    # (including one started mid-methodology by a goto) skip
+                    # it instead of re-running committed work.
+                    completed_phases.add(phase)
                     timings.finish(f"phase:{phase}", outcome="ok")
                     if self.supervisor is not None:
                         self.supervisor.heartbeat(session_id, phase=phase, note="phase_complete")
@@ -675,22 +784,30 @@ class ResearchRunner:
                         # has its own durable completion marker so a resume
                         # can run it exactly once — or catch it up when the
                         # interrupt hit between phase commit and this work.
-                        if self._post_adversarial(
+                        restart = self._post_adversarial(
                             session_id, session, phase_outputs,
-                            pivot_round, session_started,
-                        ):
-                            pivot_round += 1
-                            # The new pass analyzes from scratch: the dead
-                            # focus's decisions must not masquerade as the
-                            # new pass's. Its full record survives in the
-                            # candidate ledger, events, trace, and the
-                            # 'focus_pivots' checkpoint.
-                            phase_outputs = {}
-                            completed_phases = set()
+                            session_started,
+                        )
+                        if restart:
                             completed_all_phases = False
+                            pass_round += 1
+                            if restart == "pivot":
+                                # The new pass analyzes from scratch: the
+                                # dead focus's decisions must not masquerade
+                                # as the new pass's. Its full record survives
+                                # in the candidate ledger, events, trace, and
+                                # the 'focus_pivots' checkpoint.
+                                phase_outputs = {}
+                            # restart == "refill": phase_outputs are KEPT —
+                            # the re-opened phases continue from everything
+                            # already analyzed and verified.
+                            completed_phases = set()
                             break
-                if completed_all_phases:
+                if completed_all_phases and loop_start == 0:
                     break
+                # A goto re-enters AT the target phase; every other sweep
+                # starts at the top to pick up whatever is still open.
+                loop_start = goto_start if goto_start is not None else 0
 
             self.agent.transition(session_id, "reporting", substate="synthesis_done")
             self.trace.record(session_id, KIND_REPORT, "Generating the final research report")
@@ -753,7 +870,7 @@ class ResearchRunner:
         # crashed or restarted session continues this phase exactly where it
         # stopped — never from iteration 1 and never losing the analysis it
         # had already produced.
-        current_pass = self._pivot_rounds(session_id)
+        current_pass = self._pass_round(session_id)
         progress = self._load_phase_progress(session_id, phase, current_pass)
         start_iteration = int(progress.get("iteration") or 0)
         if progress:
@@ -839,7 +956,7 @@ class ResearchRunner:
                 marketplace_mode=self._marketplace_mode(session_id),
                 evidence_digest=self._evidence_digest(session_id),
                 candidates_digest=self._candidates_digest(session_id),
-                prior_phase_outputs={k: v for k, v in prior_outputs.items() if k != phase},
+                prior_phase_outputs=dict(prior_outputs),
                 timing=timing,
                 images_note=(
                     (
@@ -859,6 +976,8 @@ class ResearchRunner:
                 market_memory=discovery.get("memory") or None,
                 headroom_priority=discovery.get("priority") or None,
                 adjacency_note=discovery.get("adjacency") or "",
+                # Owner's niche target (deterministic; "" when unstated).
+                target_note=self._target_note(session_id, session),
                 # Deterministic exit gate, shown so the model knows exactly
                 # what still separates an explore step from a commit.
                 phase_gate=self._phase_gate(
@@ -1092,6 +1211,50 @@ class ResearchRunner:
             actions_now = reply.content.get("actions")
             exploring = isinstance(actions_now, list) and len(actions_now) > 0
 
+            # --- model-directed phase switch (goto) -------------------------
+            # The model may leave this phase at will (the usual case:
+            # verification left the owner's niche target unmet and discovery
+            # must run again). Only a COMMIT reply can switch — a reply
+            # carrying actions is an explore step and runs them first. The
+            # phase stays open: its mid-phase cursor was checkpointed above.
+            goto = str(reply.content.get("goto_phase") or "").strip()
+            if goto and not exploring:
+                if goto == phase:
+                    goto = ""  # already here — not a switch
+                elif goto not in PHASE_ORDER:
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="phase_switch_ignored_unknown",
+                        detail={"phase": phase, "requested": goto[:60]},
+                    )
+                    goto = ""
+                elif self._phase_jump_count(session_id) >= self.rc.max_phase_jumps:
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="phase_switch_ignored_budget",
+                        detail={"phase": phase, "requested": goto,
+                                "ceiling": self.rc.max_phase_jumps},
+                    )
+                    goto = ""
+                if goto:
+                    # This phase's timing row closes as "switched": the
+                    # phase is left OPEN, not finished.
+                    timings.abandon(f"phase:{phase}", outcome="switched")
+                    self._record_phase_jump(session_id, phase, goto, current_pass)
+                    self.events.append(
+                        session_id, level="info", actor="agent",
+                        action="phase_switched",
+                        detail={"from": phase, "to": goto, "pass": current_pass},
+                    )
+                    self.trace.record(
+                        session_id, KIND_PHASE,
+                        f"Switching from {PHASE_TITLES.get(phase, phase)} to "
+                        f"{PHASE_TITLES.get(goto, goto)} at the model's request — "
+                        "nothing researched is lost; verified results stay "
+                        "verified and rejected niches stay rejected",
+                    )
+                    return {"_goto": goto}
+
             # The DECLARED floors (what the phase always owes) …
             declared_floors_met = (
                 not missing
@@ -1134,9 +1297,12 @@ class ResearchRunner:
                             "re-capturing the same pages",
                         ),
                     )
+                committed = _merge_phase_output(
+                    prior_outputs.get(phase), _phase_content(reply.content)
+                )
                 self.checkpoints.save(
                     session_id, f"phase_output:{phase}",
-                    {"output": reply.content, "model": reply.model,
+                    {"output": committed, "model": reply.model,
                      "iterations": iteration, "commit": "clean",
                      "evidence_new": phase_new_evidence, "at": iso_now(),
                      "pass": current_pass},
@@ -1153,8 +1319,8 @@ class ResearchRunner:
                             "primary_items": items,
                             "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
                 )
-                self._apply_phase_effects(session_id, phase, reply.content)
-                return reply.content
+                self._apply_phase_effects(session_id, phase, committed)
+                return committed
 
             if stall >= STALL_LIMIT:
                 self.events.append(
@@ -1195,9 +1361,12 @@ class ResearchRunner:
                         )},
             )
             return {}
+        committed = _merge_phase_output(
+            prior_outputs.get(phase), _phase_content(best_output)
+        )
         self.checkpoints.save(
             session_id, f"phase_output:{phase}",
-            {"output": best_output, "iterations": iteration,
+            {"output": committed, "iterations": iteration,
              "commit": "forced", "at": iso_now(), "pass": current_pass},
         )
         try:
@@ -1210,8 +1379,8 @@ class ResearchRunner:
                     "primary_items": _primary_items(best_output, spec.output_contract[0]),
                     "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
         )
-        self._apply_phase_effects(session_id, phase, best_output)
-        return best_output
+        self._apply_phase_effects(session_id, phase, committed)
+        return committed
 
     def _salvage_contract_reply(
         self, session_id: str, exc: Exception
@@ -1283,8 +1452,19 @@ class ResearchRunner:
                     ],
                     reason="candidate_capacity",
                 )
+            # A re-run phase (model goto / target refill) re-lists niches
+            # that are already on the ledger: link them to the EXISTING row
+            # instead of creating a duplicate candidate for one niche.
+            existing_niche_ids = {
+                str(c.niche).strip().lower(): c.id
+                for c in self.candidates.list(session_id, limit=500)
+            }
             for n in norm[: self.rc.max_candidates]:
                 if not n.get("candidate_id"):
+                    key = str(n["niche"]).strip().lower()
+                    if key in existing_niche_ids:
+                        n["candidate_id"] = existing_niche_ids[key]
+                        continue
                     c = self.candidates.create(
                         session_id,
                         niche=str(n["niche"])[:200],
@@ -1296,6 +1476,7 @@ class ResearchRunner:
                         },
                     )
                     n["candidate_id"] = c.id
+                    existing_niche_ids[key] = c.id
                     self.trace.record(
                         session_id, KIND_CANDIDATE,
                         candidate_created_text(
@@ -1390,6 +1571,13 @@ class ResearchRunner:
         opps = output.get("opportunities")
         if isinstance(opps, list):
             created = 0
+            # A re-run synthesis (goto / target refill) re-lists
+            # opportunities from an earlier pass: the existing dossier
+            # stands — never a second row for one verified candidate.
+            known_opp_candidates = {
+                o.candidate_id
+                for o in self.opportunities.list(session_id, limit=500)
+            }
             for o in opps:
                 if created >= self.rc.max_opportunities:
                     break
@@ -1431,6 +1619,10 @@ class ResearchRunner:
                             ["the integrity pipeline did not verify this candidate"],
                         ),
                     )
+                    continue
+                if cid in known_opp_candidates:
+                    # Already synthesized in an earlier pass — the existing
+                    # opportunity row is the record for this candidate.
                     continue
                 keywords = o.get("keywords") or []
                 title_concepts = o.get("title_concepts")
@@ -2202,11 +2394,14 @@ class ResearchRunner:
     def _run_integrity_pipeline(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         """Deterministic integrity pipeline, run after Phase 8 and before Phase 9.
 
-        For every non-rejected candidate:
+        For every candidate that is neither rejected nor already verified:
           1. register the candidate's claims from the phase analyses,
           2. run the 13 named deterministic filters,
           3. run the verification engine (evidence chain, claim integrity,
              corroboration, KDP risk).
+
+        Verified candidates are REUSED as-is (never re-verified), so a later
+        pass that rediscovers niches cannot overturn a settled verdict.
 
         Only candidates the pipeline accepts or downgrades may feed synthesis;
         rejects carry durable, auditable reasons. This is the system's own
@@ -2224,10 +2419,13 @@ class ResearchRunner:
         # from coverage/corroboration and cannot support a claim on their
         # own until deeper research corroborates them (app.claims).
         estimate_ids = estimate_evidence_ids(all_evidence)
-        candidates = [
-            c for c in self.candidates.list(session_id, limit=self.rc.max_candidates)
-            if c.status != "rejected"
-        ]
+        # A verified candidate is FINISHED — a later pass (target refill)
+        # must never re-verify it; its verdict, filters and evidence chain
+        # stand as recorded. Rejected candidates stay dead for the same
+        # reason. Only new or still-unresolved candidates are judged.
+        live = self.candidates.list(session_id, limit=self.rc.max_candidates)
+        candidates = [c for c in live if c.status not in ("rejected", "verified")]
+        reused_verified = sum(1 for c in live if c.status == "verified")
         existing_niches = [c.niche for c in self.candidates.list(session_id, limit=500)]
         accepted = 0
         downgraded = 0
@@ -2294,11 +2492,12 @@ class ResearchRunner:
                 )
         self.checkpoints.save(session_id, "integrity_pipeline", {
             "accepted": accepted, "downgraded": downgraded, "rejected": rejected,
-            "at": iso_now(),
+            "reused_verified": reused_verified, "at": iso_now(),
         })
         self.events.append(
             session_id, level="info", actor="agent", action="integrity_pipeline_completed",
-            detail={"accepted": accepted, "downgraded": downgraded, "rejected": rejected},
+            detail={"accepted": accepted, "downgraded": downgraded,
+                    "rejected": rejected, "reused_verified": reused_verified},
         )
 
     # ------------------------------------- durable resume cursor helpers
@@ -2311,6 +2510,165 @@ class ResearchRunner:
             return len(pivots) if isinstance(pivots, list) else 0
         except Exception:
             return 0
+
+    # ---------------------------------------------------------- pass counter
+    def _target_refill_rounds(self, session_id: str) -> int:
+        """Target refills already taken (durable — restored across restarts
+        so the refill budget never resets)."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "target_refills")
+            refills = (cp.payload or {}).get("refills") if cp else None
+            return len(refills) if isinstance(refills, list) else 0
+        except Exception:
+            return 0
+
+    def _pass_round(self, session_id: str) -> int:
+        """The pass a checkpoint belongs to: focus pivots + target refills.
+
+        Both re-open phases, so both bump the pass a phase output is keyed
+        to (while the PIVOT budget keeps its own, separate count).
+        """
+        return self._pivot_rounds(session_id) + self._target_refill_rounds(session_id)
+
+    # ------------------------------------------------------------ niche target
+    def _niche_target(self, session_id: str, session: Any) -> int:
+        """How many verified niches the owner asked for (0 = no target).
+
+        The brief and any owner message win when they state a target —
+        "I need 10 niches", "niche target of 12". TARGET_NICHES is the
+        default for briefs that state none. Nothing is invented: a run
+        without a target behaves exactly as it did before.
+        """
+        texts: list[str] = []
+        for attr in ("prompt", "objective"):
+            value = getattr(session, attr, None)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+        try:
+            texts.extend(str(line) for line in self._owner_note_lines_for(session_id))
+        except Exception:
+            pass  # owner messages are additive context, never a hard dependency
+        target = 0
+        blob = " ".join(texts)
+        for rx in _TARGET_RES:
+            for m in rx.finditer(blob):
+                try:
+                    target = max(target, int(m.group(1)))
+                except (IndexError, ValueError):
+                    continue
+        if target <= 0:
+            target = max(0, int(getattr(self.config, "target_niches", 0) or 0))
+        return min(target, 50)
+
+    def _target_note(self, session_id: str, session: Any) -> str:
+        """Deterministic NICHE TARGET line for every prompt ("" = no target)."""
+        target = self._niche_target(session_id, session)
+        if target <= 0:
+            return ""
+        try:
+            verified = len(
+                self.candidates.list(
+                    session_id, status="verified", limit=self.rc.max_candidates
+                )
+            )
+            rejected = [
+                c.niche
+                for c in self.candidates.list(session_id, status="rejected", limit=20)
+            ]
+        except Exception:
+            verified, rejected = 0, []
+        note = (
+            f"the owner's target is {target} verified niches; {verified} verified so far. "
+            "If verification leaves the count below target, reply with "
+            '"goto_phase": "opportunity_discovery" to switch back to earlier '
+            "phases and discover more niches — verified candidates are never "
+            "re-verified, rejected niches stay rejected, and everything already "
+            "analyzed is kept."
+        )
+        rounds = self._target_refill_rounds(session_id)
+        if rounds:
+            note = f"REDISCOVERY ROUND {rounds} in progress — find NEW niches. " + note
+        if rejected:
+            note += " Do not rediscover these rejected niches: " + "; ".join(
+                n[:60] for n in rejected[:8]
+            ) + "."
+        return note
+
+    # -------------------------------------------------------- model phase jumps
+    def _phase_jump_count(self, session_id: str) -> int:
+        try:
+            cp = self.checkpoints.get_safe(session_id, "phase_gotos")
+            jumps = (cp.payload or {}).get("jumps") if cp else None
+            return len(jumps) if isinstance(jumps, list) else 0
+        except Exception:
+            return 0
+
+    def _record_phase_jump(
+        self, session_id: str, phase: str, target: str, pass_round: int
+    ) -> None:
+        """Append a durable record of a model-directed phase switch.
+        Accounting only: a failure never blocks the jump itself."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "phase_gotos")
+            jumps = list((cp.payload or {}).get("jumps") or []) if cp else []
+            jumps.append({
+                "from": phase, "to": target, "pass": pass_round, "at": iso_now(),
+            })
+            self.checkpoints.save(session_id, "phase_gotos", {"jumps": jumps})
+        except Exception:
+            pass  # the jump is honored even if its record hiccups
+
+    @staticmethod
+    def _keep_completed_after_goto(completed_phases: set[str], target: str) -> set[str]:
+        """Completed phases that may STAY completed after a goto to `target`:
+        everything strictly before the target. The target itself and every
+        phase after it re-open, so later work always re-runs on top of the
+        jump instead of standing on work the model is about to redo.
+        """
+        idx = PHASE_ORDER.index(target)
+        return {p for p in completed_phases if PHASE_ORDER.index(p) < idx}
+
+    def _reopen_from_goto(
+        self,
+        session_id: str,
+        target: str,
+        completed_phases: set[str],
+        pass_round: int,
+    ) -> None:
+        """Apply a model-directed goto in memory AND durably, so a crash
+        right after the jump still resumes at the target phase."""
+        keep = self._keep_completed_after_goto(completed_phases, target)
+        completed_phases.clear()
+        completed_phases.update(keep)
+        try:
+            self.checkpoints.save(
+                session_id, "phase_goto",
+                {"to": target, "pass": pass_round, "at": iso_now()},
+            )
+        except Exception:
+            pass  # the in-memory jump already happened; record is additive
+
+    def _reapply_pending_goto(
+        self, session_id: str, pass_round: int, completed_phases: set[str]
+    ) -> bool:
+        """Re-apply a goto that was in flight when the session died (same
+        pass only) — the jump is never silently lost across a restart."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "phase_goto")
+        except Exception:
+            return False
+        if cp is None:
+            return False
+        payload = cp.payload or {}
+        target = str(payload.get("to") or "")
+        if int(payload.get("pass") or -1) != pass_round or target not in PHASE_ORDER:
+            return False
+        keep = self._keep_completed_after_goto(completed_phases, target)
+        if keep == completed_phases:
+            return False  # nothing completed at/after the target — no-op
+        completed_phases.clear()
+        completed_phases.update(keep)
+        return True
 
     def _load_phase_output(
         self, session_id: str, phase: str, current_pass: int
@@ -2366,21 +2724,29 @@ class ResearchRunner:
 
     def _post_p8_done(self, session_id: str) -> bool:
         """Whether Phase 8's deterministic post-phase work (integrity
-        pipeline + market-memory harvest + pivot gate) finished for the
-        current pass — durable, so an interrupt between the phase commit
-        and that work is caught up on resume instead of skipped."""
+        pipeline + market-memory harvest + pivot/refill gate) finished for
+        the CURRENT pass — durable, so an interrupt between the phase commit
+        and that work is caught up on resume instead of skipped. Pass-aware:
+        a marker from an earlier pass never masks this pass's work."""
         try:
             cp = self.checkpoints.get_safe(session_id, "post_p8")
-            return bool((cp.payload or {}).get("done")) if cp else False
+            if not cp:
+                return False
+            payload = cp.payload or {}
+            return bool(payload.get("done")) and int(
+                payload.get("pass") or -1
+            ) == self._pass_round(session_id)
         except Exception:
             return False
 
     def _post_adversarial(
         self, session_id: str, session: Any,
-        phase_outputs: dict[str, Any], pivot_round: int, session_started: float,
-    ) -> bool:
-        """Deterministic post-Phase-8 work. Returns True when a strategic
-        focus pivot should restart the pass (its own durable record)."""
+        phase_outputs: dict[str, Any], session_started: float,
+    ) -> str | None:
+        """Deterministic post-Phase-8 work. Returns \"pivot\" when a strategic
+        focus pivot should restart the pass, \"refill\" when the owner's niche
+        target is unmet and rediscovery must re-open the earlier phases, or
+        None on a normal pass (its own durable record)."""
         self.trace.record(
             session_id, KIND_VERIFICATION,
             "Running the deterministic integrity pipeline: filters and "
@@ -2396,17 +2762,21 @@ class ResearchRunner:
         # verified candidates and the session can still afford a full pass,
         # restart discovery on a new focus with the failure on record.
         if self._maybe_strategic_pivot(
-            session_id, session, pivot_round, session_started
+            session_id, session, self._pivot_rounds(session_id), session_started
         ):
-            return True
+            return "pivot"
+        # Target gate: verification left the owner's niche target unmet —
+        # re-open the earlier phases to rediscover more (bounded; see below).
+        if self._maybe_target_refill(session_id, session, session_started):
+            return "refill"
         try:
             self.checkpoints.save(
                 session_id, "post_p8",
-                {"done": True, "pass": self._pivot_rounds(session_id), "at": iso_now()},
+                {"done": True, "pass": self._pass_round(session_id), "at": iso_now()},
             )
         except Exception:
             pass  # marker is best-effort; the pipeline result itself is durable
-        return False
+        return None
 
     # ---------------------------------------------------- strategic pivot
     def _maybe_strategic_pivot(
@@ -2478,6 +2848,90 @@ class ResearchRunner:
             session_id, KIND_PIVOT,
             focus_pivot_text(record["round"], record["rejected"]),
             detail={"round": record["round"], "rejected": record["rejected"]},
+        )
+        return True
+
+    # ---------------------------------------------------------- target refill
+    def _maybe_target_refill(
+        self, session_id: str, session: Any, session_started: float
+    ) -> bool:
+        """Target gate: the owner asked for N verified niches and verification
+        left fewer. Re-open the earlier phases to rediscover MORE — a TARGET
+        REFILL, distinct from the zero-survivor focus pivot:
+
+        - the focus stays (no fresh-focus directive),
+        - ALL phase analyses are kept: the re-run continues from what the
+          session already knows instead of going back empty,
+        - verified candidates are never re-verified and rejected niches
+          stay rejected (see _run_integrity_pipeline + the refill directive),
+        - bounded by MAX_TARGET_REFILLS and the session's time budget, both
+          durable (event + trace + 'target_refills' checkpoint).
+
+        Returns True when a refill pass should run.
+        """
+        target = self._niche_target(session_id, session)
+        if target <= 0:
+            return False
+        verified = len(
+            self.candidates.list(
+                session_id, status="verified", limit=self.rc.max_candidates
+            )
+        )
+        if verified >= target:
+            return False
+        rounds = self._target_refill_rounds(session_id)
+        if rounds >= self.config.max_target_refills:
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="target_refill_budget_exhausted",
+                detail={"target": target, "verified": verified, "rounds": rounds},
+            )
+            return False
+        # A refill re-opens the earlier phases, so it needs real time left.
+        budget = self.config.session_hard_timeout_hours * 3600
+        elapsed = time.monotonic() - session_started
+        remaining = budget - elapsed
+        if remaining < budget * self.rc.min_remaining_session_fraction_for_pivot:
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="target_refill_skipped_no_time_budget",
+                detail={"round": rounds + 1, "target": target,
+                        "verified": verified, "remaining_seconds": round(remaining, 1)},
+            )
+            return False
+        dead = [
+            c for c in self.candidates.list(session_id, limit=500)
+            if c.status == "rejected"
+        ]
+        record: dict[str, Any] = {
+            "round": rounds + 1,
+            "at": iso_now(),
+            "target": target,
+            "verified": verified,
+            "rejected": len(dead),
+            "rejected_niches": [c.niche[:120] for c in dead[:12]],
+        }
+        try:
+            prior = self.checkpoints.get_safe(session_id, "target_refills")
+            refills = list((prior.payload or {}).get("refills") or []) if prior else []
+            refills.append(record)
+            self.checkpoints.save(session_id, "target_refills", {"refills": refills})
+        except Exception:
+            pass  # the refill proceeds even if its record hiccups
+        self.events.append(
+            session_id, level="warn", actor="agent", action="target_refill",
+            detail={"round": record["round"], "target": target,
+                    "verified": verified, "rejected": len(dead),
+                    "remaining_seconds": round(remaining, 1)},
+        )
+        self.trace.record(
+            session_id, KIND_PIVOT,
+            f"Target refill (round {record['round']}): {verified} of {target} "
+            "verified niches — re-opening the earlier phases to discover more; "
+            "everything already analyzed is kept, verified results stay "
+            "verified and rejected niches stay rejected",
+            detail={"round": record["round"], "target": target,
+                    "verified": verified},
         )
         return True
 

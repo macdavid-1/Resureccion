@@ -18,6 +18,7 @@ from typing import Any
 
 from app.methodology import (
     PHASES_ALLOWING_EXTERNAL as EXTERNAL_PHASES,
+    PHASE_ORDER,
     PHASE_TITLES,
     SPECS,
     PhaseTiming,
@@ -80,7 +81,17 @@ def build_system_prompt(phase: str) -> str:
         "action fails and YOU decide: skip that source (e.g. review mining) "
         "and continue, or try another marketplace/page. When reviews or "
         "other data are visible without signing in, capture them.\n"
-        "- Convert observations into concrete, actionable judgments.\n\n"
+        "- Convert observations into concrete, actionable judgments.\n"
+        "- PHASE SWITCHING: you may leave this phase at will and jump to any "
+        "other phase of the methodology — the usual reason is that "
+        "verification left the owner's niche target unmet and discovery must "
+        "run again. Reply with the optional key \"goto_phase\": \"<phase>\" "
+        f"(one of: {', '.join(PHASE_ORDER)}) and NO 'actions' in that reply. "
+        "Nothing is lost by switching: verified candidates stay verified and "
+        "are never re-verified, rejected niches stay rejected, and every "
+        "phase's analysis so far travels with you as PRIOR PHASE DECISIONS. "
+        "Do not use it to skip verification or to dodge a phase whose input "
+        "you still owe.\n\n"
         f"PHASE CONTRACT — allowed actions: {', '.join(spec.allowed_actions)}.\n"
         + (
             "External sources (forums / Google suggestions / Goodreads): "
@@ -125,6 +136,7 @@ def build_user_prompt(
     market_memory: list[dict[str, Any]] | None = None,
     headroom_priority: list[str] | None = None,
     adjacency_note: str = "",
+    target_note: str = "",
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -140,6 +152,11 @@ def build_user_prompt(
     if images_note:
         brief["reference_images"] = images_note
     parts.append("SESSION BRIEF: " + _compact({k: v for k, v in brief.items() if v}))
+
+    # --- niche target (deterministic; what the run owes the owner) ----------
+    # Empty when the owner stated no target — nothing is invented here.
+    if target_note:
+        parts.append("\nNICHE TARGET (deterministic): " + target_note)
 
     # --- deterministic census (measured discovery input) --------------------
     # Gather by the BACKEND before the model opines (app.census): the walk of

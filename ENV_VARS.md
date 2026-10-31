@@ -18,6 +18,8 @@ Set these in the deployment platform's environment settings (never commit real v
 | `SESSION_SOFT_TIMEOUT_HOURS` | no | `8` | Soft research time budget |
 | `SESSION_HARD_TIMEOUT_HOURS` | no | `12` | Hard kill switch for a run |
 | `MAX_FOCUS_PIVOTS` | no | `1` | Strategic focus pivots per autonomous run (0 disables): after a full pass where deep research + niche-down + adversarial verification leave zero verified candidates, discovery re-enters on a new focus |
+| `TARGET_NICHES` | no | `0` | Default number of verified niches the run must reach (0 = no target). A target stated in the brief or an owner message ("I need 10 niches", "niche target of 12") takes precedence. When verification leaves fewer verified niches than the target after Phase 8, the earlier phases re-open to rediscover more — bounded by `MAX_TARGET_REFILLS` and the session's time budget; verified candidates are never re-verified, rejected niches stay rejected |
+| `MAX_TARGET_REFILLS` | no | `2` | Rediscovery rounds per run when the target is unmet (0 disables the target gate) |
 | `HEARTBEAT_TIMEOUT_SECONDS` | no | `180` | Consider agent dead after this |
 | `CHECKPOINT_INTERVAL_SECONDS` | no | `120` | Periodic checkpoint cadence |
 | `PORT` | no | `7860` | HTTP port |
@@ -136,7 +138,7 @@ engine.
 | `MEMORY_FRESH_DAYS` | no | `7` | Reuse measurements younger than this as fact; older ones are carried as stale hints the model must cheaply re-verify |
 | `MEMORY_MAX_DIGEST` | no | `40` | Memory rows handed to a single run |
 | `DIVE_ENABLED` | no | `true` | Finalist deep dive: once the report's candidates are chosen, measure their backend keywords and map both store category trees before the report is written |
-| `DIVE_MAX_CANDIDATES` | no | `8` | Report candidates that get the deep dive |
+| `DIVE_MAX_CANDIDATES` | no | `12` | Report candidates that get the deep dive — default covers synthesis' maximum so every niche the report shows carries its measured keywords and category maps |
 | `DIVE_MAX_KEYWORDS` | no | `20` | Backend keywords measured per candidate (mined from Amazon suggestions, each measured with a real Books-department search) |
 | `DIVE_MAX_CATEGORIES` | no | `10` | Categories mapped **per store** — the Kindle Store and the Books store are counted separately |
 | `DIVE_PRODUCTS_PER_STORE` | no | `6` | Top competitor product pages opened per store to read their real category breadcrumbs |

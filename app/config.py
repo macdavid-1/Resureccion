@@ -87,6 +87,16 @@ class Config:
         # session may spend another pass re-entering discovery on a fresh
         # focus. 0 disables the behavior entirely.
         self.max_focus_pivots = max(0, min(3, _int_env("MAX_FOCUS_PIVOTS", 1)))
+        # Niche TARGET: the number of verified niches the owner asked for.
+        # The brief itself wins when it states a target ("I need 10 niches",
+        # "niche target of 12", or an owner message saying the same); this
+        # env var is the default for briefs that don't state one. 0 = no
+        # target (the old behavior: whatever survives verification stands).
+        # When verified candidates fall short of the target after Phase 8,
+        # the runner re-opens the earlier phases to rediscover more niches —
+        # bounded by MAX_TARGET_REFILLS and the session's time budget.
+        self.target_niches = max(0, _int_env("TARGET_NICHES", 0))
+        self.max_target_refills = max(0, _int_env("MAX_TARGET_REFILLS", 2))
         self.heartbeat_timeout_seconds = _int_env("HEARTBEAT_TIMEOUT_SECONDS", 180)
         self.checkpoint_interval_seconds = _int_env("CHECKPOINT_INTERVAL_SECONDS", 120)
         # Per-mode budget profiles (deterministic; see app.methodology
@@ -164,7 +174,9 @@ class Config:
         # for the Kindle Store and the Books store (different category
         # systems). Every figure lands in browser_evidence as evidence.
         self.dive_enabled = _flag("DIVE_ENABLED", True)
-        self.dive_max_candidates = max(1, _int_env("DIVE_MAX_CANDIDATES", 8))
+        # Default covers synthesis' max_opportunities (12): every niche the
+        # report SHOWS must carry its measured keywords and category maps.
+        self.dive_max_candidates = max(1, _int_env("DIVE_MAX_CANDIDATES", 12))
         self.dive_max_keywords = max(0, _int_env("DIVE_MAX_KEYWORDS", 20))
         self.dive_max_categories = max(0, _int_env("DIVE_MAX_CATEGORIES", 10))
         self.dive_products_per_store = max(1, _int_env("DIVE_PRODUCTS_PER_STORE", 6))

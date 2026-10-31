@@ -248,7 +248,9 @@ def build_report_model(
             "keywords": _keyword_clusters(o.keywords, o.niche),
             "keyword_plan": _keyword_plan(o.keywords, ev_rows),
             "category_plan": _category_plan(ev_ids, ev_rows),
-            "backend_research": dive_by_niche.get(_norm_kw(o.niche)) or {},
+            "backend_research": _backend_research_for(
+                dive_by_niche, o.niche, cand
+            ),
             "demand_accommodation": demand_acc_by_cand.get(o.candidate_id) or {},
             "whitespace": ws.get(o.candidate_id) or {},
             "evidence_ids": _only_known(ev_ids, known_ids)[:24],
@@ -602,6 +604,27 @@ def _titles_for(meta: dict[str, Any]) -> list[dict[str, Any]]:
 def _norm_kw(s: str) -> str:
     """Normalized keyword/query text for matching (case/punct/space-insensitive)."""
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())).strip()
+
+
+def _backend_research_for(
+    dive_by_niche: dict[str, dict[str, Any]], niche: str, cand: Any
+) -> dict[str, Any]:
+    """The deep-dive results (measured backend keywords + both store
+    category maps) for a dossier's niche.
+
+    The dive measures per CANDIDATE (its niche), while a dossier carries the
+    OPPORTUNITY's niche — the two labels often differ ("grief journals for
+    adult children" vs "sudden-loss grief journals"). Matching only the
+    dossier label silently dropped the 20 keywords and 10 categories the
+    dive had actually measured, so the report rendered no keyword/category
+    section at all. Fall back to the candidate's own niche before giving up.
+    """
+    hit = dive_by_niche.get(_norm_kw(niche))
+    if not hit and cand is not None:
+        cand_niche = _norm_kw(str(getattr(cand, "niche", "") or ""))
+        if cand_niche:
+            hit = dive_by_niche.get(cand_niche)
+    return hit or {}
 
 
 def _ev_field(e: Any, name: str, default: Any = None) -> Any:
@@ -1857,6 +1880,15 @@ def _render_opportunity(
     # maps (Kindle Store and Books keep separate category systems).
     br = o.get("backend_research") or {}
     bkw = [k for k in (br.get("keywords") or []) if isinstance(k, dict)]
+    if not bkw and not (br.get("books") or []) and not (br.get("kindle_store") or []):
+        # Honest absence: the deliverable the owner expects (measured
+        # keywords + store categories) is either here or explicitly missing
+        # — never silently skipped.
+        a("**Backend keywords and store categories for this niche:** not "
+          "captured in this run — the finalist deep dive did not reach this "
+          "niche, so no measured keyword or category table can be shown "
+          "(figures are never invented).")
+        a("")
     if bkw:
         dept = str(br.get("department") or "books")
         dept_label = "Kindle Store" if dept == "kindle" else "Books store"
