@@ -11,8 +11,11 @@ import json
 
 import pytest
 
-from tests.test_research_runner import PHASE_OUTPUTS, make_runner
-from tests.test_research_runner import session  # noqa: F401 — pytest fixture reuse
+from tests.test_research_runner import (
+    PHASE_OUTPUTS,
+    make_runner,
+    session,  # noqa: F401 — pytest fixture reuse
+)
 
 
 async def _run_session(db, config, session_id: str):
@@ -101,7 +104,7 @@ class TestReportModelFromRealRun:
     @pytest.mark.asyncio
     async def test_full_run_produces_structured_model(self, db, config, session):
         await _run_session(db, config, session)
-        rep, body, model = _final_report(db, config, session)
+        _rep, _body, model = _final_report(db, config, session)
 
         assert model is not None, "structured model not persisted"
         assert model["schema_version"] == 2
@@ -117,7 +120,7 @@ class TestReportModelFromRealRun:
     @pytest.mark.asyncio
     async def test_executive_summary_reflects_real_counts(self, db, config, session):
         await _run_session(db, config, session)
-        _, body, model = _final_report(db, config, session)
+        _, _body, model = _final_report(db, config, session)
 
         ex = model["executive_summary"]
         # The scripted run creates 3 candidates, rejects 2, verifies 1.
@@ -130,7 +133,7 @@ class TestReportModelFromRealRun:
     @pytest.mark.asyncio
     async def test_opportunity_dossier_is_complete(self, db, config, session):
         await _run_session(db, config, session)
-        _, body, model = _final_report(db, config, session)
+        _, _body, model = _final_report(db, config, session)
 
         opps = model["opportunities"]
         assert len(opps) == 1
@@ -186,7 +189,7 @@ class TestReportModelFromRealRun:
     @pytest.mark.asyncio
     async def test_consumer_intelligence_and_quality_statement(self, db, config, session):
         await _run_session(db, config, session)
-        _, body, model = _final_report(db, config, session)
+        _, _body, model = _final_report(db, config, session)
 
         ci = model["consumer_intelligence"]
         themes = ci["themes"]
@@ -216,7 +219,7 @@ class TestReportModelFromRealRun:
             data={"title": "A", "asin": "TEST00001", "price": "$9.99"},
         )
         await _run_session(db, config, session)
-        _, body, model = _final_report(db, config, session)
+        _, _body, model = _final_report(db, config, session)
 
         comp = [c for c in model["competitors"] if c["title"] == "A"]
         assert comp, "P3 competitor not joined with browser evidence"
@@ -280,7 +283,7 @@ class TestReportPersistenceAndRerender:
     @pytest.mark.asyncio
     async def test_model_json_is_round_trippable(self, db, config, session):
         await _run_session(db, config, session)
-        rep, body, model = _final_report(db, config, session)
+        _rep, _body, model = _final_report(db, config, session)
 
         from app.report_model import ReportModel, render_markdown
 

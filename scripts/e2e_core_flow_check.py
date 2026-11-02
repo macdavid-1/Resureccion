@@ -184,6 +184,7 @@ def main() -> int:
         [PY, __file__, "--child"],
         capture_output=True,
         text=True,
+        check=False,
         timeout=420,
         env=env,
     )

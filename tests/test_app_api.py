@@ -1,8 +1,6 @@
 """End-to-end API tests using FastAPI TestClient."""
 from __future__ import annotations
 
-import pytest
-
 
 def _login(client) -> dict:
     res = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})

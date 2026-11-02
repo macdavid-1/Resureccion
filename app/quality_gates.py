@@ -28,11 +28,10 @@ from typing import Any
 
 from app.claims import (
     CLAIM_UNSUPPORTED,
-    ClaimStore,
     EQ_INFERENCE,
+    ClaimStore,
     claim_is_estimate_backed,
     estimate_evidence_ids,
-    is_estimate_kind,
 )
 from app.integrity import KIND_QUALITY_GATE, IntegrityAssessmentStore
 from app.research_data import (

@@ -21,6 +21,7 @@ from app.config import Config
 from app.db import Database, atomic_write_bytes, atomic_write_text
 from app.events import EventLog
 from app.recovery import CheckpointStore
+from app.redact import redact
 from app.reports import ReportStore
 from app.research_data import (
     CandidateStore,
@@ -28,7 +29,6 @@ from app.research_data import (
     ObservationStore,
     OpportunityStore,
 )
-from app.redact import redact
 from app.timeutil import iso_now
 
 EXPORT_FORMATS = ("tar_gz", "json")
@@ -234,6 +234,9 @@ class ExportManager:
         atomic_write_bytes(out_path, buf.getvalue())
 
     def _row(self, row: sqlite3.Row) -> ExportJob:
+        # sqlite3.Row has no .get() and `key in row` scans VALUES, not
+        # column names — dict(row) is the only correct mapping view here.
+        d = dict(row)
         return ExportJob(
             id=row["id"],
             session_id=row["session_id"],
@@ -243,7 +246,7 @@ class ExportManager:
             format=row["format"],
             error=row["error"],
             result_path=row["result_path"],
-            attempts=row["attempts"] if "attempts" in row.keys() else 0,
-            started_at=row["started_at"] if "started_at" in row.keys() else None,
-            finished_at=row["finished_at"] if "finished_at" in row.keys() else None,
+            attempts=d.get("attempts", 0),
+            started_at=d.get("started_at"),
+            finished_at=d.get("finished_at"),
         )

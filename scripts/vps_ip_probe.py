@@ -65,7 +65,7 @@ async def probe_via_proxy(spec: str, host: str, port: int) -> tuple[bool, str]:
     from app.relay import _dial_via_proxy
 
     try:
-        r, w = await asyncio.wait_for(_dial_via_proxy(spec, host, port), timeout=12)
+        _r, w = await asyncio.wait_for(_dial_via_proxy(spec, host, port), timeout=12)
         w.close()
         return True, "ok"
     except Exception as exc:

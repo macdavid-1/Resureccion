@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.browser import BrowserRegistry, BrowserRegistryError
-from app.sessions import SessionStore
+from app.sessions import SessionError, SessionStore
 
 
 @pytest.fixture()
@@ -62,5 +62,5 @@ def test_launch_config(registry, sessions) -> None:
 
 
 def test_requires_existing_session(registry, sessions) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         registry.ensure("nope")

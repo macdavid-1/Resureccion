@@ -4,7 +4,13 @@ from __future__ import annotations
 import pytest
 
 from app.research_data import CandidateStore, OpportunityStore
-from app.sessions import MODE_AUTO, MODE_KEYWORDS, MODE_PROMPT, SessionStore
+from app.sessions import (
+    MODE_AUTO,
+    MODE_KEYWORDS,
+    MODE_PROMPT,
+    SessionError,
+    SessionStore,
+)
 
 
 @pytest.fixture()
@@ -27,26 +33,26 @@ def test_create_keywords_mode(store) -> None:
 
 
 def test_create_auto_mode_rejects_prompt(store) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.create(mode=MODE_AUTO, prompt="should not be allowed")
     s = store.create(mode=MODE_AUTO)
     assert s.mode == MODE_AUTO
 
 
 def test_prompt_mode_requires_text(store) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.create(mode=MODE_PROMPT, prompt="")
 
 
 def test_keywords_mode_requires_text_or_images(store) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.create(mode=MODE_KEYWORDS, prompt="")
     s = store.create(mode=MODE_KEYWORDS, prompt="", has_images=True)
     assert s.mode == MODE_KEYWORDS
 
 
 def test_invalid_mode(store) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.create(mode="bogus")
 
 
@@ -59,7 +65,7 @@ def test_session_cap(store, config) -> None:
     config.max_sessions = 2
     store.create(mode=MODE_AUTO)
     store.create(mode=MODE_AUTO)
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.create(mode=MODE_AUTO)
     # Terminal sessions free capacity.
     s = store.list()[0]
@@ -71,14 +77,14 @@ def test_status_transition_validation(store) -> None:
     s = store.create(mode=MODE_AUTO)
     updated = store.update(s.id, status="queued")
     assert updated.status == "queued"
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.update(s.id, status="completed-invalid")
 
 
 def test_cannot_run_terminal_session(store) -> None:
     s = store.create(mode=MODE_AUTO)
     store.update(s.id, status="cancelled")
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         store.update(s.id, status="running")
 
 

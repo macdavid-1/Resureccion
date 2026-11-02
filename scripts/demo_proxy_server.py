@@ -48,9 +48,9 @@ class Server(threading.Thread):
                     conn.close()
                     return
                 buf += c
-            head, _, body = buf.partition(b"\r\n\r\n")
+            head, _, _body = buf.partition(b"\r\n\r\n")
             lines = head.decode("latin-1").split("\r\n")
-            method, target, _v = lines[0].split(" ", 2)
+            _method, target, _v = lines[0].split(" ", 2)
             auth = ""
             for ln in lines[1:]:
                 if ln.lower().startswith("proxy-authorization:"):

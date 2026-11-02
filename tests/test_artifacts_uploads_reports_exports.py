@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.artifacts import ArtifactError, ArtifactStore
-from app.exports import ExportManager
+from app.exports import ExportError, ExportManager
 from app.reports import ReportError, ReportStore
 from app.research_data import CandidateStore, OpportunityStore
 from app.uploads import UploadError, UploadStore
@@ -94,7 +94,7 @@ def test_export_bundle_json_and_tar(db, config, sid) -> None:
     with tarfile.open(job2.result_path) as tar:
         assert "export.json" in tar.getnames()
 
-    with pytest.raises(Exception):
+    with pytest.raises(ExportError):
         mgr.create(sid, format="zip")
 
 

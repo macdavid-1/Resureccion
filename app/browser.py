@@ -98,7 +98,7 @@ class BrowserRegistry:
         return self.get(session_id)  # type: ignore[return-value]
 
     def record_crash(self, session_id: str, reason: str) -> BrowserSession:
-        b = self.require(session_id)
+        self.require(session_id)
         with self.db.tx() as conn:
             conn.execute(
                 "UPDATE browser_sessions SET status = 'crashed', crash_count = crash_count + 1, updated_at = ? WHERE session_id = ?",

@@ -27,8 +27,9 @@ Design properties (why it is shaped this way):
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from app.marketplace import Marketplace
 from app.redact import redact, scrub_url
@@ -39,15 +40,15 @@ ALIAS = "stripbooks"
 # Same-origin suggestion call, executed inside the already-open marketplace
 # page (Firefox blocks cross-origin fetch; this is same-domain, like the
 # existing `autocomplete` action).
-_SUGGEST_JS = """async (q) => {
-  try {
-    const res = await fetch('/suggestion?alias=%s&prefix=' + encodeURIComponent(q),
-                            {headers: {'accept': 'application/json'}});
+_SUGGEST_JS = f"""async (q) => {{
+  try {{
+    const res = await fetch('/suggestion?alias={ALIAS}&prefix=' + encodeURIComponent(q),
+                            {{headers: {{'accept': 'application/json'}}}});
     if (!res.ok) return [];
     const data = await res.json();
     return (Array.isArray(data) && Array.isArray(data[1])) ? data[1].slice(0, 10) : [];
-  } catch (e) { return []; }
-}""" % ALIAS
+  }} catch (e) {{ return []; }}
+}}"""
 
 # Fallback seeds for a run with NO topic (mode 'auto'): book-format roots.
 # They are deliberately generic — the point is to harvest the long tail that
@@ -58,9 +59,7 @@ FALLBACK_SEEDS: tuple[str, ...] = (
 )
 
 _STOPWORDS = frozenset(
-    """a an and are as at be by for from has have how i in is it its of on or
-    our that the their to was we what when which who will with you your about
-    into over under best new free book books kindle amazon""".split()
+    ["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "how", "i", "in", "is", "it", "its", "of", "on", "or", "our", "that", "the", "their", "to", "was", "we", "what", "when", "which", "who", "will", "with", "you", "your", "about", "into", "over", "under", "best", "new", "free", "book", "books", "kindle", "amazon"]
 )
 
 # Phrases that are noise rather than demand language.

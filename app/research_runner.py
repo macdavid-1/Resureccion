@@ -32,7 +32,7 @@ from app.artifacts import ArtifactStore
 from app.browser_manager import BrowserManager, BrowserManagerError
 from app.browser_store import BrowserAuthStore, BrowserEvidenceStore, LoginWindowStore
 from app.census import CategoryCensus
-from app.claims import ClaimStore, EQ_INFERENCE, estimate_evidence_ids
+from app.claims import ClaimStore, estimate_evidence_ids
 from app.config import Config
 from app.db import Database
 from app.events import EventLog
@@ -42,9 +42,8 @@ from app.final_dive import FinalCandidateDive
 from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
-from app.marketplace import Marketplace, resolve_plan, select_auto
 from app.market_memory import MarketMemoryStore, harvest_session
-from app.owner_messages import OwnerMessageStore
+from app.marketplace import Marketplace, resolve_plan, select_auto
 from app.methodology import (
     EXTERNAL_ACTIONS,
     P1_DISCOVERY,
@@ -52,6 +51,7 @@ from app.methodology import (
     P4_CONSUMER,
     P5_DEMAND,
     P6_GAP,
+    P8_ADVERSARIAL,
     PHASE_ORDER,
     PHASE_TITLES,
     SESSION_PHASE_BY_METHOD_PHASE,
@@ -62,7 +62,6 @@ from app.methodology import (
     mode_profile,
     validate_opportunity,
 )
-from app.methodology import P8_ADVERSARIAL
 from app.model_client import (
     ModelClient,
     ModelConfigError,
@@ -72,10 +71,11 @@ from app.model_client import (
     ModelUsage,
     _extract_json,
 )
+from app.owner_messages import OwnerMessageStore
 from app.prompts import build_system_prompt, build_user_prompt
+from app.quality_gates import QualityGateRunner
 from app.recovery import CheckpointStore, ErrorStateStore
 from app.redact import redact
-from app.quality_gates import QualityGateRunner
 from app.reports import ReportStore
 from app.research_data import (
     CAND_VERIFIED,
@@ -88,7 +88,7 @@ from app.research_data import (
 from app.sessions import SessionStore
 from app.thresholds import get_thresholds
 from app.timeutil import iso_now
-from app.timing import TaskType, TimingTracker, model_timing_digest
+from app.timing import TaskType, TimingTracker
 from app.trace import (
     KIND_BROWSER,
     KIND_CANDIDATE,
@@ -113,7 +113,6 @@ from app.trace import (
 )
 from app.verification import VerificationEngine, evidence_for_candidate
 from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
-
 
 # Extra corrective retries per model iteration when the reply violates the
 # phase's output contract (missing required top-level fields). The retry
@@ -216,10 +215,10 @@ _MERGED_LIST_CAP = 500
 # ("I need 10 niches", "niche target of 12", "target: 8 niches"). Deliberately
 # narrow: "target" alone never counts — "target 20 keywords" must not become
 # a niche target. The number must sit next to a niche word.
-_TARGET_RES: tuple["re.Pattern[str]", ...] = (
-    re.compile(r"\b(\d{1,3})\s+(?:top\s+|verified\s+|final\s+|strong\s+)?(?:niches|opportunities)\b", re.I),
-    re.compile(r"\bniche\s+target\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\b", re.I),
-    re.compile(r"\btarget\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\s+(?:verified\s+)?niches\b", re.I),
+_TARGET_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(\d{1,3})\s+(?:top\s+|verified\s+|final\s+|strong\s+)?(?:niches|opportunities)\b", re.IGNORECASE),
+    re.compile(r"\bniche\s+target\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\btarget\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\s+(?:verified\s+)?niches\b", re.IGNORECASE),
 )
 
 
@@ -1263,7 +1262,6 @@ class ResearchRunner:
             )
             # … versus the depth-raised floor, which only applies while the
             # session is still under RESEARCH_MIN_HOURS.
-            depth_pending = required_evidence > spec.min_evidence
             depth_satisfied = (
                 required_evidence == 0 or phase_new_evidence >= required_evidence
             )
@@ -1300,6 +1298,15 @@ class ResearchRunner:
                 committed = _merge_phase_output(
                     prior_outputs.get(phase), _phase_content(reply.content)
                 )
+                # The durable 'phase_output' marker means the phase is
+                # finished FOR GOOD — a resume skips it — so the rows this
+                # phase must produce (candidates, verdicts, opportunities)
+                # are applied BEFORE the marker. Applied after it, any error
+                # or restart in that window lost them forever: the resumed
+                # run skipped the phase, never re-applied the effects, and
+                # the quality gates then failed a perfectly healthy research
+                # session for data its own phases had produced.
+                self._apply_phase_effects(session_id, phase, committed)
                 self.checkpoints.save(
                     session_id, f"phase_output:{phase}",
                     {"output": committed, "model": reply.model,
@@ -1319,7 +1326,6 @@ class ResearchRunner:
                             "primary_items": items,
                             "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
                 )
-                self._apply_phase_effects(session_id, phase, committed)
                 return committed
 
             if stall >= STALL_LIMIT:
@@ -1364,6 +1370,9 @@ class ResearchRunner:
         committed = _merge_phase_output(
             prior_outputs.get(phase), _phase_content(best_output)
         )
+        # Effects before the durable marker — same rule as the clean commit:
+        # a resume must never skip a phase whose rows were not yet written.
+        self._apply_phase_effects(session_id, phase, committed)
         self.checkpoints.save(
             session_id, f"phase_output:{phase}",
             {"output": committed, "iterations": iteration,
@@ -1379,7 +1388,6 @@ class ResearchRunner:
                     "primary_items": _primary_items(best_output, spec.output_contract[0]),
                     "elapsed_seconds": round(time.monotonic() - phase_start, 1)},
         )
-        self._apply_phase_effects(session_id, phase, committed)
         return committed
 
     def _salvage_contract_reply(
@@ -1418,6 +1426,22 @@ class ResearchRunner:
         )
 
     # ------------------------------------------------------------ phase effects
+    def _default_marketplace(self, session_id: str) -> str:
+        """The session's primary marketplace, for niches the model listed
+        without naming their market (plain-string niches are common under
+        pressure). A candidate with NO marketplace made the report's
+        attribution check fail every opportunity — "candidate has no
+        recorded marketplace" — on perfectly healthy runs, so the session's
+        own market plan fills the gap instead of leaving it blank."""
+        try:
+            cp = self.checkpoints.get_safe(session_id, "marketplace_plan")
+            codes = (cp.payload or {}).get("marketplaces") if cp else None
+            if isinstance(codes, list) and codes:
+                return str(codes[0])[:20]
+        except Exception:
+            pass
+        return ""
+
     def _apply_phase_effects(self, session_id: str, phase: str, output: dict[str, Any]) -> None:
         """Persist the durable effects of a phase's analysis."""
         # Niching produces/updates candidate rows.
@@ -1468,7 +1492,10 @@ class ResearchRunner:
                     c = self.candidates.create(
                         session_id,
                         niche=str(n["niche"])[:200],
-                        marketplace=str(n.get("marketplace") or "")[:20],
+                        marketplace=(
+                            str(n.get("marketplace") or "").strip()
+                            or self._default_marketplace(session_id)
+                        )[:20],
                         rationale=str(n.get("demand_hints") or "")[:500],
                         meta={
                             "chain": n.get("chain") or [],
@@ -1730,7 +1757,7 @@ class ResearchRunner:
         profile = mode_profile(mode)
         hard = max(1, int(getattr(self.config, "session_hard_timeout_hours", 12)))
         per_hour = max(1, int(getattr(self.config, "model_calls_per_hour", 30) or 30))
-        extra = int(round(profile.extra_calls * min(1.0, hard / 12.0)))
+        extra = round(profile.extra_calls * min(1.0, hard / 12.0))
         return max(base, hard * per_hour) + extra
 
     def _evidence_floor(self, min_evidence: int, session_started: float) -> int:
@@ -2158,7 +2185,7 @@ class ResearchRunner:
                     self.candidates.create(
                         session_id,
                         niche=nb.term[:200],
-                        marketplace=nb.marketplace or "",
+                        marketplace=nb.marketplace or self._default_marketplace(session_id),
                         rationale=(
                             f"adjacent to '{nb.parent_niche[:70]}' ({nb.source}) — "
                             f"{score.note()}"
@@ -2302,6 +2329,7 @@ class ResearchRunner:
         """
         if not isinstance(output, dict):
             return
+        default_mkt = self._default_marketplace(session_id)
         known = {
             str(c.niche).strip().lower()
             for c in self.candidates.list(session_id, limit=500)
@@ -2343,7 +2371,9 @@ class ResearchRunner:
                 ][:12]
                 fresh.append({
                     "niche": niche[:200],
-                    "marketplace": str(row.get("marketplace") or "")[:20],
+                    "marketplace": (
+                        str(row.get("marketplace") or "").strip() or default_mkt
+                    )[:20],
                     "rationale": str(row.get(text_key) or row.get("niche") or "")[:500],
                     "evidence_ids": self._valid_evidence_ids(session_id, evidence_ids),
                     "field": field,
@@ -3007,7 +3037,21 @@ class ResearchRunner:
             existing.add(statement.lower())
 
         def _mentions(text: str) -> bool:
-            return niche[:24] in (text or "").lower()
+            # Analysis phases routinely phrase a niche SHORTER or slightly
+            # differently than niching did ("facts encyclopedias" vs
+            # "children's illustrated facts encyclopedias for ages 8-12").
+            # The old prefix test (first 24 chars of the candidate niche
+            # inside the analysis label) missed those, the analyses
+            # registered NO claims, and the claim/evidence quality gates
+            # failed a perfectly healthy run. Same containment rule the
+            # ledger backfill already uses for exactly this mismatch.
+            a = niche
+            b = (text or "").strip().lower()
+            if not a or not b:
+                return False
+            if len(a) < 8 or len(b) < 8:
+                return a == b
+            return a in b or b in a
 
         # Seed evidence (adjacency promotions, and any candidate created with
         # its own evidence ids): register ONE chain-of-custody claim pointing
@@ -3700,7 +3744,6 @@ class ResearchRunner:
             self._harvest_memory(session_id)
 
     async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
-        from app.quality_gates import QualityGateRunner
         from app.report_model import build_report_model, render_markdown
         from app.report_validation import ReportValidator
         from app.research_data import VerificationStore

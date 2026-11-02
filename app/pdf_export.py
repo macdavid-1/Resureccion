@@ -22,7 +22,6 @@ import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -31,7 +30,7 @@ from typing import Any
 
 from app.artifacts import ArtifactStore
 from app.config import Config
-from app.db import Database, atomic_write_text
+from app.db import Database
 from app.timeutil import iso_now
 
 _SIDECAR = Path(__file__).resolve().parent.parent / "scripts" / "render_pdf.js"
@@ -93,6 +92,7 @@ def _jitless_supported() -> bool:
                 ["node", "--jitless", "-e", "process.exit(0)"],
                 capture_output=True,
                 timeout=20,
+                check=False,
             )
             _jitless_ok = proc.returncode == 0
         except Exception:
@@ -128,6 +128,7 @@ def _node_self_check() -> str:
             ["node", "-e", "process.stdout.write('ok')"],
             capture_output=True,
             timeout=20,
+            check=False,
         )
         out = proc.stdout.decode("utf-8", "replace").strip()
         return f"node self-check: rc={proc.returncode} out={out[:40]!r}"
@@ -223,8 +224,7 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
     name = str(s.get("name") or "Market Intelligence Report")
     title = "Market Intelligence Report"
     subtitle = name
-    mkt = ", ".join(str(m) for m in (s.get("marketplaces_requested") or [])) or "auto-selected"
-    footer = f"Resurrección  ·  {name}  ·  {mkt}"
+    ", ".join(str(m) for m in (s.get("marketplaces_requested") or [])) or "auto-selected"
 
     blocks: list[dict[str, Any]] = []
 
@@ -287,7 +287,7 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
     for i, o in enumerate(opps, 1):
         h3(f"{i}. {o.get('name', 'Opportunity')}")
         vr = o.get("verification", {}) or {}
-        conf = int(round(float(o.get("confidence", 0)) * 100))
+        conf = round(float(o.get("confidence", 0)) * 100)
         rows = [
             ["Precise niche", o.get("niche", "—")],
             ["Parent market", o.get("parent_market", "—")],
@@ -683,8 +683,8 @@ def render_report_html(model: dict[str, Any], blocks: list[dict[str, Any]]) -> s
         '<div class="bar"></div>',
         f"<h1>{esc(title)}</h1>",
         f'<div class="sub">{esc(subtitle)}</div>',
-        f'<div class="meta" style="margin-top:0.35in">{esc(s.get("name", ""))} · '
-        f"{esc(', '.join(str(m) for m in (s.get('marketplaces_requested') or [])) or 'auto-selected')}</div>",
+        (f'<div class="meta" style="margin-top:0.35in">{esc(s.get("name", ""))} · '
+        f"{esc(', '.join(str(m) for m in (s.get('marketplaces_requested') or [])) or 'auto-selected')}</div>"),
         "</section>",
         '<section class="sheet">',
     ]
@@ -755,10 +755,12 @@ def _render_to_tmp(job: dict[str, Any]) -> Path:
                 # Combined multi-report PDFs are larger than single ones.
                 "timeout": 300,
             }
-            proc = subprocess.run(_renderer_cmd(), **run_kwargs)
+            # check=False explicit: the caller inspects returncode and
+            # reports the failure itself — a CalledProcessError would hide it.
+            proc = subprocess.run(_renderer_cmd(), check=False, **run_kwargs)
             if proc.returncode < 0:
                 time.sleep(1.5)
-                proc = subprocess.run(_renderer_cmd(), **run_kwargs)
+                proc = subprocess.run(_renderer_cmd(), check=False, **run_kwargs)
         if proc.returncode < 0:
             name = _signal_name(proc.returncode)
             detail = (

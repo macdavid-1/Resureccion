@@ -31,10 +31,10 @@ async def main() -> int:
     dead = _dead_port()
     os.environ["BROWSER_PROXY"] = f"127.0.0.1:{dead}"
 
+    from app.browser_manager import PLAYWRIGHT_AVAILABLE, BrowserManager
+    from app.browser_store import BrowserEvidenceStore, ExtensionStore
     from app.config import get_config
     from app.db import init_db
-    from app.browser_manager import BrowserManager, PLAYWRIGHT_AVAILABLE
-    from app.browser_store import BrowserEvidenceStore, ExtensionStore
     from app.kdspy import KDSpyManager
     from app.marketplace import get_marketplace
 

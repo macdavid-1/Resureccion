@@ -17,10 +17,10 @@ async def main() -> int:
     from app import config as config_mod
 
     config_mod.get_config.cache_clear()
+    from app.browser_manager import PLAYWRIGHT_AVAILABLE, BrowserManager
+    from app.browser_store import BrowserEvidenceStore, ExtensionStore
     from app.config import get_config
     from app.db import init_db
-    from app.browser_manager import BrowserManager, PLAYWRIGHT_AVAILABLE
-    from app.browser_store import BrowserEvidenceStore, ExtensionStore
     from app.kdspy import KDSpyManager
     from app.marketplace import get_marketplace
 

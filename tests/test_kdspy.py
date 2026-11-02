@@ -14,8 +14,7 @@ from app.browser_store import (
     EXT_VALIDATED,
     ExtensionStore,
 )
-from app.kdspy import ExtensionInstallError, KDSpyError, KDSpyManager, _version_tuple
-
+from app.kdspy import ExtensionInstallError, KDSpyManager, _version_tuple
 
 MV3_MANIFEST = {
     "name": "KDSpy Pro",

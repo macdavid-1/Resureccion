@@ -3,7 +3,6 @@ the app's real click pipeline and assert the tap routes and registers."""
 import asyncio
 import json
 import os
-import re
 import sys
 import traceback
 import urllib.request
@@ -38,7 +37,7 @@ def _call(path, data=None, method=None, headers=None):
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         return {"__http__": e.code, "body": body[:400]}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {"__error__": str(e)}
 
 

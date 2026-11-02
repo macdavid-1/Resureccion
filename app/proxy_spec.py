@@ -173,7 +173,7 @@ async def probe_proxy(spec: str, timeout: float = 6.0) -> tuple[bool, str]:
             # Dial a real, stable, dialable host so the probe exercises the
             # proxy's full egress path (a proxy that cannot resolve/dial the
             # public internet is not usable either).
-            req = f"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
+            req = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
             if username is not None:
                 import base64
 
@@ -196,7 +196,7 @@ async def probe_proxy(spec: str, timeout: float = 6.0) -> tuple[bool, str]:
                 # against a second well-known host before declaring the
                 # credentials bad — a false "bad credentials" verdict would
                 # silently demote a working egress to direct.
-                req2 = f"CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\n"
+                req2 = "CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\n"
                 if username is not None:
                     import base64
 

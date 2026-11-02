@@ -5,12 +5,12 @@ from typing import Any
 
 import pytest
 
-from app.actions import ActionError, ActionResult, ActionExecutor, AuthPauseRequired
-from app.amazon_auth import AmazonAuthManager, AuthCheck
+from app.actions import ActionError, ActionExecutor, ActionResult, AuthPauseRequired
+from app.amazon_auth import AuthCheck
 from app.browser_store import BrowserEvidenceStore
 from app.config import Config
-from app.evidence_capture import EvidenceCollector
 from app.events import EventLog
+from app.evidence_capture import EvidenceCollector
 from app.marketplace import AMAZON_MARKETPLACES
 
 
@@ -124,7 +124,7 @@ async def test_search_marketplace_extracts_results_list(wired):
 
     import app.actions as actions_mod
 
-    orig = actions_mod._extract_search_items if hasattr(actions_mod, "_extract_search_items") else None
+    actions_mod._extract_search_items if hasattr(actions_mod, "_extract_search_items") else None
     # Monkeypatch the collector's internal extraction used by search capture.
     import app.evidence_capture as ec
 

@@ -168,6 +168,6 @@ class BackupManager:
                 await asyncio.to_thread(self.backup_once)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — a bad backup must not be fatal
+            except Exception as exc:
                 print(f"[backup] snapshot failed: {exc}", flush=True)
             await asyncio.sleep(interval - _INITIAL_DELAY_SECONDS)

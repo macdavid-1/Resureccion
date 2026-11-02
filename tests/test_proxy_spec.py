@@ -40,7 +40,7 @@ def test_scheme_prefix_accepted() -> None:
 
 
 def test_url_encoded_credentials_decoded() -> None:
-    server, user, pw = parse_proxy_spec("u%40mail.com:p%40ss@host.example:8080")
+    _server, user, pw = parse_proxy_spec("u%40mail.com:p%40ss@host.example:8080")
     assert user == "u@mail.com"
     assert pw == "p@ss"
 

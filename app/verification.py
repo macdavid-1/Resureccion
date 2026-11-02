@@ -26,13 +26,13 @@ from typing import Any
 from app.claims import (
     CLAIM_CONTRADICTED,
     CLAIM_UNSUPPORTED,
-    Claim,
-    ClaimStore,
     EQ_INFERENCE,
     VERDICT_INCONCLUSIVE,
     VERDICT_LIMITED,
     VERDICT_REJECTED,
     VERDICT_VERIFIED,
+    Claim,
+    ClaimStore,
     claim_is_estimate_backed,
 )
 from app.integrity import KIND_VERIFICATION, IntegrityAssessmentStore

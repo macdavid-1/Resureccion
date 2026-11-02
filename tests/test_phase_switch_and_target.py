@@ -22,7 +22,6 @@ from app.recovery import CheckpointStore
 from app.reports import ReportStore
 from app.research_data import CandidateStore, OpportunityStore, VerificationStore
 from app.sessions import SessionStore
-
 from tests.test_research_runner import (
     PHASE_OUTPUTS,
     RejectAllModel,

@@ -20,8 +20,9 @@ render is recorded as a miss and the walk continues.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from app.marketplace import Marketplace
@@ -132,7 +133,7 @@ def _review_median(items: list[dict[str, Any]]) -> int | None:
     mid = len(counts) // 2
     if len(counts) % 2:
         return counts[mid]
-    return int(round((counts[mid - 1] + counts[mid]) / 2))
+    return round((counts[mid - 1] + counts[mid]) / 2)
 
 
 class CategoryCensus:
@@ -368,9 +369,7 @@ def _link_path(href: str) -> str:
     # Only the chart/category families we walked are ever re-opened: a stray
     # navigation target from the page cannot redirect the census elsewhere.
     if not (
-        path.startswith("/gp/bestsellers/")
-        or path.startswith("/gp/new-releases/")
-        or path.startswith("/b/")
+        path.startswith(("/gp/bestsellers/", "/gp/new-releases/", "/b/"))
     ):
         return ""
     return f"{path}?{query}" if query else path

@@ -9,14 +9,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from datetime import timedelta
+from typing import Any
 
 from app.db import Database
 from app.redact import redact
-from app.timeutil import iso_now
-from app.timeutil import iso, utcnow
-from datetime import timedelta
+from app.timeutil import iso, iso_now, utcnow
 
 # Amazon account auth lifecycle (from the owner's perspective).
 AUTH_UNKNOWN = "unknown"

@@ -9,7 +9,6 @@ from app.security import hash_password
 
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
-    import os
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OWNER_USERNAME", "owner")

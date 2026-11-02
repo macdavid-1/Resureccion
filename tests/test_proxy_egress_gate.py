@@ -88,7 +88,7 @@ def _kdspy_fake() -> SimpleNamespace:
     """KDSpy stub: nothing configured, so launch skips its verifications."""
     return SimpleNamespace(
         firefox_addon_is_configured=lambda: False,
-        firefox_addon_args=lambda: [],
+        firefox_addon_args=list,
         firefox_addon_state=lambda: None,
         record_firefox_runtime_validated=lambda *_: None,
     )
@@ -111,7 +111,7 @@ def _kdspy_fake() -> SimpleNamespace:
     """KDSpy stub: nothing configured, so launch skips its verifications."""
     return SimpleNamespace(
         firefox_addon_is_configured=lambda: False,
-        firefox_addon_args=lambda: [],
+        firefox_addon_args=list,
         firefox_addon_state=lambda: None,
         record_firefox_runtime_validated=lambda *_: None,
     )
@@ -175,7 +175,7 @@ def test_probe_proxy_rejects_non_proxy_listener() -> None:
     s.listen(1)
     host, port = s.getsockname()[:2]
     try:
-        ok, detail = asyncio.run(probe_proxy(f"{host}:{port}", timeout=3.0))
+        ok, _detail = asyncio.run(probe_proxy(f"{host}:{port}", timeout=3.0))
     finally:
         s.close()
     assert ok is False
@@ -361,7 +361,7 @@ async def test_midflight_proxy_death_recovers_and_retries(monkeypatch) -> None:
         calls["goto"] += 1
         if calls["goto"] == 1:
             raise _proxy_nav_exc()
-        return None  # retry succeeds after recovery
+        # retry succeeds after recovery
 
     page.goto = goto_first_death
 
@@ -483,7 +483,6 @@ async def test_transient_proxy_refusal_is_retried_once(monkeypatch) -> None:
         calls["goto"] += 1
         if calls["goto"] == 1:
             raise bm.PlaywrightError("Page.goto: NS_ERROR_PROXY_CONNECTION_REFUSED")
-        return None
 
     page = SimpleNamespace(goto=goto, close=...)
 

@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.camoufox_engine import (  # noqa: E402
+from app.camoufox_engine import (
     CAMOUFOX_AVAILABLE,
     addons_supported,
     camoufox_cache_present,
@@ -61,13 +61,13 @@ def _install_package() -> int:
         f"installing {INSTALL_SPEC} {AUX_SPEC} (needs network)",
         file=sys.stderr,
     )
-    subprocess.run(  # noqa: S603
+    subprocess.run(
         [sys.executable, "-m", "pip", "uninstall", "-y", "camoufox", AUX_SPEC],
         check=False,
         capture_output=True,
         text=True,
     )
-    proc = subprocess.run(  # noqa: S603
+    proc = subprocess.run(
         [
             sys.executable,
             "-m",
@@ -88,15 +88,15 @@ def _install_package() -> int:
 
 def _diagnose() -> None:
     """Print why a freshly installed package still will not import."""
-    probe = subprocess.run(  # noqa: S603
+    probe = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import traceback\n"
+            ("import traceback\n"
             "try:\n"
             "    import browserforge, camoufox, camoufox.async_api\n"
             "except BaseException:\n"
-            "    traceback.print_exc()\n",
+            "    traceback.print_exc()\n"),
         ],
         capture_output=True,
         text=True,
@@ -109,7 +109,7 @@ def _diagnose() -> None:
         file=sys.stderr,
     )
     print(detail or "(import succeeded in a subprocess — environment differs?)", file=sys.stderr)
-    pip_ver = subprocess.run(  # noqa: S603
+    pip_ver = subprocess.run(
         [sys.executable, "-m", "pip", "--version"],
         capture_output=True,
         text=True,
@@ -165,13 +165,13 @@ def main(argv: list[str]) -> int:
                 "upgrading (camoufox sync + fetch, ~80 MB if a newer build exists)",
                 file=sys.stderr,
             )
-            subprocess.run(  # noqa: S603
+            subprocess.run(
                 [sys.executable, "-m", "camoufox", "sync"],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 [sys.executable, "-m", "camoufox", "fetch"],
                 check=False,
             )
@@ -196,7 +196,7 @@ def main(argv: list[str]) -> int:
 
     print("[camoufox] browser binary missing — fetching (one-time, ~80 MB)")
     try:
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             [sys.executable, "-m", "camoufox", "fetch"],
             check=False,
         )

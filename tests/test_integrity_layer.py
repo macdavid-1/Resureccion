@@ -6,10 +6,10 @@ import pytest
 
 from app.claims import (
     CLAIM_UNSUPPORTED,
-    ClaimError,
-    ClaimStore,
     EQ_INFERENCE,
     EQ_REPEATED,
+    ClaimError,
+    ClaimStore,
     compute_claim_confidence,
 )
 from app.filters import CandidateFilterEngine
@@ -123,7 +123,7 @@ class TestThresholds:
 
     def test_singleton_reset(self, monkeypatch):
         reset_thresholds()
-        t1 = get_thresholds()
+        get_thresholds()
         monkeypatch.setenv("THRESH_MIN_REVIEWS", "12")
         reset_thresholds()
         t2 = get_thresholds()
@@ -348,7 +348,6 @@ class TestCandidateFilters:
         assert any(a.stage == "overly_broad_market" and a.outcome == "fail" for a in audits)
 
     def test_specific_evidenced_candidate_passes(self, db, session_id):
-        from app.research_data import CAND_UNDER_VERIFICATION
 
         cand = CandidateStore(db).create(
             session_id,

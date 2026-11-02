@@ -36,8 +36,8 @@ async def main() -> int:
     db_mod._db = None
 
     from fastapi.testclient import TestClient
+
     from app.main import create_app
-    from app.db import Database
 
     app = create_app()
     with TestClient(app) as client:
@@ -86,7 +86,7 @@ async def main() -> int:
         import tests.test_research_runner as trr
 
         cfg = app.state.config
-        session = app.state.sessions.require(sid)
+        app.state.sessions.require(sid)
         runner = trr.make_runner(app.state.db, cfg, trr.ScriptedModel(trr.PHASE_OUTPUTS))
         await runner.run(sid)
         r = client.get(f"/api/sessions/{sid}", headers=h)

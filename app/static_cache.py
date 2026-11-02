@@ -26,7 +26,6 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import Request
 from fastapi import Response
 
 _ASSET_REF = re.compile(

@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import config as config_mod  # noqa: E402
-from app import db as db_mod  # noqa: E402
+from app import config as config_mod
+from app import db as db_mod
 
 
 def main() -> int:

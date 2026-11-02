@@ -17,8 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.methodology import P5_DEMAND, P9_SYNTHESIS, PHASE_ORDER, SPECS
-from app.research_runner import ResearchRunner, _primary_items
 from app.report_model import _exec_summary, _trace
+from app.research_runner import ResearchRunner, _primary_items
 from app.sessions import SessionStore
 
 
@@ -91,6 +91,7 @@ async def test_backfill_seeds_only_evidence_that_exists(db, config) -> None:
     """Chain-of-custody: a backfilled candidate may only be seeded with ids
     captured in THIS session — invented ids are dropped, not stored."""
     from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
+
     from app.browser_store import BrowserEvidenceStore
 
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))

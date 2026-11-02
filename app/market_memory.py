@@ -30,9 +30,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Iterable
+from typing import Any
 
 from app.db import Database
 from app.redact import redact
@@ -275,7 +276,7 @@ def _median(values: list[int]) -> int | None:
     mid = len(vals) // 2
     if len(vals) % 2:
         return vals[mid]
-    return int(round((vals[mid - 1] + vals[mid]) / 2))
+    return round((vals[mid - 1] + vals[mid]) / 2)
 
 
 def _top10_median(results: list[Any]) -> int | None:

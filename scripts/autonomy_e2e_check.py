@@ -9,16 +9,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("OWNER_USERNAME", "owner")
 
-from app.autonomy import AutonomySupervisor  # noqa: E402
-from app.config import Config  # noqa: E402
-from app.db import Database  # noqa: E402
-from app.events import EventLog  # noqa: E402
-from app.jobs import JobOrchestrator  # noqa: E402
-from app.recovery import CheckpointStore, ErrorStateStore  # noqa: E402
-from app.research_data import CandidateStore  # noqa: E402
-from app.sessions import SessionStore  # noqa: E402
-from app.timing import TimingTracker  # noqa: E402
-from app.trace import ActivityTrace  # noqa: E402
+from app.autonomy import AutonomySupervisor
+from app.config import Config
+from app.db import Database
+from app.events import EventLog
+from app.jobs import JobOrchestrator
+from app.recovery import CheckpointStore, ErrorStateStore
+from app.research_data import CandidateStore
+from app.sessions import SessionStore
+from app.timing import TimingTracker
+from app.trace import ActivityTrace
 
 
 def main() -> int:
@@ -42,7 +42,7 @@ def main() -> int:
     print("=== 1. full run with trace + timings ===")
     s = sessions.create(mode="prompt", prompt="research grief journals", objective="x")
     jobs = JobOrchestrator(db, cfg, sessions, events, errors)
-    job = jobs.create_job(s.id, kind="research_run")
+    jobs.create_job(s.id, kind="research_run")
     supervisor.mark(s.id, "researching")
 
     model = trr.ScriptedModel(trr.PHASE_OUTPUTS)

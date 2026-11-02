@@ -30,10 +30,9 @@ def test_journal_mode_is_wal(db) -> None:
 
 
 def test_transaction_rolls_back_on_error(db) -> None:
-    with pytest.raises(RuntimeError):
-        with db.tx() as conn:
-            conn.execute("CREATE TABLE rollback_test (x INTEGER)")
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), db.tx() as conn:
+        conn.execute("CREATE TABLE rollback_test (x INTEGER)")
+        raise RuntimeError("boom")
     with db.read() as conn:
         tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert "rollback_test" not in tables

@@ -207,10 +207,11 @@ class SessionStore:
             raise SessionError(f"invalid status {status!r}")
         if phase is not None and phase not in PHASES:
             raise SessionError(f"invalid phase {phase!r}")
-        if status == "running":
-            # A session may only resume from resumable states.
-            if s.status not in ("draft", "queued", "running", "interrupted", "paused"):
-                raise SessionError(f"cannot run session in status {s.status!r}")
+        # A session may only resume from resumable states.
+        if status == "running" and s.status not in (
+            "draft", "queued", "running", "interrupted", "paused"
+        ):
+            raise SessionError(f"cannot run session in status {s.status!r}")
         fields: dict[str, Any] = {}
         for key, value in (
             ("name", name),

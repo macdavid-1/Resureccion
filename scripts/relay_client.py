@@ -75,7 +75,7 @@ def _dial(host: str, port: int, timeout: float = 20) -> socket.socket:
 
 
 class Conn:
-    __slots__ = ("conn_id", "host", "port", "sock", "lock", "closed")
+    __slots__ = ("closed", "conn_id", "host", "lock", "port", "sock")
 
     def __init__(self, conn_id: int, host: str, port: int) -> None:
         self.conn_id = conn_id

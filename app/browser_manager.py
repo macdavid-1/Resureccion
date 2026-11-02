@@ -29,35 +29,32 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
-import tempfile
 import time
-import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
-from app import camoufox_engine
+from app import camoufox_engine, privacy
 from app.browser_store import BrowserEvidenceStore
 from app.config import Config
 from app.kdspy import KDSpyManager
-from app.marketplace import Marketplace, get_marketplace
-from app.redact import scrub_url
-from app import privacy
+from app.marketplace import Marketplace
 from app.proxy_spec import (
     is_proxy_nav_error,
     probe_proxy,
 )
+from app.redact import scrub_url
 
 try:  # pragma: no cover - import guard
     from playwright.async_api import (
         BrowserContext,
-        Error as PlaywrightError,
         Page,
-        Playwright,
+    )
+    from playwright.async_api import (
+        Error as PlaywrightError,
+    )
+    from playwright.async_api import (
         TimeoutError as PlaywrightTimeoutError,
-        async_playwright,
     )
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:  # pragma: no cover

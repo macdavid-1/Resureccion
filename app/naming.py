@@ -16,7 +16,6 @@ Design:
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from app.events import EventLog
 from app.model_client import ModelClient

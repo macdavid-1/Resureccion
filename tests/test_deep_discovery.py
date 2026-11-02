@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.actions import ActionError
 from app.adjacency import gather_neighbors, pre_score
 from app.browser_store import BrowserEvidenceStore
 from app.census import CategoryCensus, _link_path
@@ -520,7 +521,7 @@ async def test_run_writes_preflight_harvests_memory_and_ranks_headroom(db, confi
     # the report carries the adjacent ledger section
     from app.reports import ReportStore
 
-    rep = [r for r in ReportStore(db, config).list(sid) if r.kind == "final"][0]
+    rep = next(r for r in ReportStore(db, config).list(sid) if r.kind == "final")
     model = ReportStore(db, config).read_model_json(rep)
     assert isinstance(model, dict)
     assert "adjacent_ledger" in model and "headroom_ranking" in model
@@ -533,9 +534,10 @@ async def test_run_writes_preflight_harvests_memory_and_ranks_headroom(db, confi
 async def test_adjacency_promotes_only_measured_high_headroom(db, config):
     """A neighbour becomes a candidate only after a REAL search measured it
     above the headroom bar — never on derivation alone."""
+    from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
+
     from app.actions import ActionResult
     from app.marketplace import AMAZON_MARKETPLACES
-    from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
     sid = _mk_session(db, config)
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
@@ -692,9 +694,9 @@ async def test_external_actions_capture_ordinary_evidence(db, config):
 @pytest.mark.asyncio
 async def test_external_actions_refuse_non_allow_listed_hosts(db, config):
     _seed_session_row(db)
-    ex, browser, store, _ = _external_executor(db, config)
+    ex, browser, _store, _ = _external_executor(db, config)
     # Force the guard: the executor validates before any navigation.
-    with pytest.raises(Exception):
+    with pytest.raises(ActionError):
         await ex._open_external("https://evil.example/exfiltrate")
     assert browser.navigated == []
 

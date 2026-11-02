@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -220,7 +221,7 @@ class TestEngineGenerationCompat:
 
     # fpgen-era shape: lacks the fields browserforge requires, so retyping
     # it into a dataclass raises TypeError (missing userAgentData, ...).
-    FPGEN_DICT = {
+    FPGEN_DICT: ClassVar[dict] = {
         "navigator": {
             "userAgent": "Mozilla/5.0 (Windows NT 10.0; rv:130.0) Gecko Firefox/130.0",
             "platform": "Win32",
@@ -264,7 +265,7 @@ class TestEngineGenerationCompat:
         def fake_generate(os=None, **kw):
             seen.append(os)
             if isinstance(os, (str, list)):
-                raise ValueError("only the bare call works")
+                raise TypeError("only the bare call works")
             return dict(self.FPGEN_DICT)
 
         monkeypatch.setattr(ce, "generate_fingerprint", fake_generate)

@@ -53,10 +53,10 @@ async def main() -> int:
     from app import config as config_mod
 
     config_mod.get_config.cache_clear()
-    from app.config import get_config
-    from app.db import init_db
     from app.browser_manager import BrowserManager
     from app.browser_store import BrowserEvidenceStore, ExtensionStore
+    from app.config import get_config
+    from app.db import init_db
     from app.kdspy import KDSpyManager
 
     if not ce.CAMOUFOX_AVAILABLE:

@@ -20,7 +20,7 @@ Everything here is deterministic; no model involvement.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from app.db import Database
@@ -191,8 +191,8 @@ class TimingTracker:
                     {"task_key": r["task_key"], "type": t,
                      "seconds": round(r["duration_seconds"], 1), "outcome": r["outcome"]}
                 )
-        for t in by_type:
-            by_type[t]["total_seconds"] = round(by_type[t]["total_seconds"], 1)
+        for agg in by_type.values():
+            agg["total_seconds"] = round(agg["total_seconds"], 1)
         slowest.sort(key=lambda x: -x["seconds"])
         failed = sum(1 for s in slowest if s["outcome"] not in ("ok", "running"))
         return {

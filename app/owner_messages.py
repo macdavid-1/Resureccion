@@ -95,8 +95,8 @@ class OwnerMessageStore:
             if not rows:
                 return []
             conn.execute(
-                f"UPDATE owner_messages SET delivered_at = ? "
-                f"WHERE session_id = ? AND delivered_at IS NULL",
+                "UPDATE owner_messages SET delivered_at = ? "
+                "WHERE session_id = ? AND delivered_at IS NULL",
                 (now, session_id),
             )
         # Rows were selected pre-UPDATE; stamp the delivery marker the same

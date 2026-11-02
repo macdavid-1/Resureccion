@@ -9,11 +9,9 @@ behavior: only a NAMED hello ("Hello, Dana") confirms; "Hello" and
 """
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
-from app.amazon_auth import AmazonAuthManager, AuthCheck
+from app.amazon_auth import AmazonAuthManager
 from app.browser_store import (
     AUTH_CAPTCHA,
     AUTH_CONFIRMED,

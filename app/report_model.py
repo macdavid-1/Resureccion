@@ -35,8 +35,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.integrity import KIND_FILTER, KIND_VERIFICATION
-from app.methodology import PHASE_ORDER, PHASE_TITLES
 from app.marketplace import AMAZON_MARKETPLACES
+from app.methodology import PHASE_ORDER, PHASE_TITLES
 
 SCHEMA_VERSION = 2
 
@@ -104,7 +104,7 @@ class ReportModel:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=1)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ReportModel":
+    def from_dict(cls, data: dict[str, Any]) -> ReportModel:
         m = cls()
         list_fields = (
             "opportunities", "competitors", "candidate_ledger",
@@ -318,7 +318,7 @@ def _exec_summary(
     for d in dossiers[:10]:
         findings.append(
             f"{d['name']} — {d['niche']} for {d['target_reader']} "
-            f"(confidence {int(round(d['confidence'] * 100))}%)"
+            f"(confidence {round(d['confidence'] * 100)}%)"
         )
     if not findings:
         # No synthesized portfolio yet — still hand the owner what the run
@@ -1449,7 +1449,7 @@ def render_markdown(model: ReportModel) -> str:
             score_txt = f"{float(score):.2f}" if isinstance(score, (int, float)) else "unmeasured"
             name = str(r.get("name") or r.get("niche") or "—").replace("|", "\\|")
             conf = r.get("confidence")
-            conf_txt = f"{int(round(float(conf) * 100))}%" if isinstance(conf, (int, float)) else "—"
+            conf_txt = f"{round(float(conf) * 100)}%" if isinstance(conf, (int, float)) else "—"
             a(f"| {r.get('rank')} | {name} | {score_txt} | {conf_txt} |")
         a("")
 
@@ -1484,14 +1484,16 @@ def render_markdown(model: ReportModel) -> str:
         a("| Niche | Praise | Complaints | Unmet needs |")
         a("|---|---|---|---|")
         for m in ci["by_niche"][:20]:
-            def _cell(key: str) -> str:
-                vals = m.get(key) or []
+            # _m=m binds the CURRENT row: a closure over the loop variable
+            # itself would read whichever row the loop lands on last (B023).
+            def _cell(key: str, _m: dict[str, Any] = m) -> str:
+                vals = _m.get(key) or []
                 if vals:
                     return "; ".join(str(v) for v in vals[:3])
                 # Honest cell: never an em-dash that reads like a measurement.
                 return (
                     "not captured in this session"
-                    if m.get("not_captured") else "none recorded"
+                    if _m.get("not_captured") else "none recorded"
                 )
 
             niche_txt = str(m.get("niche") or "—").replace("|", "\\|")
@@ -1688,7 +1690,7 @@ def _render_opportunity(
     a(f"### {i}. {o['name']}")
     a("")
     vr = o.get("verification", {})
-    conf = int(round(float(o.get("confidence", 0)) * 100))
+    conf = round(float(o.get("confidence", 0)) * 100)
     rows = [
         ("Precise niche", o.get("niche")),
         ("Parent market", o.get("parent_market")),
@@ -1853,7 +1855,7 @@ def _render_opportunity(
         a("")
         a("| Rank | Keyword | Amazon results | Competition | Median reviews (top 10) | Marketplace |")
         a("|---|---|---|---|---|---|")
-        for i, e in enumerate(kp, 1):
+        for kw_rank, e in enumerate(kp, 1):
             kw = str(e.get("keyword", "")).replace("|", "\\|")
             if e.get("measured"):
                 med = e.get("top10_review_median")
@@ -1868,12 +1870,12 @@ def _render_opportunity(
                         f"{e.get('result_count', 0)} captured"
                         " (Amazon total not printed)"
                     )
-                a(f"| {i} | {kw} | {total_txt} "
+                a(f"| {kw_rank} | {kw} | {total_txt} "
                   f"| {_competition_of(total if isinstance(total, int) else None, e.get('result_count'))} "
                   f"| {med if med is not None else '—'} "
                   f"| {e.get('marketplace') or '—'} |")
             else:
-                a(f"| {i} | {kw} | not searched | not searched | not searched | — |")
+                a(f"| {kw_rank} | {kw} | not searched | not searched | not searched | — |")
         a("")
 
     # Finalist deep dive — measured backend keywords + BOTH store category
@@ -1907,7 +1909,7 @@ def _render_opportunity(
             a("")
         a("| # | Backend keyword | Competition | Amazon results | Median reviews, top 10 | Demand |")
         a("|---|---|---|---|---|---|")
-        for i, k in enumerate(bkw, 1):
+        for kw_rank, k in enumerate(bkw, 1):
             kw_txt = str(k.get("keyword") or "—").replace("|", "\\|")
             demand = k.get("demand_score")
             demand_txt = str(demand) if demand is not None else "—"
@@ -1920,12 +1922,12 @@ def _render_opportunity(
                     total_txt = str(k.get("results_text") or "not printed by Amazon")
                 med = k.get("top10_review_median")
                 a(
-                    f"| {i} | {kw_txt} | {k.get('competition') or 'not measured'} | "
+                    f"| {kw_rank} | {kw_txt} | {k.get('competition') or 'not measured'} | "
                     f"{total_txt} | {med if med is not None else '—'} | {demand_txt} |"
                 )
             else:
                 a(
-                    f"| {i} | {kw_txt} | not searched in this run | — | — | "
+                    f"| {kw_rank} | {kw_txt} | not searched in this run | — | — | "
                     f"{demand_txt} |"
                 )
         a("")
@@ -1978,7 +1980,7 @@ def _render_opportunity(
     # Verification detail.
     if vr:
         a(f"**Verification:** {vr.get('verdict', vr.get('status', '—'))}"
-          + (f" (engine confidence {int(round(float(vr['confidence']) * 100))}%)" if vr.get("confidence") is not None else ""))
+          + (f" (engine confidence {round(float(vr['confidence']) * 100)}%)" if vr.get("confidence") is not None else ""))
         if vr.get("limitations"):
             a(f"  - Limitations: {'; '.join(vr['limitations'])}")
         a("")

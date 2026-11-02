@@ -53,15 +53,15 @@ async def main() -> int:
     from camoufox.async_api import AsyncCamoufox
 
     tmp = tempfile.mkdtemp(prefix="camoufox_smoke_")
-    kwargs: dict = dict(
-        headless=True,
-        persistent_context=True,
-        user_data_dir=tmp,
-        os="windows",
-        block_webrtc=True,
-        geoip=False,
-        i_know_what_im_doing=True,
-    )
+    kwargs: dict = {
+        "headless": True,
+        "persistent_context": True,
+        "user_data_dir": tmp,
+        "os": "windows",
+        "block_webrtc": True,
+        "geoip": False,
+        "i_know_what_im_doing": True,
+    }
     if exe:
         kwargs["executable_path"] = exe
     async with AsyncCamoufox(**kwargs) as ctx:

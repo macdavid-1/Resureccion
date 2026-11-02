@@ -27,8 +27,8 @@ from app.browser_manager import (
     BrowserManagerError,
     dismiss_amazon_overlays,
 )
-from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.events import EventLog
+from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
 from app.marketplace import (
     AMAZON_MARKETPLACES,
     Marketplace,
@@ -85,7 +85,7 @@ _GOOGLE_SUGGEST_JS = """async (q) => {
   } catch (e) { return []; }
 }"""
 
-_REDDIT_RESULTS_JS = """() => {
+_REDDIT_RESULTS_JS = r"""() => {
   const out = [];
   const seen = new Set();
   const push = (title, extra) => {
@@ -106,7 +106,7 @@ _REDDIT_RESULTS_JS = """() => {
   return out.slice(0, 20);
 }"""
 
-_GOODREADS_JS = """() => {
+_GOODREADS_JS = r"""() => {
   const num = (s) => {
     const m = String(s || '').replace(/[^0-9]/g, '');
     return m ? Number(m) : null;

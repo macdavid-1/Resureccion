@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.claims import CLAIM_UNSUPPORTED, ClaimStore, EQ_INFERENCE
+from app.claims import CLAIM_UNSUPPORTED
 from app.integrity import KIND_FILTER, IntegrityAssessmentStore
 from app.thresholds import EvidenceThresholds
 
@@ -706,9 +706,8 @@ def _demand_signal_count(evidence_records: list[dict[str, Any]]) -> int:
         elif kind == "product_page":
             if (data.get("review_count") or 0) > 0 or (data.get("best_seller_rank") or 0) > 0:
                 signals += 1
-        elif kind == "reviews":
-            if data.get("reviews"):
-                signals += 1
+        elif kind == "reviews" and data.get("reviews"):
+            signals += 1
     return signals
 
 

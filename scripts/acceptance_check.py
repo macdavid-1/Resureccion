@@ -23,13 +23,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("OWNER_USERNAME", "owner")
 os.environ.setdefault("OWNER_PASSWORD_HASH", "placeholder")
 
-from app.config import Config  # noqa: E402
-from app.db import Database  # noqa: E402
-from app.events import EventLog  # noqa: E402
-from app.reports import ReportStore  # noqa: E402
-from app.sessions import SessionStore  # noqa: E402
-
-import tests.test_research_runner as trr  # noqa: E402
+import tests.test_research_runner as trr
+from app.config import Config
+from app.db import Database
+from app.reports import ReportStore
+from app.sessions import SessionStore
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -70,9 +68,9 @@ async def main() -> int:
     sess2 = sessions.require(s2.id)
     record("B: completed with niched opportunity", sess2.status == "completed"
            and "adult children" in (ReportStore(db, cfg).read_model_json(
-               [r for r in ReportStore(db, cfg).list(s2.id) if r.kind == "final"][0]
+               next(r for r in ReportStore(db, cfg).list(s2.id) if r.kind == "final")
            )["opportunities"][0]["niche"]))
-    m2 = ReportStore(db, cfg).read_model_json([r for r in ReportStore(db, cfg).list(s2.id) if r.kind == "final"][0])
+    m2 = ReportStore(db, cfg).read_model_json(next(r for r in ReportStore(db, cfg).list(s2.id) if r.kind == "final"))
     record("B: niching chain present", len(m2["opportunities"][0]["niching_chain"]) >= 2)
     record("B: consumer intelligence present",
            bool(m2["consumer_intelligence"]["themes"]["complaints"]))
@@ -84,7 +82,7 @@ async def main() -> int:
     await trr.make_runner(db, cfg, trr.ScriptedModel(trr.PHASE_OUTPUTS)).run(s3.id)
     sess3 = sessions.require(s3.id)
     record("C: image-only session completes research", sess3.status == "completed", sess3.status)
-    m3 = ReportStore(db, cfg).read_model_json([r for r in ReportStore(db, cfg).list(s3.id) if r.kind == "final"][0])
+    m3 = ReportStore(db, cfg).read_model_json(next(r for r in ReportStore(db, cfg).list(s3.id) if r.kind == "final"))
     record("C: evidence-backed opportunity produced",
            bool(m3["opportunities"][0]["evidence_ids"]))
 
@@ -95,7 +93,7 @@ async def main() -> int:
     record("D: autonomous session completed", sess4.status == "completed")
     record("D: autonomous name assigned",
            "Autonomous Market Sweep" in sess4.name or "sweep" in sess4.name.lower())
-    m4 = ReportStore(db, cfg).read_model_json([r for r in ReportStore(db, cfg).list(s4.id) if r.kind == "final"][0])
+    m4 = ReportStore(db, cfg).read_model_json(next(r for r in ReportStore(db, cfg).list(s4.id) if r.kind == "final"))
     record("D: marketplace plan recorded in report",
            bool(m4["executive_summary"]["marketplaces_investigated"]))
     record("D: opportunity portfolio produced", len(m4["opportunities"]) >= 1)

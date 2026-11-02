@@ -61,7 +61,7 @@ def _cfg(**over) -> SimpleNamespace:
 def _kdspy_fake() -> SimpleNamespace:
     return SimpleNamespace(
         firefox_addon_is_configured=lambda: False,
-        firefox_addon_args=lambda: [],
+        firefox_addon_args=list,
         firefox_addon_state=lambda: None,
         record_firefox_runtime_validated=lambda *_: None,
     )
@@ -165,7 +165,6 @@ async def test_single_refusal_does_not_escalate(monkeypatch) -> None:
         calls["goto"] += 1
         if calls["goto"] == 1:
             raise bm.PlaywrightError("Page.goto: NS_ERROR_PROXY_CONNECTION_REFUSED")
-        return None
 
     page = SimpleNamespace(goto=goto, close=...)
 

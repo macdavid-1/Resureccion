@@ -17,12 +17,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("OWNER_USERNAME", "owner")
 
-from app.config import Config  # noqa: E402
-from app.db import Database  # noqa: E402
-from app.integrity import IntegrityAssessmentStore  # noqa: E402
-from app.research_data import CandidateStore, OpportunityStore  # noqa: E402
-from app.reports import ReportStore  # noqa: E402
-from app.sessions import SessionStore  # noqa: E402
+from app.config import Config
+from app.db import Database
+from app.integrity import IntegrityAssessmentStore
+from app.reports import ReportStore
+from app.research_data import CandidateStore, OpportunityStore
+from app.sessions import SessionStore
 
 
 def main() -> int:

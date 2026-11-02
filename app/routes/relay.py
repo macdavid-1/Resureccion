@@ -52,7 +52,6 @@ async def _maybe_restart_browser(request: Request) -> bool:
     proxy. Never yanks the browser out from under a running research page —
     the new egress applies on the next launch instead. Returns whether a
     restart actually happened."""
-    from app.routes.browser import _maybe_restart_browser as _restart
 
     mgr = getattr(request.app.state, "browser_manager", None)
     interactive = getattr(request.app.state, "interactive", None)

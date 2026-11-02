@@ -15,11 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("OWNER_USERNAME", "owner")
 os.environ.setdefault("OWNER_PASSWORD_HASH", "placeholder")
 
-from app.config import Config  # noqa: E402
-from app.db import Database  # noqa: E402
-from app.events import EventLog  # noqa: E402
-from app.reports import ReportStore  # noqa: E402
-from app.sessions import SessionStore  # noqa: E402
+from app.config import Config
+from app.db import Database
+from app.reports import ReportStore
+from app.sessions import SessionStore
 
 
 async def main() -> int:

@@ -60,6 +60,7 @@ def _run(snippet: str) -> subprocess.CompletedProcess[str]:
         [PY, "-c", snippet],
         capture_output=True,
         text=True,
+        check=False,
         timeout=120,
         # Simulate the preview server process: root-ish HOME without the
         # downloaded browser in its cache.

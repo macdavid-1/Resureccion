@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from app.evidence_capture import (
+    EvidenceCaptureError,
+    EvidenceCollector,
     _extract_kdspy_panel,
     _first_price,
     _parse_int,
     _parse_rating,
     _stamp,
-    EvidenceCollector,
-    EvidenceCaptureError,
 )
 
 

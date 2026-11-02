@@ -37,7 +37,7 @@ def backend_routes() -> set[str]:
     for f in sorted(ROUTES.glob("*.py")):
         text = f.read_text(encoding="utf-8")
         prefix = ""
-        m = re.search(r"APIRouter\([^)]*prefix\s*=\s*[\"']([^\"']+)[\"']", text, re.S)
+        m = re.search(r"APIRouter\([^)]*prefix\s*=\s*[\"']([^\"']+)[\"']", text, re.DOTALL)
         if m:
             prefix = m.group(1)
         for dm in re.finditer(
@@ -61,10 +61,10 @@ def frontend_calls() -> set[tuple[str, str]]:
     calls: set[tuple[str, str]] = set()
     for wrapper in (r"fetch", r"\bapi"):
         for m in re.finditer(
-            rf"{wrapper}\(\s*([`\"'])(.+?)\1\s*(,\s*\{{(.{{0,300}}?)\}})?", js, re.S
+            rf"{wrapper}\(\s*([`\"'])(.+?)\1\s*(,\s*\{{(.{{0,300}}?)\}})?", js, re.DOTALL
         ):
             opts = m.group(4) or ""
-            mm = re.search(r"method\s*:\s*[\"'](\w+)[\"']", opts, re.I)
+            mm = re.search(r"method\s*:\s*[\"'](\w+)[\"']", opts, re.IGNORECASE)
             method = (mm.group(1) if mm else "GET").upper()
             calls.add((method, _template_path(m.group(2))))
     return calls

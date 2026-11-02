@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.amazon_auth import AmazonAuthError, AmazonAuthManager
 from app.browser_manager import BrowserManager, BrowserManagerError
-from app.browser_store import BrowserAuthStore, BrowserEvidenceStore, LoginWindowStore
+from app.browser_store import BrowserEvidenceStore, LoginWindowStore
 from app.interactive import InteractiveError, InteractiveSessionManager
 from app.kdspy import ExtensionInstallError, KDSpyError, KDSpyManager
 from app.marketplace import (
@@ -123,7 +123,7 @@ async def amazon_signin_options(request: Request) -> dict:
 
 
 @router.post("/auth/amazon/check")
-async def amazon_auth_check(request: Request, body: "MarketplaceRequest") -> dict:
+async def amazon_auth_check(request: Request, body: MarketplaceRequest) -> dict:
     _auth(request)
     mkt = _marketplace_or_400(body.marketplace)
     try:
@@ -136,7 +136,7 @@ async def amazon_auth_check(request: Request, body: "MarketplaceRequest") -> dic
 @router.post("/auth/amazon/login-window")
 async def open_login_window(
     request: Request,
-    body: "MarketplaceRequest",
+    body: MarketplaceRequest,
     x_login_secret: str | None = Header(default=None),
 ) -> dict:
     _auth(request)
@@ -150,7 +150,7 @@ async def open_login_window(
 
 
 @router.post("/auth/amazon/login-window/{window_id}/complete")
-async def complete_login_window(request: Request, window_id: str, body: "MarketplaceRequest") -> dict:
+async def complete_login_window(request: Request, window_id: str, body: MarketplaceRequest) -> dict:
     _auth(request)
     mkt = _marketplace_or_400(body.marketplace)
     mgr: AmazonAuthManager = _amazon_auth(request)
@@ -181,7 +181,7 @@ async def list_login_windows(request: Request) -> dict:
 
 
 @router.post("/auth/amazon/cookies")
-async def import_cookies(request: Request, body: "CookieImportRequest") -> dict:
+async def import_cookies(request: Request, body: CookieImportRequest) -> dict:
     _auth(request)
     mkt = _marketplace_or_400(body.marketplace)
     try:
@@ -355,7 +355,7 @@ async def _maybe_restart_browser(request: Request) -> None:
 
 # ----------------------------------------------------------------- interactive
 @router.post("/interactive/start")
-async def interactive_start(request: Request, body: "InteractiveStartRequest") -> dict:
+async def interactive_start(request: Request, body: InteractiveStartRequest) -> dict:
     """Open an owner-controlled browser tab (persistent research profile)."""
     _auth(request)
     mgr: InteractiveSessionManager = _interactive(request)
@@ -382,7 +382,7 @@ async def interactive_frame(request: Request) -> dict:
 
 
 @router.post("/interactive/action")
-async def interactive_action(request: Request, body: "InteractiveActionRequest") -> dict:
+async def interactive_action(request: Request, body: InteractiveActionRequest) -> dict:
     _auth(request)
     mgr: InteractiveSessionManager = _interactive(request)
     try:
@@ -394,7 +394,7 @@ async def interactive_action(request: Request, body: "InteractiveActionRequest")
 
 
 @router.post("/interactive/complete")
-async def interactive_complete(request: Request, body: "InteractiveEndRequest") -> dict:
+async def interactive_complete(request: Request, body: InteractiveEndRequest) -> dict:
     _auth(request)
     mgr: InteractiveSessionManager = _interactive(request)
     try:
@@ -431,7 +431,7 @@ async def list_marketplaces(request: Request) -> dict:
 
 
 @router.post("/marketplaces/resolve")
-async def resolve_marketplaces(request: Request, body: "MarketplacePlanRequest") -> dict:
+async def resolve_marketplaces(request: Request, body: MarketplacePlanRequest) -> dict:
     _auth(request)
     try:
         mode, marketplaces = resolve_plan(body.marketplaces or [])

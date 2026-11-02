@@ -7,6 +7,8 @@ backend keywords and both store category maps measured from real pages.
 """
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from app.browser_manager import _OVERLAY_DISMISS_JS, dismiss_amazon_overlays
@@ -384,7 +386,7 @@ def test_report_renders_measured_backend_keywords_and_both_stores() -> None:
     assert "Books store" in md and "Kindle Store" in md
     assert "Children's eBooks" in md
     # The PDF path carries the same facts.
-    from app.pdf_export import model_to_blocks, _kw_total_txt
+    from app.pdf_export import _kw_total_txt, model_to_blocks
 
     _, _, blocks = model_to_blocks(model.to_dict())
     text = " ".join(str(b.get("x", "")) for b in blocks if b.get("t") in ("p", "h3"))
@@ -441,7 +443,7 @@ async def test_finalist_deep_dive_runs_once_per_report_candidate(
     calls: list[dict] = []
 
     class _StubDive:
-        last_kwargs: dict = {}
+        last_kwargs: ClassVar[dict] = {}
 
         def __init__(self, *args, kwargs_unused=None, **kwargs) -> None:
             _StubDive.last_kwargs = kwargs
@@ -502,7 +504,7 @@ def test_dive_can_be_switched_off_entirely(db, config, monkeypatch) -> None:
         raise AssertionError("the dive must not run when disabled")
 
     monkeypatch.setattr(FinalCandidateDive, "run", _boom)
-    assert getattr(config, "dive_enabled") is False
+    assert config.dive_enabled is False
 
 
 def test_dive_evidence_is_indexed_by_niche_for_the_report() -> None:

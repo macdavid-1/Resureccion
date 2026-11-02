@@ -495,7 +495,6 @@ class SessionRecorder:
         so the artifact stays a few MB even for long sessions. Frames are
         read one at a time; memory stays flat.
         """
-        import base64
 
         frames: list[tuple[float, bytes]] = []
         total = len(frame_files)

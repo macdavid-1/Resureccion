@@ -225,9 +225,9 @@ async def main() -> int:
     assert hub.stats["fallback_proxy"] == 1
 
     # ------------------------------------------------------------ Chromium level
-    from app.db import init_db
-    from app.browser_store import BrowserEvidenceStore, ExtensionStore
     from app.browser_manager import BrowserManager
+    from app.browser_store import BrowserEvidenceStore, ExtensionStore
+    from app.db import init_db
     from app.kdspy import KDSpyManager
 
     cm.get_config.cache_clear()

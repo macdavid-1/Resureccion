@@ -17,8 +17,8 @@ from app.claims import (
     EVIDENCE_QUALITY_WEIGHTS,
     ClaimStore,
     claim_is_estimate_backed,
-    evidence_quality_from_kind,
     estimate_evidence_ids,
+    evidence_quality_from_kind,
 )
 from app.filters import _demand_signal_count
 from app.integrity import IntegrityAssessmentStore

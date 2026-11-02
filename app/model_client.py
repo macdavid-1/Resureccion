@@ -31,14 +31,13 @@ import base64
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from app.config import DEFAULT_BASE_URL, DEFAULT_MODEL, Config
 from app.events import EventLog
-from app.redact import scrub_url
 from app.thoughts import STATUS_DONE, STATUS_FAILED, ThoughtStore
 
 # DEFAULT_BASE_URL / DEFAULT_MODEL are re-exported from app.config (single
@@ -134,7 +133,7 @@ def _split_think(text: str) -> tuple[str, str]:
     """
     found: list[str] = []
 
-    def _collect(match: "re.Match[str]") -> str:
+    def _collect(match: re.Match[str]) -> str:
         found.append(match.group(1))
         return ""
 

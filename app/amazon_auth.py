@@ -22,9 +22,7 @@ diagnostics are stored (see BrowserAuthStore).
 """
 from __future__ import annotations
 
-import asyncio
 import re
-import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -33,18 +31,16 @@ from app.browser_manager import BrowserManager, BrowserManagerError
 from app.browser_store import (
     AUTH_CAPTCHA,
     AUTH_CONFIRMED,
-    AUTH_ERROR,
     AUTH_LOGIN_REQUIRED,
     AUTH_OTP_REQUIRED,
-    AUTH_SIGNED_OUT,
     AUTH_UNKNOWN,
-    AuthState,
-    BrowserAuthStore,
-    LoginWindowStore,
     WINDOW_CANCELLED,
     WINDOW_COMPLETED,
     WINDOW_EXPIRED,
     WINDOW_OPEN,
+    AuthState,
+    BrowserAuthStore,
+    LoginWindowStore,
 )
 from app.config import Config
 from app.marketplace import Marketplace
@@ -196,7 +192,7 @@ class AmazonAuthManager:
         # (?!\s*sign...): the \s* must be INSIDE the lookahead, else the
         # greedy \s* before it backtracks past the space and "Hello, sign in"
         # slips through as a named hello.
-        hello_named = bool(re.match(r"hello\s*,\s*(?!\s*sign\s*in\b).+", label, re.I | re.S))
+        hello_named = bool(re.match(r"hello\s*,\s*(?!\s*sign\s*in\b).+", label, re.IGNORECASE | re.DOTALL))
         if hello_named or await _has_selector(page, "#nav-your-account"):
             detail["account_label_present"] = True
             if label:
@@ -206,7 +202,7 @@ class AmazonAuthManager:
         # "Hello, sign in" when signed out, "Hello, <Name>" when in.
         if not hello_named:
             hmenu = (await _safe_text_of(page, "#hmenu-content")).strip()
-            m = re.match(r"hello\s*,\s*([^\n]+)", hmenu, re.I)
+            m = re.match(r"hello\s*,\s*([^\n]+)", hmenu, re.IGNORECASE)
             if m:
                 if "sign in" in m.group(1).strip().lower():
                     detail["reason"] = "sign-in prompt visible (mobile drawer)"

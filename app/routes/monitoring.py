@@ -170,7 +170,7 @@ async def stream(session_id: str, request: Request, max_events: int = 0) -> Resp
     st = request.app.state
     if st.sessions.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
-    trace = ActivityTrace(st.db)
+    ActivityTrace(st.db)
 
     async def gen():
         after_trace = 0
@@ -300,6 +300,6 @@ async def live_stream(session_id: str, request: Request) -> Response:
 
     return StreamingResponse(
         gen(),
-        media_type=f"multipart/x-mixed-replace; boundary=frame",
+        media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store"},
     )

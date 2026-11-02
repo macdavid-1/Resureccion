@@ -19,7 +19,6 @@ the single shared worker pool (2-CPU target: 1-2 concurrent sessions max).
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Any
 

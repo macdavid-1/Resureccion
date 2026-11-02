@@ -75,7 +75,7 @@ class Tunnel:
     """One TCP stream to an origin, carried over the relay or a fallback."""
 
     conn_id: int
-    hub: "RelayHub"
+    hub: RelayHub
     opened: asyncio.Event = field(default_factory=asyncio.Event)
     open_error: str | None = None
     inbound: asyncio.Queue = field(default_factory=asyncio.Queue)  # bytes chunks
@@ -145,7 +145,7 @@ class RelayHub:
             "blocked_requests": 0,
             "relay_served": 0,
         }
-        self.shim: "ShimServer | None" = None
+        self.shim: ShimServer | None = None
         self._token_cache: str | None = None
 
     # ------------------------------------------------------------- token

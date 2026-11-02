@@ -29,18 +29,18 @@ def sid(db, config) -> str:
 def _prompt(**over: Any) -> str:
     from app.methodology import PhaseTiming
 
-    kwargs: dict[str, Any] = dict(
-        phase="opportunity_discovery",
-        mode="prompt",
-        objective="",
-        prompt_text="brief",
-        marketplaces=["us"],
-        marketplace_mode="explicit",
-        evidence_digest=[],
-        candidates_digest=[],
-        prior_phase_outputs=None,
-        timing=PhaseTiming(phase="opportunity_discovery", started_at="now"),
-    )
+    kwargs: dict[str, Any] = {
+        "phase": "opportunity_discovery",
+        "mode": "prompt",
+        "objective": "",
+        "prompt_text": "brief",
+        "marketplaces": ["us"],
+        "marketplace_mode": "explicit",
+        "evidence_digest": [],
+        "candidates_digest": [],
+        "prior_phase_outputs": None,
+        "timing": PhaseTiming(phase="opportunity_discovery", started_at="now"),
+    }
     kwargs.update(over)
     return build_user_prompt(**kwargs)  # type: ignore[arg-type]
 
@@ -111,6 +111,7 @@ def _runner(db, config, model):
     from app.actions import ActionExecutor
     from app.agent import AgentStateStore
     from app.artifacts import ArtifactStore
+    from app.autonomy import AutonomySupervisor
     from app.browser_store import BrowserEvidenceStore
     from app.evidence_capture import EvidenceCollector
     from app.marketplace import AMAZON_MARKETPLACES
@@ -122,7 +123,6 @@ def _runner(db, config, model):
         OpportunityStore,
     )
     from app.research_runner import ResearchRunner
-    from app.autonomy import AutonomySupervisor
     from app.trace import ActivityTrace
 
     events = EventLog(db)

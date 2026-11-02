@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import pytest
 
-from app.events import EventLog
 from app.security import AuthError, AuthService, hash_password, verify_password
 
 
@@ -67,8 +66,9 @@ def test_ensure_user_is_idempotent(db, config) -> None:
 
 
 def test_expired_token_rejected(auth, db) -> None:
-    from app.timeutil import iso, utcnow
     from datetime import timedelta
+
+    from app.timeutil import iso, utcnow
 
     token = auth.login("owner", "correct horse")
     with db.tx() as conn:

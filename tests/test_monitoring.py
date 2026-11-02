@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from app.live_view import LiveViewStore, downscale_jpeg
-from app.sessions import SessionStore
 from app.timing import TaskType, TimingTracker
 from app.trace import ActivityTrace
 

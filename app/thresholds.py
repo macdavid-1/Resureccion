@@ -19,7 +19,7 @@ Chain of custody (enforced by app.claims):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def _int_env(name: str, default: int) -> int:
@@ -101,7 +101,7 @@ class EvidenceThresholds:
     min_candidate_evidence: int = 4
 
     @classmethod
-    def from_env(cls) -> "EvidenceThresholds":
+    def from_env(cls) -> EvidenceThresholds:
         return cls(
             min_competitor_sample=_int_env("THRESH_MIN_COMPETITORS", cls.min_competitor_sample),
             min_review_sample=_int_env("THRESH_MIN_REVIEWS", cls.min_review_sample),

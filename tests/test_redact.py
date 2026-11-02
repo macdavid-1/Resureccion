@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.redact import assert_no_secrets, redact, redact_cookies_summary, redact_headers, scrub_url
+from app.redact import (
+    assert_no_secrets,
+    redact,
+    redact_cookies_summary,
+    redact_headers,
+    scrub_url,
+)
 
 
 def test_sensitive_keys_dropped() -> None:

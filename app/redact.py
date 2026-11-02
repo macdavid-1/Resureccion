@@ -85,7 +85,7 @@ def redact(value: Any, *, keep_urls: bool = True) -> Any:
         return [redact(v, keep_urls=keep_urls) for v in value]
     if isinstance(value, str):
         s = value
-        if keep_urls and (s.startswith("http://") or s.startswith("https://")):
+        if keep_urls and (s.startswith(("http://", "https://"))):
             return scrub_url(s)
         # Mask strings that look like bearer tokens / long secrets. Threshold
         # is 40+ chars so 32-char UUID ids survive; secrets.token_urlsafe(32)

@@ -12,13 +12,12 @@ from __future__ import annotations
 import asyncio
 import socket
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
 
 from app.privacy import is_blocked_host
-from app.relay import RelayError, RelayHub, TunnelError, _dial_via_proxy
+from app.relay import RelayHub, TunnelError, _dial_via_proxy
 from app.static_cache import render_index
 
 
@@ -137,8 +136,8 @@ async def test_upstream_open_ack_completes_tunnel(tmp_path) -> None:
     # Data path: hub → device
     await t.write(b"hello")
     sent = await asyncio.wait_for(q.get(), timeout=2)
-    import json as _json
     import base64 as _b64
+    import json as _json
 
     m2 = _json.loads(sent)
     assert m2["op"] == "data" and _b64.b64decode(m2["b64"]) == b"hello"
@@ -316,8 +315,8 @@ async def test_shim_tunnel_via_device_end_to_end(tmp_path) -> None:
     origin = _MiniOrigin()
     origin.start()
     try:
-        import json as _json
         import base64 as _b64
+        import json as _json
 
         q = hub.attach_device()
 

@@ -175,7 +175,7 @@ class EvidenceCollector:
     ) -> CapturedEvidence:
         """Minimal context capture of the current page (no scraping)."""
         url = scrub_url(page.url or "")
-        title = (await _safe_title(page)) or ""
+        (await _safe_title(page)) or ""
         marketplace = marketplace_from_url(url)
         return await self._persist(
             page,

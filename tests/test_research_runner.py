@@ -13,19 +13,20 @@ from typing import Any
 
 import pytest
 
-from app.actions import ActionExecutor, AuthPauseRequired
+from app.actions import ActionExecutor
 from app.agent import AgentStateStore
 from app.artifacts import ArtifactStore
 from app.browser_store import BrowserEvidenceStore
 from app.config import Config
 from app.db import Database
-from app.evidence_capture import EvidenceCollector
 from app.events import EventLog
+from app.evidence_capture import EvidenceCollector
 from app.jobs import JobOrchestrator
 from app.marketplace import AMAZON_MARKETPLACES
 from app.methodology import PHASE_ORDER, SPECS
-from app.model_client import ModelClient, ModelConfigError
+from app.model_client import ModelConfigError
 from app.recovery import CheckpointStore, ErrorStateStore
+from app.reports import ReportStore
 from app.research_data import (
     CandidateStore,
     EvidenceStore,
@@ -33,9 +34,8 @@ from app.research_data import (
     OpportunityStore,
 )
 from app.research_runner import ResearchRunner, RunnerConfig
-from app.reports import ReportStore
-from app.runner_registry import RunnerRegistry, RunnerRegistryError
-from app.sessions import SessionStore
+from app.runner_registry import RunnerRegistry
+from app.sessions import SessionError, SessionStore
 
 
 class FakePage:
@@ -130,7 +130,7 @@ class ScriptedModel:
         ids = self._cited_ids(user)
         if ids:
             # Cite real evidence in every analysis item, like the real model.
-            for key, value in content.items():
+            for value in content.values():
                 if isinstance(value, list):
                     for item in value:
                         if isinstance(item, dict):
@@ -211,8 +211,8 @@ def make_runner(db: Database, config: Config, model: Any, *, pause_auth: bool = 
     artifacts = ArtifactStore(db, config)
     be_store = BrowserEvidenceStore(db)
     browser = FakeBrowser()
-    from app.trace import ActivityTrace
     from app.autonomy import AutonomySupervisor
+    from app.trace import ActivityTrace
 
     trace = ActivityTrace(db)
     supervisor = AutonomySupervisor(
@@ -248,7 +248,7 @@ def make_runner(db: Database, config: Config, model: Any, *, pause_auth: bool = 
 
 @pytest.fixture()
 def session(db, config) -> str:
-    with db.tx() as conn:
+    with db.tx():
         pass
     sessions = SessionStore(db, config)
     config.max_concurrent_sessions = 3
@@ -725,7 +725,7 @@ async def test_registry_refuses_runnable_only_statuses(db, config):
     registry = RunnerRegistry(
         db, config, sessions=sessions, events=events, errors=errors, state=type("S", (), {})(),
     )
-    with pytest.raises(Exception):
+    with pytest.raises(SessionError):
         registry.start("no-such-session")
 
 
@@ -882,7 +882,7 @@ class TestAutonomySupervisor:
         from app.autonomy import JOB_RESEARCHING, JOB_WAITING_AUTH
 
         sup = self._supervisor(db, config)
-        st = requestless_job(db, config, session)
+        requestless_job(db, config, session)
         sup.mark(session, JOB_RESEARCHING)
         job = sup.current_job(session)
         assert job is not None and job.status == JOB_RESEARCHING
@@ -1048,7 +1048,7 @@ async def test_budget_exhaustion_still_applies_the_model_output(db, config, sess
 async def test_empty_niching_output_cannot_commit_while_signals_exist(db, config, session):
     """Phase 2 is where candidates are BORN: with Phase 1 signals on the
     table it may not commit an empty niches list (the zero-candidate bug)."""
-    from app.methodology import P1_DISCOVERY, P2_NICHING
+    from app.methodology import P2_NICHING
 
     class EmptyNichingModel(ScriptedModel):
         def _reply_for(self, phase: str, user: str) -> FakeModelReply:
@@ -1181,11 +1181,11 @@ def test_build_user_prompt_includes_pivot_directive():
     from app.methodology import P1_DISCOVERY, PhaseTiming
     from app.prompts import build_user_prompt
 
-    base = dict(
-        mode="auto", objective=None, prompt_text="", marketplaces=["us"],
-        marketplace_mode="auto", evidence_digest=[], candidates_digest=[],
-        prior_phase_outputs=None, timing=PhaseTiming(P1_DISCOVERY, "t0"),
-    )
+    base = {
+        "mode": "auto", "objective": None, "prompt_text": "", "marketplaces": ["us"],
+        "marketplace_mode": "auto", "evidence_digest": [], "candidates_digest": [],
+        "prior_phase_outputs": None, "timing": PhaseTiming(P1_DISCOVERY, "t0"),
+    }
     assert "STRATEGIC PIVOT" not in build_user_prompt(P1_DISCOVERY, **base)
     pivoted = build_user_prompt(
         P1_DISCOVERY, **base, pivot_directive="explore a different parent market"

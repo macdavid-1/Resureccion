@@ -21,8 +21,9 @@ Why this shape (and why it breaks nothing):
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from app.whitespace import WhitespaceScore, _head_terms, _log_norm
 

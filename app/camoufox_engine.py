@@ -17,7 +17,6 @@ is not installed there is no fallback — launch fails with a precise fix.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import random
@@ -265,7 +264,7 @@ def stable_fingerprint_path(config: Config) -> Path:
     return config.browser_profiles_dir / "kdspy_fingerprint.json"
 
 
-def _load_cached_fingerprint(path: Path) -> "Fingerprint | dict[str, Any] | None":
+def _load_cached_fingerprint(path: Path) -> Fingerprint | dict[str, Any] | None:
     """Read the cached fingerprint and fully re-type its nested dataclasses.
 
     ``asdict`` flattens NavigatorFingerprint/ScreenFingerprint/VideoCard into
@@ -317,7 +316,7 @@ def _persist_fingerprint(path: Path, fp_dict: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _generate_identity_fingerprint() -> "Fingerprint | dict[str, Any]":
+def _generate_identity_fingerprint() -> Fingerprint | dict[str, Any]:
     """Generate an identity fingerprint on whichever camoufox is installed.
 
     Engine generations disagree about ``os``:
@@ -358,7 +357,7 @@ def _fingerprint_payload(fp: Any) -> dict[str, Any]:
     return {"_resurreccion_native": 1, **dict(fp)}
 
 
-def load_or_generate_fingerprint(config: Config) -> "Fingerprint | dict[str, Any]":
+def load_or_generate_fingerprint(config: Config) -> Fingerprint | dict[str, Any]:
     """Profile-stable identity: generate once, cache as JSON, reuse forever.
 
     Reusing the same fingerprint across restarts is the point: a research

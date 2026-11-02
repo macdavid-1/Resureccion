@@ -22,6 +22,29 @@ dependencies = [
     "pytest-asyncio>=0.23",
 ]
 
+[tool.ruff]
+# The venv and every test run use Python 3.10, so lint fixes must stay
+# 3.10-compatible (e.g. datetime.UTC and TimeoutError aliases are 3.11+).
+target-version = "py310"
+
+[tool.ruff.lint]
+# Deliberate design policy, not oversight: this app's contract is that a
+# bookkeeping hiccup, an auxiliary layer or one odd record must NEVER kill
+# a research run mid-flight. Every broad catch in the codebase either
+# records the failure durably (errors.record / events) or is explicitly
+# documented why it must not propagate — narrowing these to specific
+# exception types would turn recoverable degradation into failed sessions.
+ignore = ["BLE001", "S110", "S112"]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest injects fixtures BY NAME: test parameters must share the fixture's
+# name, and modules import the fixture object to register it — pyflakes
+# reads that necessary shadowing as F811, but it is pytest's core mechanism.
+"tests/*" = ["F811"]
+# FastAPI's documented UploadFile idiom puts File(...) in the parameter
+# default; moving it into the body breaks signature introspection.
+"app/routes/*" = ["B008"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

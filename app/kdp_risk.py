@@ -32,7 +32,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.integrity import KIND_KDP_RISK, KIND_KEYWORD_INTEGRITY, IntegrityAssessmentStore
+from app.integrity import (
+    KIND_KDP_RISK,
+    KIND_KEYWORD_INTEGRITY,
+    IntegrityAssessmentStore,
+)
 
 # --------------------------------------------------------------------------- #
 # Rule tables (documented, deterministic; extend deliberately)

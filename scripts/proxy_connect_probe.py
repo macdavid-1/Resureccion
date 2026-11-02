@@ -26,7 +26,7 @@ async def probe_one(host: str) -> str:
 
     spec = os.environ.get("BROWSER_PROXY", "")
     try:
-        reader, writer = await asyncio.wait_for(
+        _reader, writer = await asyncio.wait_for(
             _dial_via_proxy(spec, host, 443), timeout=15
         )
         writer.close()

@@ -23,8 +23,8 @@ def _seed(db, config, session_id, *, with_opportunity: bool = True,
     candidates = CandidateStore(db)
     c1 = candidates.create(session_id, niche="sudden-loss grief journals for adults",
                            marketplace="us")
-    c2 = candidates.create(session_id, niche="90-day prayer journals for new believers")
-    c3 = candidates.create(session_id, niche="guided divorce recovery journals for men")
+    candidates.create(session_id, niche="90-day prayer journals for new believers")
+    candidates.create(session_id, niche="guided divorce recovery journals for men")
     claims.create(session_id, kind="demand",
                   statement="multiple competitors show steady review accumulation",
                   evidence_ids=["ev1"], candidate_id=c1.id)

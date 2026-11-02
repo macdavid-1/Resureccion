@@ -70,7 +70,6 @@ class TestCorruptedCheckpoints:
         assert len([e for e in tail if e.action == "research_started"]) == 2
 
 
-from app.events import EventLog  # noqa: E402  (kept below imports-on-top rule)
 
 
 class TestStorageFailures:

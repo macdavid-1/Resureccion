@@ -24,8 +24,9 @@ evidence of absence, and must never masquerade as a measured zero.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 # Component weights (renormalised over the components actually present).
 _DEMAND_WEIGHTS = {
@@ -98,9 +99,10 @@ def _observed_competitors(evidence: Iterable[dict[str, Any]]) -> list[dict[str, 
             for r in data.get("results") or []:
                 if isinstance(r, dict) and (r.get("asin") or r.get("review_count") is not None):
                     out.append(r)
-        elif e.get("kind") == "product_page":
-            if data.get("asin") or data.get("review_count") is not None:
-                out.append(data)
+        elif e.get("kind") == "product_page" and (
+            data.get("asin") or data.get("review_count") is not None
+        ):
+            out.append(data)
     return out
 
 
@@ -204,10 +206,10 @@ def compute_whitespace(
         with_reviews = [c for c in counts if c > 0]
         demand_parts["buyer_activity"] = len(with_reviews) / max(1, len(competitors))
         if len(competitors) >= 3:
-            comp_parts["crowding"] = _clamp(len(set(
+            comp_parts["crowding"] = _clamp(len({
                 str(c.get("asin") or c.get("title") or i)
                 for i, c in enumerate(competitors)
-            )) / _MAX_CROWD)
+            }) / _MAX_CROWD)
 
     barrier = _median(counts)
     if barrier is not None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -13,9 +13,6 @@ from app.amazon_auth import AmazonAuthManager
 from app.artifacts import ArtifactStore
 from app.autonomy import AutonomySupervisor, resume_auth_paused_sessions
 from app.backup import BackupManager
-from app.claims import ClaimStore
-from app.integrity import IntegrityAssessmentStore
-from app.live_view import LiveViewStore
 from app.browser import BrowserRegistry
 from app.browser_manager import BrowserManager
 from app.browser_store import (
@@ -24,18 +21,21 @@ from app.browser_store import (
     ExtensionStore,
     LoginWindowStore,
 )
+from app.claims import ClaimStore
 from app.config import get_config
 from app.db import init_db
 from app.events import EventLog
 from app.exports import ExportManager
-from app.owner_messages import OwnerMessageStore
+from app.integrity import IntegrityAssessmentStore
 from app.interactive import InteractiveSessionManager
 from app.jobs import JobOrchestrator
 from app.kdspy import KDSpyManager
+from app.live_view import LiveViewStore
 from app.methodology import Methodology
+from app.owner_messages import OwnerMessageStore
+from app.recording import SessionRecorder
 from app.recovery import CheckpointStore, ErrorStateStore, RecoveryManager
 from app.relay import RelayHub
-from app.recording import SessionRecorder
 from app.reports import ReportStore
 from app.research_data import (
     CandidateStore,
@@ -50,12 +50,12 @@ from app.routes import misc as misc_routes
 from app.routes import monitoring as monitoring_routes
 from app.routes import relay as relay_routes
 from app.routes import sessions as session_routes
-from app.trace import ActivityTrace
-from app.thoughts import ThoughtStore
 from app.runner_registry import RunnerRegistry
 from app.security import AuthError, AuthService
 from app.sessions import SessionStore
 from app.static_cache import index_response
+from app.thoughts import ThoughtStore
+from app.trace import ActivityTrace
 from app.uploads import UploadStore
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

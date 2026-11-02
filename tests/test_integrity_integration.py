@@ -2,9 +2,6 @@
 the owner-facing integrity API endpoints."""
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
 import pytest
 
 from app.claims import ClaimStore
@@ -15,16 +12,18 @@ from app.research_data import (
     VerificationStore,
 )
 from app.sessions import SessionStore
-from tests.test_research_runner import (  # noqa: F401
+from tests.test_research_runner import (
     PHASE_OUTPUTS,
     ScriptedModel,
     make_runner,
-    session as session_fixture,
+)
+from tests.test_research_runner import (
+    session as session_fixture,  # noqa: F401 — pytest fixture re-export
 )
 
 
 @pytest.fixture()
-def session(session_fixture):  # noqa: F811
+def session(session_fixture):
     return session_fixture
 
 

@@ -35,8 +35,8 @@ from app.integrity import (
 )
 from app.methodology import validate_opportunity
 from app.quality_gates import GateReport, QualityGateRunner
-from app.research_data import CandidateStore, OpportunityStore, VerificationStore
 from app.redact import redact
+from app.research_data import CandidateStore, OpportunityStore, VerificationStore
 
 # Verification verdicts that allow a "final" (not provisional) report.
 _FINAL_VERDICTS = {"verified", "verified_with_limitations"}
@@ -293,7 +293,6 @@ class ReportValidator:
         """Scan rendered report text for credential-shaped assignments that
         redact() would have removed. We render the body through redact-parsed
         JSON to detect key-shaped leaks deterministically."""
-        import json
 
         # Simulate: if the body contained `key: value` pairs with forbidden
         # key names, they would appear as plain text. Detect the key names.

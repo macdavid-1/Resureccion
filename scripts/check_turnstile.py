@@ -1,11 +1,11 @@
 """Live check of the REAL kdspy login page (publishingaltitude.com) Turnstile
 widget through the app's interactive browser. Reports widget presence and
 saves a frame. Owner password comes from the workspace environment."""
+import base64
 import json
 import sys
 import time
 import urllib.request
-import base64
 
 sys.path.insert(0, ".")
 
@@ -42,7 +42,8 @@ def main() -> None:
     time.sleep(10)
 
     fr = raw("/api/browser/interactive/frame", None, "GET", headers=H)
-    open("/tmp/kdspy_login.jpg", "wb").write(base64.b64decode(fr["frame"]))
+    with open("/tmp/kdspy_login.jpg", "wb") as fh:
+        fh.write(base64.b64decode(fr["frame"]))
     print("frame saved: /tmp/kdspy_login.jpg")
 
     st = raw("/api/browser/interactive/state", None, "GET", headers=H)

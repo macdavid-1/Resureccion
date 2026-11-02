@@ -4,18 +4,17 @@ from __future__ import annotations
 import pytest
 
 from app.browser_store import (
-    AUTH_CAPTCHA,
     AUTH_CONFIRMED,
     AUTH_LOGIN_REQUIRED,
     AUTH_UNKNOWN,
-    BrowserAuthStore,
-    BrowserEvidenceStore,
     EXT_INSTALLED,
-    ExtensionStore,
-    LoginWindowStore,
     WINDOW_COMPLETED,
     WINDOW_OPEN,
     WINDOW_PENDING,
+    BrowserAuthStore,
+    BrowserEvidenceStore,
+    ExtensionStore,
+    LoginWindowStore,
 )
 
 

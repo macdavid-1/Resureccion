@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -120,7 +119,7 @@ class TestBlockFidelity:
     def test_all_words_preserved(self):
         """Every word of the model's prose reaches the blocks verbatim."""
         model = _minimal_model()
-        title, subtitle, blocks = model_to_blocks(model)
+        _title, _subtitle, blocks = model_to_blocks(model)
         blob = json.dumps(blocks, ensure_ascii=False)
 
         probe_strings = [
@@ -264,8 +263,9 @@ class TestRealRender:
     @pytest.mark.skipif(not node_available(), reason="node/pdfkit sidecar unavailable")
     def test_long_report_renders_many_pages(self, db, config, session):
         """A long report must paginate — never truncate."""
-        from app.artifacts import ArtifactStore
         from pathlib import Path
+
+        from app.artifacts import ArtifactStore
 
         model = _minimal_model()
         # Inflate: repeat the portfolio 30x.
@@ -318,7 +318,7 @@ class TestFailureSafety:
         res = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})
         h = {"X-Auth-Token": res.json()["token"]}
         reps = client.get(f"/api/sessions/{s.id}/reports", headers=h).json()["reports"]
-        final = [r for r in reps if r["kind"] == "final"][0]
+        final = next(r for r in reps if r["kind"] == "final")
         # Destroy the stored model, keep the report body.
         report = st.reports.get(s.id, final["id"])
         Path(report.body_path).with_suffix(".model.json").unlink()
@@ -355,7 +355,7 @@ class TestExportAPI:
         res = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})
         h = {"X-Auth-Token": res.json()["token"]}
         reps = client.get(f"/api/sessions/{s.id}/reports", headers=h).json()["reports"]
-        final = [r for r in reps if r["kind"] == "final"][0]
+        final = next(r for r in reps if r["kind"] == "final")
         res = client.post(f"/api/sessions/{s.id}/reports/{final['id']}/export-pdf", headers=h)
         assert res.status_code == 200, res.text
         body = res.json()

@@ -25,9 +25,10 @@ import json
 import re
 import shutil
 import zipfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, BinaryIO, Callable
+from typing import Any, BinaryIO
 
 from app.browser_store import (
     EXT_FAILED,
@@ -160,7 +161,7 @@ class KDSpyManager:
         return self._install_payload(data, source="zip_upload")
 
     async def install_from_amo(
-        self, *, fetch: "Callable[[], Awaitable[bytes]] | None" = None
+        self, *, fetch: Callable[[], Awaitable[bytes]] | None = None
     ) -> ExtensionManifestInfo:
         """One-tap install: fetch the KDSpy Firefox add-on from Mozilla Add-ons.
 
@@ -235,7 +236,7 @@ class KDSpyManager:
                     seen_manifest = True
             if not seen_manifest:
                 raise ExtensionInstallError("manifest.json missing from upload")
-            info_obj = self._validate_staging(staging)
+            self._validate_staging(staging)
             self._swap_in(staging)
         except ExtensionInstallError:
             shutil.rmtree(staging, ignore_errors=True)
@@ -289,7 +290,7 @@ class KDSpyManager:
                     target = staging / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(zf.read(info))
-                info_obj = self._validate_staging(staging)
+                self._validate_staging(staging)
                 self._swap_in(staging)
             except ExtensionInstallError:
                 shutil.rmtree(staging, ignore_errors=True)

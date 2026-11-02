@@ -150,7 +150,7 @@ def estimate_evidence_ids(evidence_records: list[Any]) -> set[str]:
     return out
 
 
-def claim_is_estimate_backed(claim: "Claim", estimate_ids: set[str] | None) -> bool:
+def claim_is_estimate_backed(claim: Claim, estimate_ids: set[str] | None) -> bool:
     """True when a claim's ONLY support is extension-derived estimates.
 
     Such a claim is treated exactly like an unsupported one by the

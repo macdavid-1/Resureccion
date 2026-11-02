@@ -17,12 +17,14 @@ import json
 from typing import Any
 
 from app.methodology import (
-    PHASES_ALLOWING_EXTERNAL as EXTERNAL_PHASES,
     PHASE_ORDER,
     PHASE_TITLES,
     SPECS,
     PhaseTiming,
     depth_priority_text,
+)
+from app.methodology import (
+    PHASES_ALLOWING_EXTERNAL as EXTERNAL_PHASES,
 )
 
 

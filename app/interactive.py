@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
@@ -33,11 +34,11 @@ from app.browser_store import (
     AUTH_CONFIRMED,
     AUTH_LOGIN_REQUIRED,
     AUTH_UNKNOWN,
-    LoginWindowStore,
     WINDOW_CANCELLED,
     WINDOW_COMPLETED,
     WINDOW_EXPIRED,
     WINDOW_OPEN,
+    LoginWindowStore,
 )
 from app.config import Config
 from app.marketplace import Marketplace, get_marketplace, marketplace_from_url
@@ -265,7 +266,7 @@ class InteractiveSessionManager:
                 # failed" label sent every navigation failure to a
                 # nonexistent launch bug.
                 msg = str(exc)
-                if msg.startswith("navigation failed") or msg.startswith("navigation timeout"):
+                if msg.startswith(("navigation failed", "navigation timeout")):
                     raise InteractiveError(f"page open failed: {msg}") from exc
                 raise InteractiveError(f"browser launch failed: {msg}") from exc
             session.pages = [page]
@@ -292,7 +293,7 @@ class InteractiveSessionManager:
     # it to once per second per session.
     _DETECT_INTERVAL_SECONDS = 1.0
 
-    def _detect_amazon_signin(self, session: "InteractiveSession") -> None:
+    def _detect_amazon_signin(self, session: InteractiveSession) -> None:
         """Guard + throttle for the async sign-in watcher (see _watch_amazon_signin)."""
         if self.amazon_auth is None or session.purpose != "amazon_signin":
             return
@@ -333,7 +334,7 @@ class InteractiveSessionManager:
             detail,
         )
 
-    async def _watch_amazon_signin(self, session: "InteractiveSession") -> None:
+    async def _watch_amazon_signin(self, session: InteractiveSession) -> None:
         """Persist the durable Amazon auth state the moment it visibly changes.
 
         The active page is classified with the SAME DOM criteria as the

@@ -39,13 +39,13 @@ os.environ["BROWSER_HEADLESS"] = "true"
 os.environ.pop("BROWSER_PROXY", None)
 os.environ.setdefault("HOME", "/root")
 
-from app import config as config_mod  # noqa: E402
+from app import config as config_mod
 
 config_mod.get_config.cache_clear()
 
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from app.main import create_app  # noqa: E402
+from app.main import create_app
 
 app = create_app()
 ok = True

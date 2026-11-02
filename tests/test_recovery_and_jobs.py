@@ -51,7 +51,7 @@ def test_error_state_store(db) -> None:
 
 
 def test_recovery_manager_marks_transient(sessions, db) -> None:
-    events = EventLog(db)
+    EventLog(db)
     s1 = sessions.create(mode="auto")
     s2 = sessions.create(mode="auto")
     sessions.update(s1.id, status="running")

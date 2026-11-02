@@ -57,15 +57,15 @@ _LETTERS = "abcdefghklnoprstw"
 
 # Same-origin suggestion call inside the open marketplace page (Firefox
 # blocks cross-origin fetch; this mirrors app.frontier).
-_SUGGEST_JS = """async (q) => {
-  try {
-    const res = await fetch('/suggestion?alias=%s&prefix=' + encodeURIComponent(q),
-                            {headers: {'accept': 'application/json'}});
+_SUGGEST_JS = f"""async (q) => {{
+  try {{
+    const res = await fetch('/suggestion?alias={ALIAS}&prefix=' + encodeURIComponent(q),
+                            {{headers: {{'accept': 'application/json'}}}});
     if (!res.ok) return [];
     const data = await res.json();
     return (Array.isArray(data) && Array.isArray(data[1])) ? data[1].slice(0, 10) : [];
-  } catch (e) { return []; }
-}""" % ALIAS
+  }} catch (e) {{ return []; }}
+}}"""
 
 
 def competition_label(total: int | None) -> str:
