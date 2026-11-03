@@ -52,6 +52,7 @@ GROUND RULES (non-negotiable):
 6. Do not restate the whole dossier — ADD interpretation. The deterministic sections already carry the raw figures.
 7. KDSpy Pro numbers are third-party ESTIMATES, never measurements. If you mention one, say it is an estimate and lean on the measured evidence (search result totals, review counts, category paths) for any conclusion.
 8. "backend_research" per opportunity is measured: the Amazon result totals, competition labels and store category paths were captured by the browser. Interpret them — why a keyword looks winnable, which store category fits — without inventing any new figure.
+9. "finalist_candidates" lists every final candidate's measured counts, marketplace order and top keywords. Each one has its own playbook section in the report; do not repeat those sections, but you may say what the set of them has in common.
 
 Output ONLY the JSON object."""
 
@@ -117,6 +118,32 @@ def build_digest(model: dict[str, Any]) -> dict[str, Any]:
             "major_findings": ex.get("major_findings"),
         },
         "opportunities": opps,
+        # One entry per FINAL candidate: the measured playbook data exists for
+        # each of them, so the overview can refer to it without inventing it.
+        "finalist_candidates": [
+            {
+                "niche": s.get("niche"),
+                "derived_from_marketplace": s.get("marketplace_derived_from"),
+                "marketplaces_ranked": [
+                    m.get("code") for m in (s.get("marketplace_ranking") or [])
+                    if isinstance(m, dict)
+                ],
+                "keywords_measured": s.get("keywords_measured"),
+                "kindle_store_categories": len(
+                    (s.get("categories") or {}).get("kindle_store") or []
+                ),
+                "books_categories": len(
+                    (s.get("categories") or {}).get("books") or []
+                ),
+                "reviews_read": (s.get("review_findings") or {}).get("reviews_read"),
+                "top_keywords": [
+                    k.get("keyword") for k in (s.get("keywords") or [])[:5]
+                    if isinstance(k, dict)
+                ],
+            }
+            for s in (model.get("finalist_sections") or [])
+            if isinstance(s, dict)
+        ],
         "competitors": competitors,
         "consumer_intelligence": model.get("consumer_intelligence") or {},
         "candidate_ledger": model.get("candidate_ledger") or [],

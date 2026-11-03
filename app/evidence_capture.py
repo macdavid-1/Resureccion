@@ -379,6 +379,55 @@ async def _extract_product(page: Any) -> dict[str, Any]:
     return {k: v for k, v in data.items() if v not in (None, "", [])}
 
 
+async def _extract_review_snippets(page: Any, max_items: int = 4) -> list[dict[str, Any]]:
+    """Read the review text Amazon already rendered on a product page.
+
+    Used by the finalist deep dive: the same product pages it opens to read
+    category breadcrumbs also carry real customer reviews, so the report's
+    "how to beat the incumbents" section is grounded in what buyers actually
+    wrote instead of a separate, expensive navigation pass. Best-effort by
+    design — no reviews on the page simply yields an empty list.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        blocks = await page.query_selector_all("div[data-hook='review']")
+    except Exception:
+        blocks = []
+    asin_m = ASIN_RE.search(scrub_url(page.url or ""))
+    asin = asin_m.group(1) if asin_m else ""
+    for block in blocks[: max(1, int(max_items)) * 2]:
+        if len(out) >= max_items:
+            break
+        body = " ".join(
+            (
+                await _text_of_inner(
+                    block, "[data-hook='review-body'] span, [data-hook='review-body']"
+                )
+            ).split()
+        )
+        if not body:
+            continue
+        title = " ".join(
+            (
+                await _text_of_inner(
+                    block, "[data-hook='review-title'] span, [data-hook='review-title']"
+                )
+            ).split()
+        )
+        rating_txt = await _text_of_inner(
+            block, "i[data-hook='review-star-rating'] span, [data-hook='review-star-rating']"
+        )
+        out.append(
+            {
+                "asin": asin,
+                "rating": _parse_rating(rating_txt),
+                "title": title[:160],
+                "body": body[:600],
+            }
+        )
+    return out
+
+
 async def _extract_kdspy_panel(page: Any) -> dict[str, Any] | None:
     """Read the KDSpy panel the extension rendered, if present.
 

@@ -280,6 +280,12 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
 
     # ------------------------------------------------------ opportunities
     opps = model.get("opportunities", []) or []
+    # Candidates with their own playbook section carry the full measured
+    # detail there; the dossier cross-references it instead of repeating it.
+    playbook_section_for = {
+        str(s.get("candidate_id") or ""): s.get("index")
+        for s in (model.get("finalist_sections") or []) if isinstance(s, dict)
+    }
     h2("Opportunity Portfolio")
     if not opps:
         p("No opportunities passed adversarial verification in this session. "
@@ -342,7 +348,13 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
 
         # Finalist deep dive: measured backend keywords + BOTH store
         # category maps (Kindle Store and Books are different systems).
-        br = o.get("backend_research") or {}
+        cross_ref = playbook_section_for.get(str(o.get("candidate_id") or ""))
+        br = {} if cross_ref else (o.get("backend_research") or {})
+        if cross_ref:
+            p(
+                "Measured keywords, both store category maps and the ten premium "
+                f"titles for this candidate: see Final candidate {cross_ref}."
+            )
         bkw = [x for x in (br.get("keywords") or []) if isinstance(x, dict)]
         if bkw:
             dept = str(br.get("department") or "books")
@@ -407,6 +419,138 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
         ev = o.get("evidence_ids") or []
         if ev:
             p(f"Evidence trail: {', '.join(str(e) for e in ev[:12])}")
+
+    # ------------------------------------------- final candidate playbooks
+    # One section per final candidate: the measured tables (both category
+    # systems, the 20 ranked keywords, the marketplace order, the live review
+    # material) plus the prose the model wrote from exactly that data.
+    plays = model.get("finalist_playbooks", {}) or {}
+    sections = [
+        s for s in (model.get("finalist_sections") or []) if isinstance(s, dict)
+    ]
+    if sections:
+        h2("Final Candidate Playbooks")
+    for sec in sections:
+        pb = plays.get(str(sec.get("candidate_id") or "")) or {}
+        if not isinstance(pb, dict):
+            pb = {}
+        h3(f"Final candidate {sec.get('index')} — {sec.get('niche') or '—'}")
+        derived = str(sec.get("marketplace_derived_from") or "") or "not recorded"
+        p(
+            f"Derived from marketplace: {derived} · candidate status: "
+            f"{sec.get('status') or '—'} · measured live: "
+            f"{sec.get('keywords_measured', 0)} backend keyword(s), "
+            f"{len((sec.get('categories') or {}).get('kindle_store') or [])} "
+            "Kindle Store categories, "
+            f"{len((sec.get('categories') or {}).get('books') or [])} Books "
+            f"categories, "
+            f"{(sec.get('review_findings') or {}).get('reviews_read', 0)} review(s) "
+            "read live."
+        )
+        ranking = [r for r in (sec.get("marketplace_ranking") or []) if isinstance(r, dict)]
+        if ranking:
+            h3("Marketplace ranking — where this book is most likely to perform")
+            table(
+                ["Rank", "Marketplace", "Language / currency", "Why it is ranked here"],
+                [
+                    [
+                        r.get("rank"),
+                        f"{r.get('name', '')} ({r.get('code', '')})",
+                        f"{r.get('language', '')} / {r.get('currency', '')}".strip(" /"),
+                        str(r.get("basis") or "—"),
+                    ]
+                    for r in ranking
+                ],
+            )
+        if pb.get("marketplace_plan"):
+            p(pb["marketplace_plan"])
+        cats = sec.get("categories") or {}
+        for label, key in (("Kindle Store", "kindle_store"), ("Books store", "books")):
+            rows = [r for r in (cats.get(key) or []) if isinstance(r, dict)]
+            h3(f"{label} categories ({len(rows)} of {sec.get('category_target') or 10})")
+            if not rows:
+                p(f"No {label} category was observed for this candidate — nothing is guessed.")
+                continue
+            table(
+                ["#", label, "Where it was observed"],
+                [
+                    [r.get("rank"), r.get("category", "—"), r.get("breadcrumb", "—")]
+                    for r in rows
+                ],
+            )
+        if pb.get("category_plan"):
+            p(pb["category_plan"])
+        kws = [k for k in (sec.get("keywords") or []) if isinstance(k, dict)]
+        h3(
+            f"Backend keywords — {len(kws)} ranked for ranking potential and "
+            "low competition"
+        )
+        if kws:
+            table(
+                ["#", "Backend keyword", "Competition", "Amazon results",
+                 "Median reviews (top 10)", "Demand", "Marketplace"],
+                [
+                    [
+                        k.get("rank"),
+                        str(k.get("keyword") or "—"),
+                        str(k.get("competition") or "not measured"),
+                        _kw_total_txt(k),
+                        k.get("top10_review_median")
+                        if k.get("top10_review_median") is not None else "—",
+                        k.get("demand_score")
+                        if k.get("demand_score") is not None else "—",
+                        str(k.get("marketplace") or "—"),
+                    ]
+                    for k in kws
+                ],
+            )
+        else:
+            p("No backend keyword was measured for this candidate — no phrase is presented as validated.")
+        if pb.get("keyword_plan"):
+            p(pb["keyword_plan"])
+        titles = [t for t in (pb.get("titles") or []) if isinstance(t, dict)]
+        h3(f"Premium titles — {len(titles)} written from these keywords")
+        if titles:
+            table(
+                ["#", "Title", "Subtitle", "Targets keyword",
+                 "Why it ranks", "Why it converts"],
+                [
+                    [
+                        i, t.get("title", ""), t.get("subtitle", ""),
+                        t.get("targets_keyword", ""), t.get("why_it_ranks", ""),
+                        t.get("why_it_converts", ""),
+                    ]
+                    for i, t in enumerate(titles, 1)
+                ],
+            )
+            if pb.get("titles_shortfall"):
+                p(
+                    f"{len(titles)} of 10 titles survived grounding in this run — the "
+                    "rest cited a keyword that was not measured here or repeated "
+                    "an existing title."
+                )
+        else:
+            p("The research model did not produce grounded titles for this candidate — none was invented.")
+        findings = sec.get("review_findings") or {}
+        h3("How to beat the incumbent books — from their readers' reviews")
+        p(f"Source: {findings.get('source') or 'not captured in this session'}.")
+        for label, key in (
+            ("What readers praise (keep this)", "praises"),
+            ("What readers complain about", "complaints"),
+            ("Unmet needs", "unmet"),
+            ("What a better book would do", "design_opportunities"),
+        ):
+            items = findings.get(key) or []
+            if items:
+                li(f"{label}: {'; '.join(str(x) for x in items[:5])}")
+        for r in (findings.get("reviews") or [])[:3]:
+            if isinstance(r, dict) and str(r.get("body") or "").strip():
+                star = f"{r.get('rating')}★ " if r.get("rating") is not None else ""
+                quote(f"{star}{str(r.get('body')).strip()}")
+        if pb.get("beating_incumbents"):
+            p(pb["beating_incumbents"])
+        for note in (sec.get("research_notes") or []):
+            p(str(note))
 
     # ------------------------------------------------- consumer intelligence
     ci = model.get("consumer_intelligence", {}) or {}

@@ -38,7 +38,7 @@ from app.db import Database
 from app.events import EventLog
 from app.evidence_capture import EvidenceCollector
 from app.filters import CandidateFilterEngine
-from app.final_dive import FinalCandidateDive
+from app.final_dive import FinalCandidateDive, order_for_marketplace
 from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
@@ -3699,9 +3699,14 @@ class ResearchRunner:
         for cand in pending:
             if self._cancelled or self._pause_requested:
                 break
+            # Measure on the candidate's OWN marketplace first: result
+            # totals, review barriers and category trees are marketplace
+            # specific, and every section reports where its numbers came from.
             res = await dive.run(
                 session_id=session_id,
-                marketplaces=marketplaces,
+                marketplaces=order_for_marketplace(
+                    marketplaces, getattr(cand, "marketplace", "")
+                ),
                 niche=cand.niche,
                 candidate_id=cand.id,
             )
@@ -3728,6 +3733,7 @@ class ResearchRunner:
                     "keywords_measured": res.keywords_measured,
                     "books_categories": len(res.books_categories),
                     "kindle_categories": len(res.kindle_categories),
+                    "reviews_read": len(res.reviews),
                     "stopped_reason": res.stopped_reason,
                     **({"error": res.error} if res.error else {}),
                 },
@@ -3742,6 +3748,117 @@ class ResearchRunner:
             # the post-Phase-8 work). Distill the new measurements too, so
             # the next session never has to pay for them again.
             self._harvest_memory(session_id)
+
+    async def _finalist_playbooks(
+        self, session_id: str, model: Any
+    ) -> dict[str, Any]:
+        """Write each FINAL candidate's report section from its measured data.
+
+        One model call per candidate, isolated: a candidate whose reply breaks
+        grounding gets one corrective retry and then degrades to "no prose"
+        for that candidate only — never for the others, and never for the
+        report. The measured tables stand on their own either way.
+        """
+        from app.finalist_playbook import (
+            PLAYBOOK_FIELDS,
+            PLAYBOOK_SYSTEM,
+            build_playbook_digest,
+            correction_prompt,
+            digest_json,
+            normalize_playbook,
+            user_prompt,
+        )
+        from app.report_narrative import allowed_numbers
+
+        sections = [
+            s for s in (getattr(model, "finalist_sections", None) or [])
+            if isinstance(s, dict) and s.get("candidate_id")
+        ]
+        if not sections:
+            return {}
+        out: dict[str, Any] = {}
+        for sec in sections:
+            # No measured (or at least Amazon-suggested) phrase means there is
+            # nothing a title could honestly be built from — skip instead of
+            # inviting ungrounded titles.
+            if not [
+                k for k in (sec.get("keywords") or [])
+                if isinstance(k, dict) and str(k.get("keyword") or "").strip()
+            ]:
+                self.events.append(
+                    session_id, level="info", actor="agent",
+                    action="finalist_playbook_skipped",
+                    detail={
+                        "candidate_id": sec.get("candidate_id"),
+                        "reason": "no keyword was measured for this candidate",
+                    },
+                )
+                continue
+            try:
+                digest = digest_json(build_playbook_digest(sec))
+            except Exception:
+                continue
+            allowed = allowed_numbers(digest)
+            prompt = user_prompt(digest)
+            playbook: dict[str, Any] = {}
+            violations: list[str] = []
+            for attempt in (1, 2):
+                try:
+                    reply = await self.model.call(
+                        session_id,
+                        system=PLAYBOOK_SYSTEM,
+                        user=prompt,
+                        expect_fields=PLAYBOOK_FIELDS,
+                        label=(
+                            "Writing the production playbook for "
+                            f"{str(sec.get('niche') or '')[:60]}"
+                        ),
+                    )
+                except Exception as exc:  # CancelledError is BaseException
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="finalist_playbook_unavailable",
+                        detail={
+                            "candidate_id": sec.get("candidate_id"),
+                            "error": f"{type(exc).__name__}: {exc}"[:300],
+                        },
+                    )
+                    break  # this candidate keeps its measured tables only
+                try:
+                    self._record_model_usage(session_id, reply)
+                except Exception:
+                    pass
+                playbook, violations = normalize_playbook(
+                    getattr(reply, "content", None), allowed=allowed, section=sec
+                )
+                if playbook and not violations:
+                    break
+                if attempt == 1:
+                    prompt = correction_prompt(digest, violations, sec)
+            if not playbook:
+                self.events.append(
+                    session_id, level="info", actor="agent",
+                    action="finalist_playbook_skipped",
+                    detail={
+                        "candidate_id": sec.get("candidate_id"),
+                        "niche": str(sec.get("niche") or "")[:120],
+                        "violations": len(violations),
+                    },
+                )
+                continue
+            out[str(sec["candidate_id"])] = playbook
+            self.events.append(
+                session_id, level="info", actor="agent",
+                action="finalist_playbook_written",
+                detail={
+                    "candidate_id": sec.get("candidate_id"),
+                    "niche": str(sec.get("niche") or "")[:120],
+                    "titles": len(playbook.get("titles") or []),
+                    "sections": sorted(playbook.keys()),
+                    "figures_removed": len(violations),
+                },
+            )
+        return out
 
     async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         from app.report_model import build_report_model, render_markdown
@@ -3787,6 +3904,13 @@ class ResearchRunner:
             backlog=self._backlog_items(session_id),
             adjacency=self._adjacency_rows(session_id),
             evidence=self.evidence,
+            finalist_cap=int(getattr(self.config, "dive_max_candidates", 12)),
+            finalist_keyword_target=int(
+                getattr(self.config, "dive_max_keywords", 20)
+            ),
+            finalist_category_target=int(
+                getattr(self.config, "dive_max_categories", 10)
+            ),
         )
         # Analyst prose: the model interprets the verified records above;
         # it never computes a figure. Empty on any failure — the report
@@ -3794,6 +3918,12 @@ class ResearchRunner:
         narrative = await self._analyst_narrative(session_id, model)
         if narrative:
             model.narrative = narrative
+        # Per-final-candidate playbooks: written by the model from that
+        # candidate's measured data only (app.finalist_playbook). Degrades to
+        # the measured tables when a candidate's prose cannot be grounded.
+        playbooks = await self._finalist_playbooks(session_id, model)
+        if playbooks:
+            model.finalist_playbooks = playbooks
         body = render_markdown(model)
 
         # Adversarial validation of the deliverable: gates + per-opportunity

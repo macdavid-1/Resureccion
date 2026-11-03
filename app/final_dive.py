@@ -38,6 +38,7 @@ from urllib.parse import quote_plus
 from app.evidence_capture import (
     _extract_product,
     _extract_results_summary,
+    _extract_review_snippets,
     _extract_search_items,
 )
 from app.frontier import ALIAS, phrase_score, seeds_from_text
@@ -50,6 +51,11 @@ DEPARTMENT_PARAM = {"books": "stripbooks", "kindle": "digital-text"}
 # Competition buckets for a measured keyword (Amazon's total result count).
 LOW_COMPETITION_MAX = 5_000
 MEDIUM_COMPETITION_MAX = 25_000
+
+# Real customer reviews read per opened competitor product page (the page is
+# already open for its category breadcrumbs, so this costs no navigation).
+REVIEWS_PER_PRODUCT = 4
+MAX_REVIEW_SNIPPETS = 24
 
 # Letters appended to the most productive seed to surface long-tail buyer
 # phrases ("space facts book for k…") — bounded, deterministic order.
@@ -79,6 +85,33 @@ def competition_label(total: int | None) -> str:
     return "high"
 
 
+def competition_rank(total: int | None) -> int:
+    """Sort key: lowest competition first, unmeasured last.
+
+    The owner asks for keywords that can actually rank, so competition leads
+    the ordering and buyer demand breaks ties — a phrase nobody searches is
+    winnable but worthless.
+    """
+    label = competition_label(total)
+    return {"low": 0, "medium": 1, "high": 2}.get(label, 3)
+
+
+def order_for_marketplace(
+    marketplaces: list[Marketplace], code: str
+) -> list[Marketplace]:
+    """Put the candidate's OWN marketplace first, keeping the rest in order.
+
+    A candidate discovered on Amazon UK must be measured on Amazon UK: the
+    keyword totals, review barriers and category trees are marketplace
+    specific, and the report tells the owner which marketplace the numbers
+    came from.
+    """
+    wanted = [c.strip() for c in str(code or "").split(",") if c.strip()]
+    own = [m for m in (marketplaces or []) if m.code in wanted]
+    rest = [m for m in (marketplaces or []) if m.code not in wanted]
+    return own + rest
+
+
 def _median(values: list[int]) -> int | None:
     if not values:
         return None
@@ -102,6 +135,11 @@ class DiveResult:
     keywords: list[dict[str, Any]] = field(default_factory=list)
     books_categories: list[dict[str, Any]] = field(default_factory=list)
     kindle_categories: list[dict[str, Any]] = field(default_factory=list)
+    # Real customer reviews read off the competitor product pages opened for
+    # the Books category map — the raw material for "beat the incumbents".
+    reviews: list[dict[str, Any]] = field(default_factory=list)
+    review_evidence_id: str = ""
+    review_products_read: int = 0
     evidence_ids: list[str] = field(default_factory=list)
     phrases_mined: int = 0
     keywords_measured: int = 0
@@ -125,6 +163,9 @@ class DiveResult:
             "keywords": self.keywords,
             "books_categories": self.books_categories,
             "kindle_categories": self.kindle_categories,
+            "reviews": self.reviews,
+            "review_evidence_id": self.review_evidence_id,
+            "review_products_read": self.review_products_read,
             "evidence_ids": self.evidence_ids,
             "phrases_mined": self.phrases_mined,
             "keywords_measured": self.keywords_measured,
@@ -371,9 +412,13 @@ class FinalCandidateDive:
                 except Exception:
                     pass
 
-        # Measured first: buyer demand desc, then lightest competition, then
-        # the honest unmeasured tail (never a fabricated number).
+        # Lightest competition first (what actually lets a new book rank),
+        # then buyer demand, then the honest unmeasured tail (never a
+        # fabricated number).
         measured.sort(key=lambda d: (
+            competition_rank(
+                d.get("total_results") if isinstance(d.get("total_results"), int) else None
+            ),
             -int(d.get("demand_score") or 0),
             d.get("total_results") if isinstance(d.get("total_results"), int) else 10**12,
             d["keyword"].lower(),
@@ -422,13 +467,18 @@ class FinalCandidateDive:
         books: list[dict[str, Any]] = []
         kindle: list[dict[str, Any]] = []
         sources: list[str] = []
+        # Reviews are read from the SAME Books product pages the category map
+        # already opens, so the instruction "beat these books, from reviews"
+        # rests on live text without costing extra navigations.
+        review_state: dict[str, Any] = {"snippets": [], "products": 0}
         for store in ("books", "kindle"):
             if self._expired(deadline) or self.should_stop():
                 break
             if self.max_categories == 0:
                 break
             rows, urls = await self._categories_for_store(
-                mkt, res, store, deadline
+                mkt, res, store, deadline,
+                review_state=review_state if store == "books" else None,
             )
             if store == "books":
                 books = rows
@@ -437,8 +487,37 @@ class FinalCandidateDive:
             sources.extend(urls)
         res.books_categories = books
         res.kindle_categories = kindle
+        res.reviews = review_state["snippets"]
+        res.review_products_read = int(review_state["products"])
         if self._expired(deadline):
             res.stopped_reason = "budget_reached"
+        if res.reviews:
+            try:
+                rec = self.evidence_store.create(
+                    session_id=session_id,
+                    marketplace=mkt.code,
+                    kind="review_research",
+                    url=scrub_url(f"{mkt.base_url}/s?k={quote_plus(res.niche)}&i={DEPARTMENT_PARAM['books']}"),
+                    title=f"competitor reviews read for {res.niche[:120]}",
+                    data={
+                        "niche": res.niche,
+                        "products_read": res.review_products_read,
+                        "reviews": res.reviews,
+                        "ranked_by": (
+                            "reviews of the top Books-store competitors that "
+                            "rank for this niche, read live"
+                        ),
+                        "note": (
+                            "Verbatim customer review text captured from the "
+                            "pages the category map opened; complaints and "
+                            "praises here are quoted, not inferred"
+                        ),
+                    },
+                )
+                res.review_evidence_id = str(rec.id)
+                res.evidence_ids.append(str(rec.id))
+            except Exception:
+                pass  # reviews are already in hand; persistence is additive
         if not books and not kindle:
             return
         try:
@@ -470,6 +549,7 @@ class FinalCandidateDive:
         res: DiveResult,
         store: str,
         deadline: float,
+        review_state: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Up to `max_categories` real categories for one Amazon store."""
         dept = DEPARTMENT_PARAM[store]
@@ -517,6 +597,15 @@ class FinalCandidateDive:
                     continue
                 res.pages_opened += 1
                 prod = await _extract_product(page)
+                if review_state is not None:
+                    review_state["products"] = int(review_state.get("products", 0)) + 1
+                    for snip in await _extract_review_snippets(
+                        page, REVIEWS_PER_PRODUCT
+                    ):
+                        if len(review_state["snippets"]) >= MAX_REVIEW_SNIPPETS:
+                            break
+                        snip = {**snip, "asin": snip.get("asin") or prod.get("asin") or asin}
+                        review_state["snippets"].append(snip)
                 crumbs = [str(c).strip() for c in (prod.get("category_path") or [])]
                 add(
                     crumbs,

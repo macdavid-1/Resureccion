@@ -220,9 +220,12 @@ class TestRunnerWiring:
                 self.labels: list[str | None] = []
 
             async def call(self, session_id, *, system, user, **k):
-                # The post-research narrative call opens its own thought in
-                # the real client; this double only plays phase calls.
-                if user.startswith("SESSION DATA (verified"):
+                # Post-research report-writing calls (analyst narrative,
+                # finalist playbooks) open their own thought in the real
+                # client; this double only plays research-phase calls.
+                from app.finalist_playbook import PLAYBOOK_PROMPT_PREFIX
+
+                if user.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX)):
                     return await super().call(session_id, system=system, user=user, **k)
                 self.labels.append(k.get("label"))
                 tid = self.thoughts.begin(session_id, label=k.get("label") or "Thinking")

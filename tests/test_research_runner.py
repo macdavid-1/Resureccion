@@ -351,9 +351,12 @@ async def test_vision_screenshot_attached_to_every_research_call(db, config, ses
             self.shots: list[Any] = []
 
         async def call(self, session_id: str, *, system: str, user: str, **k: Any) -> Any:
-            # The post-research narrative call is not a research call: it
-            # runs after every phase and never receives the screen.
-            if not user.startswith("SESSION DATA (verified"):
+            # Post-research report-writing calls (analyst narrative,
+            # finalist playbooks) are not research calls: they run after
+            # every phase, from measured data, and never receive the screen.
+            from app.finalist_playbook import PLAYBOOK_PROMPT_PREFIX
+
+            if not user.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX)):
                 self.shots.append(k.get("screenshot_png"))
             return await super().call(session_id, system=system, user=user, **k)
 

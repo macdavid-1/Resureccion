@@ -256,11 +256,14 @@ async def test_runner_injects_owner_message_without_interruption(db, config, sid
     # every prompt after consumption must — zero context loss from then on.
     assert model.prompts_seen, "model was called"
     assert "focus on grief journals" not in model.prompts_seen[0]
-    # The post-research narrative call is not a research prompt and never
-    # carries guidance — scope the assertion to the phase calls.
+    # Post-research report-writing prompts (analyst narrative, finalist
+    # playbooks) are not research prompts and never carry guidance — scope
+    # the assertion to the phase calls.
+    from app.finalist_playbook import PLAYBOOK_PROMPT_PREFIX
+
     after = [
         p for p in model.prompts_seen[1:]
-        if not p.startswith("SESSION DATA (verified")
+        if not p.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX))
     ]
     assert after, "runner kept iterating after the message arrived"
     assert all("focus on grief journals" in p and "OWNER GUIDANCE" in p for p in after)
