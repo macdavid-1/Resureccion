@@ -32,7 +32,12 @@ import json
 import re
 from typing import Any
 
+from app.prompts import owner_precedence_block
+
 NARRATIVE_FIELDS = ("overview", "opportunity_analyses", "risks")
+
+# The owner outranks these defaults, exactly as in the research phases.
+OWNER_PRECEDENCE = owner_precedence_block(notes_field=False)
 
 NARRATIVE_SYSTEM = """You are a senior market-intelligence analyst writing for a non-developer publisher.
 
@@ -53,8 +58,11 @@ GROUND RULES (non-negotiable):
 7. KDSpy Pro numbers are third-party ESTIMATES, never measurements. If you mention one, say it is an estimate and lean on the measured evidence (search result totals, review counts, category paths) for any conclusion.
 8. "backend_research" per opportunity is measured: the Amazon result totals, competition labels and store category paths were captured by the browser. Interpret them — why a keyword looks winnable, which store category fits — without inventing any new figure.
 9. "finalist_candidates" lists every final candidate's measured counts, marketplace order and top keywords. Each one has its own playbook section in the report; do not repeat those sections, but you may say what the set of them has in common.
+10. "research_notes" are the notes YOU wrote during the research run, for things no phase field could hold. Use them as your own memory: they explain dead ends, quirks and judgments the data alone does not show. They are annotations, not measurements — never present a note as evidence, and never introduce a figure that only a note mentions.
 
 Output ONLY the JSON object."""
+
+NARRATIVE_SYSTEM = NARRATIVE_SYSTEM + "\n\n" + OWNER_PRECEDENCE
 
 
 # ------------------------------------------------------------------- digest
@@ -143,6 +151,18 @@ def build_digest(model: dict[str, Any]) -> dict[str, Any]:
             }
             for s in (model.get("finalist_sections") or [])
             if isinstance(s, dict)
+        ],
+        # The model's own notes from the research run: things the phase
+        # contracts had no field for. Its annotations, not measurements.
+        "research_notes": [
+            {
+                "phase": n.get("phase"),
+                "phase_title": n.get("phase_title"),
+                "niche": n.get("niche"),
+                "text": str(n.get("text") or "")[:600],
+            }
+            for n in (model.get("research_notes") or [])[:60]
+            if isinstance(n, dict)
         ],
         "competitors": competitors,
         "consumer_intelligence": model.get("consumer_intelligence") or {},

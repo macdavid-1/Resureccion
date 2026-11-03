@@ -83,6 +83,7 @@ from app.research_data import (
     EvidenceStore,
     ObservationStore,
     OpportunityStore,
+    ResearchNoteStore,
     VerificationStore,
 )
 from app.sessions import SessionStore
@@ -120,6 +121,11 @@ from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
 # after the retries is salvaged and flows through the normal gate machinery.
 # A missing field is a degraded iteration — research NEVER pauses for it.
 _CONTRACT_REPAIR_ATTEMPTS = 1
+
+# Notes accepted from a single model reply (the session-wide cap lives in
+# app.research_data.MAX_NOTES_PER_SESSION). Bounded so one runaway reply cannot
+# flood the session or the report.
+_MAX_NOTES_PER_REPLY = 12
 
 # Unexpected errors inside a run are RECOVERED this many times before the
 # session is marked failed. The retry re-enters the methodology at its
@@ -319,6 +325,9 @@ class ResearchRunner:
         self.candidates = candidates
         self.evidence = evidence
         self.observations = observations
+        # Free-form notes the model writes during research (the escape hatch
+        # for what no phase field holds). They reach the final report.
+        self.notes = ResearchNoteStore(db)
         self.opportunities = opportunities
         self.artifacts = artifacts
         self.browser = browser
@@ -474,6 +483,72 @@ class ResearchRunner:
             pass
 
     # ---------------------------------------------------------- usage/cost
+    # ------------------------------------------------------------------ notes
+    def _capture_notes(self, session_id: str, phase: str, content: Any) -> int:
+        """Persist the model's free-form notes from one reply.
+
+        The phase output contracts name only what the backend can store
+        structurally (signals, niches, maps, verdicts). Everything else the
+        model learned — a dead end, a category quirk, a promising tangent, an
+        owner instruction it had to override — would vanish between phases and
+        never reach the report. `notes` is that escape hatch.
+
+        Additive by construction: a malformed note is skipped, an identical
+        note is stored once, the session total is bounded, and nothing here
+        can fail a run.
+        """
+        raw = content.get("notes") if isinstance(content, dict) else None
+        if not raw:
+            return 0
+        if isinstance(raw, (str, dict)):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return 0
+        stored = 0
+        for item in raw[:_MAX_NOTES_PER_REPLY]:
+            text = niche = ""
+            kind = "note"
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, dict):
+                text = str(item.get("text") or item.get("note") or "")
+                niche = str(item.get("niche") or "")
+                kind = str(item.get("kind") or "note")
+            if not text.strip():
+                continue
+            try:
+                _note, outcome = self.notes.add(
+                    session_id, text=text, phase=phase, niche=niche, kind=kind,
+                )
+            except Exception as exc:
+                self.events.append(
+                    session_id, level="warn", actor="model",
+                    action="notes_write_failed",
+                    detail={"phase": phase,
+                            "error": f"{type(exc).__name__}: {exc}"[:200]},
+                )
+                break
+            if outcome == "stored":
+                stored += 1
+            elif outcome == "full":
+                # Say it once, instead of silently swallowing every later note.
+                if not getattr(self, "_notes_cap_reported", False):
+                    self._notes_cap_reported = True
+                    self.events.append(
+                        session_id, level="warn", actor="model",
+                        action="notes_budget_spent",
+                        detail={"phase": phase,
+                                "note": "this session's note budget is spent; "
+                                        "later notes are not stored"},
+                    )
+                break
+        if stored:
+            self.events.append(
+                session_id, level="info", actor="model", action="notes_written",
+                detail={"phase": phase, "notes": stored},
+            )
+        return stored
+
     def _record_model_usage(self, session_id: str, reply: Any) -> None:
         """Checkpoint this session's cumulative token/cost usage (durable).
 
@@ -1076,6 +1151,9 @@ class ResearchRunner:
                 # limiter forces the phase open with whatever best output it
                 # has; the session keeps running — it never pauses here.
                 continue
+            # Anything the model noted that no contract field can hold is
+            # stored durably here and replayed into the final report.
+            self._capture_notes(session_id, phase, reply.content)
             # Durable per-run token/cost accounting (exposed on the session).
             self._record_model_usage(session_id, reply)
             if reply.elapsed_seconds and reply.elapsed_seconds >= 150:
@@ -3911,6 +3989,9 @@ class ResearchRunner:
             finalist_category_target=int(
                 getattr(self.config, "dive_max_categories", 10)
             ),
+            # Everything the model noted during research, for the report and
+            # the writing stages that follow.
+            notes=self.notes.list(session_id, limit=500),
         )
         # Analyst prose: the model interprets the verified records above;
         # it never computes a figure. Empty on any failure — the report

@@ -673,6 +673,30 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
             ],
         )
 
+    # ------------------------------------------- research notes (model-written)
+    run_notes = model.get("research_notes", []) or []
+    if run_notes:
+        h2("Research Notes Written During the Run")
+        p(
+            "The research model wrote these notes as it worked — the things the "
+            "phase contracts have no field for: dead ends, quirks, tangents, "
+            "judgments it wanted to keep, and any instruction of mine it had "
+            "to override. They are the model's own annotations, not "
+            "measurements; every figure the report treats as fact is in the "
+            "evidence records."
+        )
+        for n in run_notes[:120]:
+            tag = str(n.get("phase_title") or "during research")
+            if n.get("niche"):
+                tag += f" · {n['niche']}"
+            li(f"{tag} — {n.get('text', '')}")
+        total = int(model.get("research_notes_total") or 0)
+        if total > len(run_notes):
+            p(
+                f"{total - len(run_notes)} further note(s) are stored with this "
+                "session and were not repeated here."
+            )
+
     # --------------------------------------------------------- methodology
     trace = model.get("methodology_trace", []) or []
     if trace:

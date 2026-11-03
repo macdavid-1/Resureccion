@@ -96,6 +96,21 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id, created_at);
 
+-- Free-form notes the research model writes during the run: what it learned
+-- that the phase contracts have no field for. Kept apart from observations on
+-- purpose — notes are the model's own annotations, never evidence, so they
+-- must not satisfy any evidence or observation floor.
+CREATE TABLE IF NOT EXISTS research_notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id),
+    created_at TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT '',
+    niche TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'note',
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_session ON research_notes(session_id, created_at);
+
 CREATE TABLE IF NOT EXISTS evidence (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES research_sessions(id),

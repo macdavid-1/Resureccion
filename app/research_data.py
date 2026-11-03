@@ -235,6 +235,137 @@ class ObservationStore:
         )
 
 
+MAX_NOTE_CHARS = 1500
+MAX_NOTES_PER_SESSION = 400
+
+
+@dataclass
+class ResearchNote:
+    """One free-form note the research model wrote during the run."""
+
+    id: str
+    session_id: str
+    created_at: str
+    phase: str
+    niche: str
+    kind: str
+    text: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "phase": self.phase,
+            "niche": self.niche,
+            "kind": self.kind,
+            "text": self.text,
+        }
+
+
+class ResearchNoteStore:
+    """Durable notes channel for the researching model.
+
+    The phase output contracts name the fields the backend can store
+    structurally (signals, niches, competitive maps, …). Everything else the
+    model notices — a dead end, an odd category quirk, an idea that has no
+    field yet — would be lost between phases and never reach the report. These
+    notes are that escape hatch.
+
+    They are deliberately NOT observations: a note is the model's own
+    annotation, so it must never satisfy an evidence/observation floor or any
+    quality gate. Identical notes are stored once, and the session total is
+    bounded.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def add(
+        self,
+        session_id: str,
+        *,
+        text: str,
+        phase: str = "",
+        niche: str = "",
+        kind: str = "note",
+    ) -> tuple[ResearchNote | None, str]:
+        """Store one note. Returns (note, outcome).
+
+        outcome is "stored", "duplicate" (identical text already present) or
+        "full" (the session's bounded note budget is spent). Nothing raises
+        for a bad note: notes are additive, research never stops for them.
+        """
+        cleaned = " ".join(str(text or "").split())[:MAX_NOTE_CHARS].strip()
+        if not cleaned:
+            return None, "empty"
+        with self.db.read() as conn:
+            existing = conn.execute(
+                "SELECT * FROM research_notes WHERE session_id = ? AND text = ? LIMIT 1",
+                (session_id, cleaned),
+            ).fetchone()
+            if existing is not None:
+                return self._row(existing), "duplicate"
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_notes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if int(total["n"]) >= MAX_NOTES_PER_SESSION:
+            return None, "full"
+        note = ResearchNote(
+            id=new_id(),
+            session_id=session_id,
+            created_at=iso_now(),
+            phase=str(phase or "")[:60],
+            niche=str(niche or "")[:200],
+            kind=str(kind or "note")[:40],
+            text=cleaned,
+        )
+        with self.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO research_notes (id, session_id, created_at, phase, "
+                "niche, kind, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    note.id, note.session_id, note.created_at, note.phase,
+                    note.niche, note.kind, note.text,
+                ),
+            )
+        return note, "stored"
+
+    def list(
+        self, session_id: str, *, limit: int = 500, phase: str = ""
+    ) -> list[ResearchNote]:
+        query = "SELECT * FROM research_notes WHERE session_id = ?"
+        params: list[Any] = [session_id]
+        if phase:
+            query += " AND phase = ?"
+            params.append(phase)
+        query += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(limit)
+        with self.db.read() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row(r) for r in rows]
+
+    def count(self, session_id: str) -> int:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_notes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def _row(self, row: sqlite3.Row) -> ResearchNote:
+        return ResearchNote(
+            id=row["id"],
+            session_id=row["session_id"],
+            created_at=row["created_at"],
+            phase=row["phase"],
+            niche=row["niche"],
+            kind=row["kind"],
+            text=row["text"],
+        )
+
+
 class EvidenceStore:
     def __init__(self, db: Database) -> None:
         self.db = db

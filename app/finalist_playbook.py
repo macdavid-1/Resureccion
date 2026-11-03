@@ -34,6 +34,7 @@ import json
 import re
 from typing import Any
 
+from app.prompts import owner_precedence_block
 from app.report_narrative import allowed_numbers, ground_text
 
 PLAYBOOK_FIELDS = (
@@ -76,8 +77,14 @@ GROUND RULES (non-negotiable):
 4. Numbers in a TITLE or SUBTITLE are editorial only (for example "101 Facts"). Never put a statistic in a title — no review counts, no result totals, no prices.
 5. Plain language for a non-developer. Markdown body text only: no headings, no JSON, no field names, no code identifiers.
 6. Reviews are the readers' words, not yours: when you use one, attribute it as a reader observation rather than restating it as a fact about the market.
+7. "notes" are the notes YOU wrote earlier in this research run about this candidate or the run as a whole. Treat them as your own memory: they explain dead ends, quirks and judgments the measured rows cannot show. They are annotations, not measurements — never quote a figure that only a note mentions.
 
 Output ONLY the JSON object."""
+
+# The owner outranks these defaults, exactly as in the research phases.
+PLAYBOOK_SYSTEM = PLAYBOOK_SYSTEM + "\n\n" + owner_precedence_block(
+    notes_field=False
+)
 
 
 # ------------------------------------------------------------------- digest
@@ -179,6 +186,13 @@ def build_playbook_digest(section: dict[str, Any]) -> dict[str, Any]:
             if isinstance(c, dict)
         ],
         "title_seeds": list(section.get("title_seeds") or []),
+        # The model's own notes from the research run that concern this
+        # candidate (or the run as a whole).
+        "notes": [
+            {"phase": n.get("phase"), "text": n.get("text")}
+            for n in (section.get("model_notes") or [])
+            if isinstance(n, dict) and n.get("text")
+        ],
         "research_notes": list(section.get("research_notes") or []),
     }
 

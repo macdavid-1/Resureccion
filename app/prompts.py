@@ -44,10 +44,62 @@ def _compact(value: Any, limit: int = 2400) -> str:
 _DIGEST_RECORD_LIMIT = 900
 
 
+# ------------------------------------------------------- owner precedence
+def owner_precedence_block(*, notes_field: bool = True) -> str:
+    """The owner-over-defaults rule, shared by every system prompt.
+
+    The owner of the research outranks the defaults in these prompts: their
+    brief, their mid-run messages, any input at all wins a conflict. The only
+    exception is input that is evidently a mistake — then the model keeps to
+    the default and says so, instead of silently doing something nobody meant.
+    """
+    discrepancy = (
+        'Record the discrepancy in "notes" (the optional top-level key) so '
+        "the owner can correct you."
+        if notes_field else
+        "Do not silently absorb it: say so in one sentence, in the part of "
+        "your answer where it belongs, so the owner can correct you."
+    )
+    return (
+        "OWNER PRECEDENCE — this rule outranks everything below it:\n"
+        "The owner of this research is the authority on this run. Every "
+        "instruction in this prompt is a DEFAULT, not a law.\n"
+        "- If anything the owner says — the brief, a posted message, a "
+        "correction, a preference, a direction, an objection, any input at "
+        "all, at any time — contradicts, narrows or overrides anything in "
+        "this prompt, directly or indirectly, FOLLOW THE OWNER, even when "
+        "you believe the default would be better.\n"
+        "- The one exception: if the owner's input is evidently a MISTAKE — a "
+        "typo, a slipped word, a contradiction with what they said moments "
+        "earlier, a request that cannot be what they meant — do NOT silently "
+        "obey it. Keep to the instruction it contradicted. " + discrepancy + "\n"
+        "- Silence is not a contradiction: where the owner said nothing, "
+        "these instructions stand.\n"
+    )
+
+
+NOTES_INSTRUCTION = (
+    "NOTES — the escape hatch for what no field holds:\n"
+    "The output contract names what the backend can store structurally. You "
+    "will learn other things that fit no field: a dead end worth remembering, "
+    "a quirk in a category tree, a promising tangent, why a niche is softer "
+    "than it looks, a conflict between the owner and these instructions. Put "
+    "them in the OPTIONAL top-level key \"notes\": a list of short strings, or "
+    "objects {\"text\": \"…\", \"niche\": \"…\", \"kind\": \"…\"}.\n"
+    "Notes are stored durably, travel with the session, and are handed back "
+    "to you when the final report is written — write them for your future "
+    "self, in your own words. Never put a fabricated figure in a note: notes "
+    "are annotations, never evidence, and no note may claim a measurement you "
+    "did not capture."
+)
+
+
 def build_system_prompt(phase: str) -> str:
     spec = SPECS[phase]
     return (
-        "You are the reasoning core of Resurrección, a rigorous KDP market "
+        owner_precedence_block()
+        + "\n"
+        + "You are the reasoning core of Resurrección, a rigorous KDP market "
         "research agent. You operate INSIDE a fixed, deterministic research "
         "methodology; you do not invent your own process. You are now in "
         f"{PHASE_TITLES[phase]}.\n\n"
@@ -84,6 +136,7 @@ def build_system_prompt(phase: str) -> str:
         "and continue, or try another marketplace/page. When reviews or "
         "other data are visible without signing in, capture them.\n"
         "- Convert observations into concrete, actionable judgments.\n"
+        "- " + NOTES_INSTRUCTION.replace("\n", " ") + "\n"
         "- PHASE SWITCHING: you may leave this phase at will and jump to any "
         "other phase of the methodology — the usual reason is that "
         "verification left the owner's niche target unmet and discovery must "
@@ -110,7 +163,8 @@ def build_system_prompt(phase: str) -> str:
             )
             if phase in EXTERNAL_PHASES else ""
         )
-        + f"Required output JSON fields: {', '.join(spec.output_contract)}.\n"
+        + f"Required output JSON fields: {', '.join(spec.output_contract)}. "
+        "Optional keys: 'actions', 'activity_note', 'goto_phase', 'notes'.\n"
         f"Phase guidance: {spec.guidance}"
     )
 
@@ -288,9 +342,12 @@ def build_user_prompt(
     if owner_messages:
         rendered = [f"[new] {m}" if i == len(owner_messages) - 1 else m for i, m in enumerate(owner_messages)]
         parts.append(
-            "\nOWNER GUIDANCE (direct messages from the session owner; they "
-            "remain authoritative for the rest of the research — follow any "
-            "new instruction in your next actions and analyses): "
+            "\nOWNER GUIDANCE (direct messages from the session owner). They "
+            "remain authoritative for the rest of the research and outrank "
+            "the system instructions above wherever they conflict — follow "
+            "any new instruction in your next actions and analyses, unless "
+            "the message is evidently a mistake (then keep to the "
+            "instructions and record the discrepancy in 'notes'): "
             + _compact(rendered, limit=2000)
         )
 
@@ -318,7 +375,10 @@ def build_user_prompt(
     parts.append(
         "\nRESPOND WITH JSON ONLY, an object with exactly these keys: "
         + _compact(list(spec.output_contract))
-        + " — plus optional key 'actions': a list of browser actions you want "
+        + " — plus optional key 'notes' (your free-form notes for this run, "
+        "including anything you learned that no field holds and any owner "
+        "instruction you had to override), and optional key 'actions': "
+        "a list of browser actions you want "
         "executed BEFORE your next analysis, each "
         '{"action": "<one of the allowed actions>", "args": {...}}. '
         "If 'actions' is present and non-empty this is an EXPLORE step: the "

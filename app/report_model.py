@@ -94,6 +94,12 @@ class ReportModel:
     # (app.finalist_playbook), keyed by candidate id.
     finalist_sections: list[dict[str, Any]] = field(default_factory=list)
     finalist_playbooks: dict[str, Any] = field(default_factory=dict)
+    # Free-form notes the model wrote DURING the run, for everything the phase
+    # contracts have no field for. Rendered as the model's own annotations
+    # (never as measurements) so the owner sees what the research learned
+    # beyond the schema.
+    research_notes: list[dict[str, Any]] = field(default_factory=list)
+    research_notes_total: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +121,8 @@ class ReportModel:
             "narrative": self.narrative,
             "finalist_sections": self.finalist_sections,
             "finalist_playbooks": self.finalist_playbooks,
+            "research_notes": self.research_notes,
+            "research_notes_total": self.research_notes_total,
         }
 
     def to_json(self) -> str:
@@ -127,6 +135,7 @@ class ReportModel:
             "opportunities", "competitors", "candidate_ledger",
             "adjacent_ledger", "headroom_ranking", "methodology_trace",
             "focus_pivots", "evidence_appendix", "finalist_sections",
+            "research_notes",
         )
         for f in (
             "schema_version", "session", "generated_at", "executive_summary",
@@ -134,9 +143,14 @@ class ReportModel:
             "candidate_ledger", "adjacent_ledger", "headroom_ranking",
             "methodology_trace", "focus_pivots", "evidence_appendix",
             "quality_statement", "validation", "narrative",
-            "finalist_sections", "finalist_playbooks",
+            "finalist_sections", "finalist_playbooks", "research_notes",
+            "research_notes_total",
         ):
-            default: Any = [] if f in list_fields else {}
+            default: Any = (
+                [] if f in list_fields
+                else 0 if f in ("schema_version", "research_notes_total")
+                else {}
+            )
             setattr(m, f, data.get(f, default))
         return m
 
@@ -162,6 +176,7 @@ def build_report_model(
     finalist_cap: int = 12,
     finalist_keyword_target: int = PLAYBOOK_KEYWORD_TARGET,
     finalist_category_target: int = PLAYBOOK_CATEGORY_TARGET,
+    notes: list[Any] | None = None,
 ) -> ReportModel:
     """Assemble the structured report model from durable state. Deterministic."""
     ws = dict(whitespace_by_candidate or {})
@@ -279,6 +294,7 @@ def build_report_model(
         })
 
     # ------------------------------------------------------------- sections
+    note_rows, note_total = _note_rows(notes)
     counts = sessions.counts(session_id)
     model = ReportModel(
         session={
@@ -311,6 +327,7 @@ def build_report_model(
             cap=finalist_cap,
             keyword_target=finalist_keyword_target,
             category_target=finalist_category_target,
+            run_notes=note_rows,
         ),
         candidate_ledger=_ledger(cands),
         adjacent_ledger=_adjacent_ledger(
@@ -326,6 +343,8 @@ def build_report_model(
             counts, cands, verifications, session_id, assessments, claims,
             focus_pivots=focus_pivots,
         ),
+        research_notes=note_rows,
+        research_notes_total=note_total,
     )
     return model
 
@@ -849,6 +868,47 @@ def _dive_index(ev_rows: list[Any]) -> dict[str, dict[str, Any]]:
 # measurement (app.final_dive); this module only orders and joins them. The
 # prose inside each section is written by the model from exactly this data
 # (app.finalist_playbook) and is never allowed to invent a figure.
+def _note_rows(
+    notes: list[Any] | None, limit: int = 120
+) -> tuple[list[dict[str, Any]], int]:
+    """Normalize the model's run notes for the report (bounded).
+
+    Accepts the store's ResearchNote objects or plain dicts (re-rendered
+    models). Notes are annotations the model wrote for itself during the run;
+    they are rendered attributed to it, never as measurements.
+    """
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for n in notes or []:
+        if isinstance(n, dict):
+            text = str(n.get("text") or n.get("content") or "").strip()
+            phase = str(n.get("phase") or "")
+            niche = str(n.get("niche") or "")
+            kind = str(n.get("kind") or "note")
+            created = str(n.get("created_at") or "")
+        else:
+            text = str(getattr(n, "text", "") or "").strip()
+            phase = str(getattr(n, "phase", "") or "")
+            niche = str(getattr(n, "niche", "") or "")
+            kind = str(getattr(n, "kind", "") or "note")
+            created = str(getattr(n, "created_at", "") or "")
+        if not text:
+            continue
+        total += 1
+        if len(rows) >= limit:
+            continue
+        rows.append({
+            "index": len(rows) + 1,
+            "phase": phase,
+            "phase_title": PHASE_TITLES.get(phase, phase) or "during research",
+            "niche": niche,
+            "kind": kind,
+            "text": text,
+            "created_at": created,
+        })
+    return rows, total
+
+
 def _competition_rank(label: Any) -> int:
     return _COMPETITION_RANK.get(str(label or "").strip().lower(), 3)
 
@@ -1077,6 +1137,7 @@ def _finalist_sections(
     cap: int = 12,
     keyword_target: int = PLAYBOOK_KEYWORD_TARGET,
     category_target: int = PLAYBOOK_CATEGORY_TARGET,
+    run_notes: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """One complete, measurable section per final candidate.
 
@@ -1188,6 +1249,18 @@ def _finalist_sections(
             "review_findings": findings,
             "incumbents": incumbents,
             "title_seeds": seeds,
+            # The model's OWN earlier notes that concern this candidate (or
+            # none in particular) travel into the playbook prompt, so the
+            # writing stage can use what the research stage learned.
+            "model_notes": [
+                {"phase": n.get("phase"), "text": n.get("text")}
+                for n in (run_notes or [])
+                if isinstance(n, dict) and n.get("text")
+                and (
+                    not n.get("niche")
+                    or _niche_matches(str(n.get("niche") or ""), niche)
+                )
+            ][:8],
             "differentiation": str(meta.get("differentiation") or ""),
             "market_gap": str(meta.get("market_gap") or ""),
             "positioning": str(
@@ -2316,6 +2389,32 @@ def render_markdown(model: ReportModel) -> str:
         a("")
         for line in str(narrative["risks"]).splitlines():
             a(line)
+        a("")
+
+    # ------------------------------------------- research notes (model-written)
+    if model.research_notes:
+        a("## Research notes written during the run")
+        a("")
+        a(
+            "The research model wrote these notes as it worked — the things the "
+            "phase contracts have no field for: dead ends, quirks, tangents, "
+            "judgments it wanted to keep, and any instruction of mine it had "
+            "to override. They are the model's own annotations, not "
+            "measurements; every figure the report treats as fact is in the "
+            "evidence records above."
+        )
+        a("")
+        for n in model.research_notes:
+            tag = n.get("phase_title") or "during research"
+            if n.get("niche"):
+                tag += f" · {n['niche']}"
+            a(f"- **{tag}** — {n.get('text', '')}")
+        if model.research_notes_total > len(model.research_notes):
+            a(
+                f"- *{model.research_notes_total - len(model.research_notes)} "
+                "further note(s) are stored with this session and were not "
+                "repeated here.*"
+            )
         a("")
 
     # ------------------------------------------------------------ methodology
