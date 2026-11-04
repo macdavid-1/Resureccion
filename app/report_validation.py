@@ -290,23 +290,35 @@ class ReportValidator:
 
     @staticmethod
     def _redaction_scan(body: str) -> list[str]:
-        """Scan rendered report text for credential-shaped assignments that
-        redact() would have removed. We render the body through redact-parsed
-        JSON to detect key-shaped leaks deterministically."""
+        """Scan rendered report text for leaked credentials.
 
-        # Simulate: if the body contained `key: value` pairs with forbidden
-        # key names, they would appear as plain text. Detect the key names.
+        A leak is a forbidden key name assigned a CREDENTIAL-SHAPED value —
+        a long unbroken token. The old check fired on any word followed by a
+        colon, so a real KDP report mentioning a competitor title like
+        'Password: A Memoir' (or 'Cookie: 100 Recipes' in a baking niche) was
+        downgraded to PROVISIONAL over prose. That cost the owner the FINAL
+        status for a false positive, which is its own kind of dishonesty.
+        """
+        import re
+
         forbidden = ("authorization", "cookie", "set-cookie", "session-token",
                      "x-amz-security-token", "password", "api_key", "bearer")
         low = body.lower()
-        leaks = []
+        leaks: list[str] = []
         for f in forbidden:
-            if f + ":" in low or f + "=" in low or f + '":' in low:
-                # Confirm it is a real assignment, not prose mentioning the word.
-                import re
-
-                if re.search(rf"{re.escape(f)}\s*[:=]\s*\S", low):
-                    leaks.append(f)
+            key = re.escape(f)
+            # A leaked credential is either an explicit Bearer token
+            # ('authorization: Bearer sk-…', any length) or a long unbroken
+            # token value. A word that merely starts a title is prose.
+            if re.search(
+                rf"{key}[\"']?\s*[:=]\s*[\"']?(?:bearer\s+\S{{6,}}"
+                r"|[\"']?[A-Za-z0-9_\-\.\+/]{16,})",
+                low,
+            ):
+                leaks.append(f)
+            elif re.search(rf"\b{key}\s+[A-Za-z0-9_\-\.]{{20,}}", low):
+                # 'bearer sk-…' style without a separator.
+                leaks.append(f)
         return leaks
 
     def _persist(self, session_id: str, validation: ReportValidation) -> None:

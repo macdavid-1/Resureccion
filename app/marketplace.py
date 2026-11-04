@@ -86,6 +86,64 @@ def get_marketplace(code_or_domain: str) -> Marketplace:
     raise MarketplaceError(f"unknown marketplace {code_or_domain!r}")
 
 
+# Human spellings a model (or owner) uses for a marketplace, mapped to codes.
+# Deliberately small and explicit: guessing beyond this list is how a wrong
+# market silently enters a report.
+_MARKETPLACE_ALIASES: dict[str, str] = {
+    "usa": "us", "u.s.": "us", "u.s.a.": "us",
+    "united states": "us", "united states of america": "us",
+    "us marketplace": "us", "amazon us": "us",
+    "gb": "uk", "united kingdom": "uk", "great britain": "uk",
+    "britain": "uk", "england": "uk", "uk marketplace": "uk",
+    "canada": "ca", "australia": "au", "germany": "de",
+    "deutschland": "de", "france": "fr", "italy": "it",
+    "spain": "es", "japan": "jp", "india": "in", "mexico": "mx",
+    "brazil": "br", "brasil": "br", "netherlands": "nl",
+    "sweden": "se", "poland": "pl", "singapore": "sg",
+    "uae": "ae", "united arab emirates": "ae", "turkey": "tr",
+}
+
+
+def normalize_marketplace_codes(values: object) -> list[str]:
+    """Map model-written marketplace labels onto real supported codes.
+
+    Models describe markets as 'US', 'amazon.com', 'United Kingdom', 'us, uk'.
+    Every one of those names a real marketplace; refusing them made an
+    otherwise valid opportunity fail the report's registry check (and the
+    whole report provisional) over a spelling. Unknown labels are DROPPED —
+    the caller decides the fallback (usually the candidate's own market).
+    Order is preserved and duplicates collapse.
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        for piece in raw.replace(";", ",").split(","):
+            key = piece.strip().lower()
+            if not key:
+                continue
+            code = ""
+            try:
+                code = get_marketplace(key).code
+            except MarketplaceError:
+                code = _MARKETPLACE_ALIASES.get(key, "")
+                if not code:
+                    code = _MARKETPLACE_ALIASES.get(
+                        key.replace("amazon ", "").replace(" marketplace", ""), ""
+                    )
+            if code and code not in seen:
+                out.append(code)
+                seen.add(code)
+    return out
+
+
 def resolve_explicit(identifiers: list[str]) -> list[Marketplace]:
     """Resolve an owner-specified list. Raises on any unknown entry."""
     if not identifiers:

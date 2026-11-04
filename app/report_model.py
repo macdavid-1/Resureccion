@@ -2134,6 +2134,133 @@ def _render_finalist_playbooks(lines: list[str], model: ReportModel) -> None:
             a("")
 
 
+def render_fallback_markdown(model: Any, error: BaseException) -> str:
+    """A minimal, honest report body for when the full renderer fails.
+
+    Rendering is deterministic, so a failure means a defect in ONE section.
+    After hours of research, delivering nothing is worse than delivering the
+    measured core — portfolio, ledger, methodology trace, notes — with a
+    plain statement of what happened. Every access here is defensive: this
+    function is the last line of the delivery path and must not itself fail.
+    """
+    try:
+        data = model.to_dict() if hasattr(model, "to_dict") else dict(model or {})
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    def _txt(value: Any, limit: int = 600) -> str:
+        return str(value if value is not None else "").strip()[:limit]
+
+    def _rows(key: str) -> list[Any]:
+        value = data.get(key)
+        return value if isinstance(value, list) else []
+
+    session = data.get("session") if isinstance(data.get("session"), dict) else {}
+    ex = data.get("executive_summary")
+    ex = ex if isinstance(ex, dict) else {}
+    lines: list[str] = []
+    a = lines.append
+    a("# Resurrección — Market Intelligence Report")
+    a("")
+    a(f"**Session:** {_txt(session.get('name'), 200) or '—'}  ")
+    a(f"**Mode:** {_txt(session.get('mode'), 40) or '—'}  ")
+    a(f"**Objective:** {_txt(session.get('objective'), 600) or '—'}")
+    a("")
+    validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
+    if validation:
+        if validation.get("passed"):
+            a("**Report status: FINAL** — passed adversarial validation.")
+        else:
+            a("**Report status: PROVISIONAL** — adversarial validation found issues:")
+            for failure in (validation.get("failures") or [])[:10]:
+                a(f"- {failure}")
+        a("")
+    a("## Executive summary")
+    a("")
+    a(
+        "**This report was delivered in compact form.** The full layout could "
+        "not be rendered for this session "
+        f"(`{type(error).__name__}: {_txt(error, 200)}`). The research itself is "
+        "unaffected: everything below is read directly from the session's "
+        "durable records."
+    )
+    a("")
+    a(
+        f"**Scale.** {ex.get('candidates_considered', 0)} candidates considered · "
+        f"{ex.get('survived_verification', 0)} survived verification · "
+        f"{ex.get('evidence_records', 0)} evidence records · "
+        f"{ex.get('claims_registered', 0)} claims registered."
+    )
+    a("")
+
+    opps = _rows("opportunities")
+    if opps:
+        a("## Opportunities")
+        a("")
+        for o in opps:
+            if isinstance(o, dict):
+                a(f"- **{_txt(o.get('title') or o.get('niche'), 200)}** — {_txt(o.get('niche'), 200)}")
+            else:
+                a(f"- {_txt(o, 200)}")
+        a("")
+
+    ledger = _rows("candidate_ledger")
+    if ledger:
+        a("## Candidate ledger")
+        a("")
+        a("| Niche | Status | Marketplace |")
+        a("| --- | --- | --- |")
+        for c in ledger:
+            if isinstance(c, dict):
+                a(
+                    f"| {_txt(c.get('niche'), 120)} | {_txt(c.get('status'), 40)} | "
+                    f"{_txt(c.get('marketplace'), 20) or '—'} |"
+                )
+        a("")
+
+    notes = _rows("research_notes")
+    if notes:
+        a("## Research notes written during the run")
+        a("")
+        for n in notes:
+            if isinstance(n, dict):
+                tag = _txt(n.get("phase_title") or n.get("phase"), 80) or "during research"
+                if n.get("niche"):
+                    tag += f" · {_txt(n['niche'], 80)}"
+                a(f"- **{tag}** — {_txt(n.get('text'), 1500)}")
+        a("")
+
+    trace = _rows("methodology_trace")
+    if trace:
+        a("## Methodology trace")
+        a("")
+        for t in trace:
+            if isinstance(t, dict):
+                state = "completed" if t.get("completed") else "produced no output"
+                a(f"- **{_txt(t.get('title') or t.get('phase'), 120)}** — {state}")
+        a("")
+
+    appendix = _rows("evidence_appendix")
+    a(f"**Evidence appendix:** {len(appendix)} record(s).")
+    a("")
+    return "\n".join(lines)
+
+
+def safe_render_markdown(model: ReportModel) -> str:
+    """Render the report, degrading to the compact body instead of raising.
+
+    Used anywhere a report is re-rendered (e.g. from its stored model), where
+    failing the whole request over one defective section helps nobody.
+    """
+    try:
+        return render_markdown(model)
+    except Exception as exc:
+        # Documented degrade: the compact body is still this session's report.
+        return render_fallback_markdown(model, exc)
+
+
 def render_markdown(model: ReportModel) -> str:
     """Render the structured model into the publication-ready report."""
     ex = model.executive_summary
@@ -2150,6 +2277,21 @@ def render_markdown(model: ReportModel) -> str:
     if s.get("prompt"):
         a(f"**Brief:** {str(s.get('prompt'))[:600]}")
     a("")
+
+    # ------------------------------------------------------- validation badge
+    # Rendered from the model, not injected into the body afterwards: a
+    # report re-rendered from its stored model used to silently lose its
+    # FINAL / PROVISIONAL status, so the owner could no longer tell whether
+    # the deliverable had passed adversarial validation.
+    validation = model.validation if isinstance(model.validation, dict) else {}
+    if validation:
+        if validation.get("passed"):
+            a("**Report status: FINAL** — passed adversarial validation.")
+        else:
+            a("**Report status: PROVISIONAL** — adversarial validation found issues:")
+            for failure in (validation.get("failures") or [])[:10]:
+                a(f"- {failure}")
+        a("")
 
     # ------------------------------------------------------- executive summary
     a("## Executive summary")

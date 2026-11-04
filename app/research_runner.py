@@ -43,7 +43,12 @@ from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
 from app.market_memory import MarketMemoryStore, harvest_session
-from app.marketplace import Marketplace, resolve_plan, select_auto
+from app.marketplace import (
+    Marketplace,
+    normalize_marketplace_codes,
+    resolve_plan,
+    select_auto,
+)
 from app.methodology import (
     EXTERNAL_ACTIONS,
     P1_DISCOVERY,
@@ -68,6 +73,7 @@ from app.model_client import (
     ModelContractError,
     ModelError,
     ModelReply,
+    ModelRequestError,
     ModelUsage,
     _extract_json,
 )
@@ -133,6 +139,20 @@ _MAX_NOTES_PER_REPLY = 12
 # phase resumed from its own iteration checkpoint), so a heal costs one
 # extra attempt — never research quality. See ResearchRunner._self_heal.
 _SELF_HEAL_ATTEMPTS = 3
+
+# Consecutive FAILED model iterations (transport, 429/5xx, truncated or
+# unparseable JSON) a phase absorbs before the session pauses. One bad reply
+# must never pause a multi-hour run — the iteration is simply retried — but a
+# genuinely dead endpoint must not silently burn the whole iteration budget
+# and produce an empty report either. Three failures is roughly two minutes
+# of real backoff: the blip is gone, or the owner needs to act.
+_MODEL_FAILURE_LIMIT = 3
+
+# Keys a model may add on top of the phase contract that are control or
+# annotation data, never analysis: they are stripped before a phase's output
+# is committed, so they never come back to the model as "prior decisions" and
+# never bloat a checkpoint.
+_CONTROL_KEYS = frozenset({"goto_phase", "actions", "activity_note", "notes"})
 
 
 @asynccontextmanager
@@ -229,9 +249,17 @@ _TARGET_RES: tuple[re.Pattern[str], ...] = (
 
 
 def _phase_content(output: dict[str, Any]) -> dict[str, Any]:
-    """The phase's analysis, without orchestrator control keys the model
-    may add on top of the contract (e.g. 'goto_phase')."""
-    return {k: v for k, v in output.items() if k != "goto_phase"}
+    """The phase's analysis, without orchestrator control/annotation keys the
+    model may add on top of the contract.
+
+    'actions', 'activity_note' and 'notes' describe ONE reply, not the phase's
+    findings: keeping them in the committed output replayed stale action lists
+    into later prompts as prior decisions and duplicated notes into every
+    checkpoint. They have their own durable homes.
+    """
+    if not isinstance(output, dict):
+        return {}
+    return {k: v for k, v in output.items() if k not in _CONTROL_KEYS}
 
 
 def _dedup_rows(rows: list[Any]) -> list[Any]:
@@ -387,6 +415,8 @@ class ResearchRunner:
         self.memory = MarketMemoryStore(db)
         # Owner reference images, prepared once per run (see _reference_images).
         self._ref_images: dict[str, list[bytes]] = {}
+        # Consecutive failed model iterations (see _MODEL_FAILURE_LIMIT).
+        self._consecutive_model_failures = 0
 
     # ------------------------------------------------- owner message channel
     def _take_owner_messages(self, session_id: str) -> None:
@@ -638,7 +668,10 @@ class ResearchRunner:
         finally:
             self._tick_elapsed(session_id)  # flush the final slice on every exit path
             self._elapsed_last.pop(session_id, None)
-            await self.model.aclose()
+            try:
+                await self.model.aclose()
+            except Exception:
+                pass  # closing the HTTP client never decides a session's outcome
 
     async def _run_once(
         self, session_id: str, session: Any, session_started: float
@@ -928,6 +961,9 @@ class ResearchRunner:
 
         stall = 0
         model_calls = 0
+        # A new phase starts with a clean failure streak: the previous phase's
+        # absorbed blip must not count against this one.
+        self._consecutive_model_failures = 0
         # Phase-start baseline. The min_evidence floor is measured against
         # what THIS phase captures (counts - baseline), never against the
         # session total: Phase 1 alone can hand over 100+ evidence records,
@@ -1136,6 +1172,44 @@ class ResearchRunner:
                     )
                     self._bump_model_calls(session_id)  # the retry is a real call
                     continue
+                except ModelError as exc:
+                    # A config/auth rejection needs the owner NOW: pause.
+                    if isinstance(exc, ModelRequestError):
+                        timings.finish(call_key, outcome="failed")
+                        raise
+                    # Otherwise the call failed transiently (network blip,
+                    # 429/5xx after backoff, truncated or unparseable JSON).
+                    # That is a failed ITERATION, not a failed research: the
+                    # loop retries with the next iteration, which re-reads
+                    # fresh evidence and a fresh prompt. Only a sustained
+                    # streak means the endpoint is really down.
+                    timings.finish(call_key, outcome="failed")
+                    self._consecutive_model_failures += 1
+                    detail = {
+                        "phase": phase, "iteration": iteration,
+                        "attempt": contract_attempt,
+                        "consecutive": self._consecutive_model_failures,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                    self.errors.record(
+                        session_id, scope=f"model:{phase}", severity="warning",
+                        message=f"{type(exc).__name__}: {exc}"[:300],
+                        recoverable=True,
+                    )
+                    self.events.append(
+                        session_id, level="warn", actor="model",
+                        action="model_iteration_failed", detail=detail,
+                    )
+                    if self._consecutive_model_failures >= _MODEL_FAILURE_LIMIT:
+                        # Sustained failure: hand the session to the owner
+                        # instead of silently degrading every later phase.
+                        self.events.append(
+                            session_id, level="error", actor="model",
+                            action="model_unreachable_pausing", detail=detail,
+                        )
+                        raise
+                    reply = None
+                    break
                 except BaseException:
                     timings.finish(call_key, outcome="failed")
                     raise
@@ -1151,6 +1225,7 @@ class ResearchRunner:
                 # limiter forces the phase open with whatever best output it
                 # has; the session keeps running — it never pauses here.
                 continue
+            self._consecutive_model_failures = 0
             # Anything the model noted that no contract field can hold is
             # stored durably here and replayed into the final report.
             self._capture_notes(session_id, phase, reply.content)
@@ -1374,7 +1449,10 @@ class ResearchRunner:
                         ),
                     )
                 committed = _merge_phase_output(
-                    prior_outputs.get(phase), _phase_content(reply.content)
+                    prior_outputs.get(phase),
+                    _phase_content(
+                        self._commit_content(reply.content, best_output, primary)
+                    ),
                 )
                 # The durable 'phase_output' marker means the phase is
                 # finished FOR GOOD — a resume skips it — so the rows this
@@ -1468,6 +1546,25 @@ class ResearchRunner:
         )
         return committed
 
+    @staticmethod
+    def _commit_content(
+        latest: dict[str, Any], best: dict[str, Any] | None, primary: str
+    ) -> dict[str, Any]:
+        """The analysis a phase commits: never its thinnest reply.
+
+        `best_output` holds the most complete reply of the phase so far. A
+        later commit-shaped reply may carry FEWER primary items — an empty
+        list is a legitimate commit for phases 8 and 9 — and committing it
+        alone silently discarded analysis an earlier (explore) reply had
+        already produced: verdicts that never landed, opportunities that
+        never reached the report. Merge the two, richer reply first.
+        """
+        if not isinstance(best, dict) or best is latest:
+            return latest
+        if _primary_items(best, primary) > _primary_items(latest, primary):
+            return _merge_phase_output(best, latest)
+        return latest
+
     def _salvage_contract_reply(
         self, session_id: str, exc: Exception
     ) -> ModelReply | None:
@@ -1504,6 +1601,19 @@ class ResearchRunner:
         )
 
     # ------------------------------------------------------------ phase effects
+    def _marketplace_code(self, session_id: str, value: Any) -> str:
+        """A real marketplace code for a model-written label, never blank.
+
+        Prefers the value the model gave, falls back to the session's own
+        marketplace plan. Candidate rows with an unparsable marketplace used
+        to poison the report's attribution check for every opportunity built
+        on them.
+        """
+        codes = normalize_marketplace_codes(value)
+        if codes:
+            return codes[0][:20]
+        return self._default_marketplace(session_id)[:20]
+
     def _default_marketplace(self, session_id: str) -> str:
         """The session's primary marketplace, for niches the model listed
         without naming their market (plain-string niches are common under
@@ -1567,13 +1677,20 @@ class ResearchRunner:
                     if key in existing_niche_ids:
                         n["candidate_id"] = existing_niche_ids[key]
                         continue
+                    # Same market under a slightly different label (a re-run's
+                    # phrasing after a goto or target refill): link it to the
+                    # existing row instead of double-counting the ledger.
+                    sibling = self._find_candidate_by_niche(session_id, key)
+                    if sibling is not None:
+                        n["candidate_id"] = sibling.id
+                        existing_niche_ids[key] = sibling.id
+                        continue
                     c = self.candidates.create(
                         session_id,
                         niche=str(n["niche"])[:200],
-                        marketplace=(
-                            str(n.get("marketplace") or "").strip()
-                            or self._default_marketplace(session_id)
-                        )[:20],
+                        marketplace=self._marketplace_code(
+                            session_id, n.get("marketplace")
+                        ),
                         rationale=str(n.get("demand_hints") or "")[:500],
                         meta={
                             "chain": n.get("chain") or [],
@@ -1688,7 +1805,42 @@ class ResearchRunner:
                     break
                 if not isinstance(o, dict):
                     continue
-                ok, problems = validate_opportunity(o)
+                # Resolve the candidate FIRST: its own marketplace is the
+                # truthful attribution when the model omitted one, and a
+                # marketplace the registry does not recognise is a spelling,
+                # not a reason to throw away a verified dossier.
+                cid = str(o.get("candidate_id") or "").strip()
+                if not cid:
+                    match = self._find_candidate_by_niche(session_id, str(o.get("niche", "")))
+                    cid = match.id if match else ""
+                cand = self.candidates.get(session_id, cid) if cid else None
+                opp_markets = normalize_marketplace_codes(o.get("marketplaces"))
+                cand_markets = (
+                    normalize_marketplace_codes(cand.marketplace) if cand else []
+                )
+                if not opp_markets:
+                    opp_markets = list(cand_markets)
+                elif cand_markets and not (set(cand_markets) & set(opp_markets)):
+                    # The candidate's evidence was captured on its own
+                    # marketplace; an opportunity that omits it mis-attributes
+                    # the research. Both markets are real, so list both and
+                    # record the correction.
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="opportunity_marketplace_corrected",
+                        detail={"candidate_id": cid,
+                                "candidate_marketplace": cand.marketplace,
+                                "model_marketplaces": list(opp_markets)},
+                    )
+                    opp_markets = cand_markets + opp_markets
+                if not opp_markets:
+                    opp_markets = normalize_marketplace_codes(
+                        self._default_marketplace(session_id)
+                    )
+                normalized = dict(o)
+                if opp_markets:
+                    normalized["marketplaces"] = opp_markets
+                ok, problems = validate_opportunity(normalized)
                 if not ok:
                     self.events.append(
                         session_id, level="warn", actor="agent",
@@ -1696,11 +1848,6 @@ class ResearchRunner:
                         detail={"problems": problems, "niche": str(o.get("niche", ""))[:120]},
                     )
                     continue
-                cid = str(o.get("candidate_id") or "").strip()
-                if not cid:
-                    match = self._find_candidate_by_niche(session_id, str(o.get("niche", "")))
-                    cid = match.id if match else ""
-                cand = self.candidates.get(session_id, cid) if cid else None
                 if cand is None or cand.status != "verified":
                     self.events.append(
                         session_id, level="warn", actor="agent",
@@ -1776,7 +1923,7 @@ class ResearchRunner:
                     candidate_id=cid,
                     title=title[:200],
                     niche=str(o.get("niche", ""))[:200],
-                    marketplace=",".join(map(str, o.get("marketplaces") or []))[:60],
+                    marketplace=",".join(opp_markets)[:60],
                     angle=str(o.get("positioning") or "")[:500],
                     keywords=[k[:80] for k in clean_keywords][:20],
                     confidence=float(o.get("confidence") or 0.0),
@@ -2140,8 +2287,13 @@ class ResearchRunner:
         meta so the dashboard, report and next run all read the same number.
         The score never enters any verdict — it orders work, nothing else.
         """
-        rows = self._all_browser_evidence(session_id)
-        cand_rows = self.candidates.list(session_id, limit=500)
+        try:
+            rows = self._all_browser_evidence(session_id)
+            cand_rows = self.candidates.list(session_id, limit=500)
+        except Exception:
+            # Ordering only: keep whatever was already computed rather than
+            # letting a read hiccup abort the phase loop that called this.
+            return self._ws_scores.get(session_id, {})
         scores: dict[str, WhitespaceScore] = {}
         for cand in cand_rows:
             try:
@@ -2407,7 +2559,6 @@ class ResearchRunner:
         """
         if not isinstance(output, dict):
             return
-        default_mkt = self._default_marketplace(session_id)
         known = {
             str(c.niche).strip().lower()
             for c in self.candidates.list(session_id, limit=500)
@@ -2449,9 +2600,13 @@ class ResearchRunner:
                 ][:12]
                 fresh.append({
                     "niche": niche[:200],
-                    "marketplace": (
-                        str(row.get("marketplace") or "").strip() or default_mkt
-                    )[:20],
+                    # A model-written label ('amazon.com', 'United Kingdom') is
+                    # resolved to a registry code here: an unparsable
+                    # marketplace on the candidate failed the report's
+                    # attribution check for every opportunity built on it.
+                    "marketplace": self._marketplace_code(
+                        session_id, row.get("marketplace")
+                    ),
                     "rationale": str(row.get(text_key) or row.get("niche") or "")[:500],
                     "evidence_ids": self._valid_evidence_ids(session_id, evidence_ids),
                     "field": field,
@@ -2531,7 +2686,11 @@ class ResearchRunner:
         # must never re-verify it; its verdict, filters and evidence chain
         # stand as recorded. Rejected candidates stay dead for the same
         # reason. Only new or still-unresolved candidates are judged.
-        live = self.candidates.list(session_id, limit=self.rc.max_candidates)
+        # EVERY candidate on the ledger is judged, not just the first page: a
+        # target refill adds candidates precisely because the earlier ones
+        # failed, and a page-limited read left the newest (most promising)
+        # rows permanently unverified and stuck in 'discovered'.
+        live = self.candidates.list(session_id, limit=500)
         candidates = [c for c in live if c.status not in ("rejected", "verified")]
         reused_verified = sum(1 for c in live if c.status == "verified")
         existing_niches = [c.niche for c in self.candidates.list(session_id, limit=500)]
@@ -2675,9 +2834,7 @@ class ResearchRunner:
             return ""
         try:
             verified = len(
-                self.candidates.list(
-                    session_id, status="verified", limit=self.rc.max_candidates
-                )
+                self.candidates.list(session_id, status="verified", limit=500)
             )
             rejected = [
                 c.niche
@@ -2903,7 +3060,7 @@ class ResearchRunner:
         if pivot_round >= self.config.max_focus_pivots:
             return False
         survivors = self.candidates.list(
-            session_id, status="verified", limit=self.rc.max_candidates
+            session_id, status="verified", limit=500
         )
         if survivors:
             return False
@@ -2921,7 +3078,7 @@ class ResearchRunner:
             )
             return False
 
-        all_cands = self.candidates.list(session_id, limit=self.rc.max_candidates)
+        all_cands = self.candidates.list(session_id, limit=500)
         dead = [c for c in all_cands if c.status == "rejected"]
         unresolved = [c for c in all_cands if c.status not in ("rejected", "verified")]
         directive = focus_pivot_directive(
@@ -2981,9 +3138,7 @@ class ResearchRunner:
         if target <= 0:
             return False
         verified = len(
-            self.candidates.list(
-                session_id, status="verified", limit=self.rc.max_candidates
-            )
+            self.candidates.list(session_id, status="verified", limit=500)
         )
         if verified >= target:
             return False
@@ -3468,10 +3623,31 @@ class ResearchRunner:
         return str(cp.payload.get("mode")) if cp else "auto"
 
     def _find_candidate_by_niche(self, session_id: str, niche: str):
-        for c in self.candidates.list(session_id, limit=200):
-            if c.niche.strip().lower() == niche.strip().lower():
+        """Resolve a model-written niche label to a real candidate row.
+
+        Exact match first. Otherwise the SAME containment rule the claims and
+        the ledger backfill already use — analysis phases routinely phrase a
+        niche shorter than niching did ("sudden-loss grief journals" vs
+        "… for adult children"), and an exact-only lookup silently discarded
+        the synthesis dossier built on that candidate. Containment is only
+        trusted when exactly ONE candidate matches: an ambiguous label must
+        never be attached to the wrong row.
+        """
+        wanted = (niche or "").strip().lower()
+        if not wanted:
+            return None
+        cands = self.candidates.list(session_id, limit=200)
+        for c in cands:
+            if c.niche.strip().lower() == wanted:
                 return c
-        return None
+        if len(wanted) < 8:
+            return None
+        matches = [
+            c for c in cands
+            if len(c.niche.strip().lower()) >= 8
+            and (wanted in c.niche.strip().lower() or c.niche.strip().lower() in wanted)
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     # ------------------------------------------------------------- failure paths
     def _mark_job(self, session_id: str, status: str, detail: dict[str, Any] | None = None) -> None:
@@ -3622,10 +3798,13 @@ class ResearchRunner:
         )
 
         try:
-            data = digest_json(build_digest(model.to_dict()))
+            digest = build_digest(model.to_dict())
+            data = digest_json(digest)
         except Exception:
             return {}
-        allowed = allowed_numbers(data)
+        # Notes are annotations, never measurements: a figure that appears
+        # ONLY in a note must not become an allowed figure for the prose.
+        allowed = allowed_numbers(digest_json({**digest, "research_notes": []}))
         prompt = user_prompt(data)
         narrative: dict[str, Any] = {}
         unresolved: list[str] = []
@@ -3652,15 +3831,28 @@ class ResearchRunner:
                 self._record_model_usage(session_id, reply)
             except Exception:
                 pass
-            narrative, unresolved = normalize_narrative(
-                getattr(reply, "content", None), allowed=allowed
-            )
+            try:
+                narrative, unresolved = normalize_narrative(
+                    getattr(reply, "content", None), allowed=allowed
+                )
+            except Exception as exc:
+                # The narrative is additive. A bug in normalisation must
+                # never cost the owner the deterministic report it decorates.
+                self.errors.record(
+                    session_id, scope="report_narrative", severity="warning",
+                    message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+                )
+                narrative, unresolved = {}, [f"normalisation failed: {exc}"[:200]]
+                break
             if narrative and not unresolved:
                 break
             if attempt == 1:
-                prompt = correction_prompt(
-                    data, unresolved or ["an unusable section structure"]
-                )
+                try:
+                    prompt = correction_prompt(
+                        data, unresolved or ["an unusable section structure"]
+                    )
+                except Exception:
+                    break
         if not narrative:
             self.events.append(
                 session_id, level="info", actor="agent",
@@ -3873,10 +4065,13 @@ class ResearchRunner:
                 )
                 continue
             try:
-                digest = digest_json(build_playbook_digest(sec))
+                digest_sections = build_playbook_digest(sec)
+                digest = digest_json(digest_sections)
             except Exception:
                 continue
-            allowed = allowed_numbers(digest)
+            # Same rule as the analyst prose: a figure that exists only in a
+            # note may never be presented as a measured number.
+            allowed = allowed_numbers(digest_json({**digest_sections, "notes": []}))
             prompt = user_prompt(digest)
             playbook: dict[str, Any] = {}
             violations: list[str] = []
@@ -3938,6 +4133,77 @@ class ResearchRunner:
             )
         return out
 
+    def _render_report_body(
+        self, session_id: str, model: Any, build_error: Exception | None
+    ) -> tuple[str, Exception | None]:
+        """Render the markdown body, never raising.
+
+        Returns (body, error). `error` is set when the full layout failed and
+        the compact fallback was delivered, so the caller can re-render the
+        same way after validation and never pretend the full layout ran.
+        """
+        from app.report_model import render_fallback_markdown, render_markdown
+
+        if build_error is not None:
+            return render_fallback_markdown(model, build_error), build_error
+        try:
+            return render_markdown(model), None
+        except Exception as exc:
+            # A defect in one section must not cost the whole deliverable.
+            # The fallback is still a real report of this session's durable
+            # records, and says plainly that it is compact and why.
+            self.errors.record(
+                session_id, scope="report_render", severity="error",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
+            self.events.append(
+                session_id, level="error", actor="agent",
+                action="report_render_failed",
+                detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
+            )
+            self.trace.record(
+                session_id, KIND_REPORT,
+                f"Full report layout failed ({type(exc).__name__}); "
+                "delivered the compact report instead of nothing",
+            )
+            return render_fallback_markdown(model, exc), exc
+
+    def _minimal_report_model(self, session_id: str, notes: list[Any]) -> Any:
+        """A report model safe to render when the full build failed.
+
+        Reads only the session row, the opportunity portfolio and the run
+        notes — each guarded separately — so one broken section cannot take
+        the whole model down with it.
+        """
+        from app.report_model import ReportModel, _note_rows
+
+        session: dict[str, Any] = {"id": session_id}
+        try:
+            s = self.sessions.require(session_id)
+            session = {
+                "id": s.id, "name": s.name, "mode": s.mode,
+                "objective": s.objective, "prompt": s.prompt,
+            }
+        except Exception:
+            pass
+        opps: list[dict[str, Any]] = []
+        try:
+            opps = [o.to_dict() for o in self.opportunities.list(session_id, limit=50)]
+        except Exception:
+            pass
+        rows, total = ([], 0)
+        try:
+            rows, total = _note_rows(notes)
+        except Exception:
+            pass
+        return ReportModel(
+            session=session,
+            executive_summary={},
+            opportunities=opps,
+            research_notes=rows,
+            research_notes_total=total,
+        )
+
     async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         from app.report_model import build_report_model, render_markdown
         from app.report_validation import ReportValidator
@@ -3964,48 +4230,81 @@ class ResearchRunner:
             ws = self._whitespace_scores(session_id)
         except Exception:
             ws = {}
-        model = build_report_model(
-            session_id,
-            sessions=self.sessions,
-            candidates=self.candidates,
-            opportunities=self.opportunities,
-            verifications=VerificationStore(self.db),
-            claims=self.claims,
-            browser_evidence=self.browser_evidence,
-            observations=self.observations,
-            assessments=self.assessments,
-            phase_outputs=phase_outputs,
-            focus_pivots=self._focus_pivot_history(session_id),
-            whitespace_by_candidate={
-                k: v.to_dict() for k, v in ws.items()
-            },
-            backlog=self._backlog_items(session_id),
-            adjacency=self._adjacency_rows(session_id),
-            evidence=self.evidence,
-            finalist_cap=int(getattr(self.config, "dive_max_candidates", 12)),
-            finalist_keyword_target=int(
-                getattr(self.config, "dive_max_keywords", 20)
-            ),
-            finalist_category_target=int(
-                getattr(self.config, "dive_max_categories", 10)
-            ),
-            # Everything the model noted during research, for the report and
-            # the writing stages that follow.
-            notes=self.notes.list(session_id, limit=500),
-        )
-        # Analyst prose: the model interprets the verified records above;
-        # it never computes a figure. Empty on any failure — the report
-        # renders deterministically without it.
-        narrative = await self._analyst_narrative(session_id, model)
-        if narrative:
-            model.narrative = narrative
-        # Per-final-candidate playbooks: written by the model from that
-        # candidate's measured data only (app.finalist_playbook). Degrades to
-        # the measured tables when a candidate's prose cannot be grounded.
-        playbooks = await self._finalist_playbooks(session_id, model)
-        if playbooks:
-            model.finalist_playbooks = playbooks
-        body = render_markdown(model)
+        run_notes = self.notes.list(session_id, limit=500)
+        build_error: Exception | None = None
+        try:
+            model = build_report_model(
+                session_id,
+                sessions=self.sessions,
+                candidates=self.candidates,
+                opportunities=self.opportunities,
+                verifications=VerificationStore(self.db),
+                claims=self.claims,
+                browser_evidence=self.browser_evidence,
+                observations=self.observations,
+                assessments=self.assessments,
+                phase_outputs=phase_outputs,
+                focus_pivots=self._focus_pivot_history(session_id),
+                whitespace_by_candidate={
+                    k: v.to_dict() for k, v in ws.items()
+                },
+                backlog=self._backlog_items(session_id),
+                adjacency=self._adjacency_rows(session_id),
+                evidence=self.evidence,
+                finalist_cap=int(getattr(self.config, "dive_max_candidates", 12)),
+                finalist_keyword_target=int(
+                    getattr(self.config, "dive_max_keywords", 20)
+                ),
+                finalist_category_target=int(
+                    getattr(self.config, "dive_max_categories", 10)
+                ),
+                # Everything the model noted during research, for the report
+                # and the writing stages that follow.
+                notes=run_notes,
+            )
+        except Exception as exc:
+            # Even the structured build failing must not cost the owner the
+            # deliverable: a minimal model is assembled from durable records
+            # and rendered in compact form below.
+            build_error = exc
+            self.errors.record(
+                session_id, scope="report_model", severity="error",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
+            self.events.append(
+                session_id, level="error", actor="agent",
+                action="report_model_failed",
+                detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
+            )
+            model = self._minimal_report_model(session_id, run_notes)
+        if build_error is None:
+            # Analyst prose: the model interprets the verified records above;
+            # it never computes a figure. Empty on any failure — the report
+            # renders deterministically without it.
+            narrative = await self._analyst_narrative(session_id, model)
+            if narrative:
+                model.narrative = narrative
+            # Per-final-candidate playbooks: written by the model from that
+            # candidate's measured data only (app.finalist_playbook).
+            # Degrades to the measured tables when prose cannot be grounded.
+            try:
+                playbooks = await self._finalist_playbooks(session_id, model)
+            except Exception as exc:
+                # Playbooks are model prose on top of measured tables. A bug
+                # here may cost the prose; it may never cost the report.
+                playbooks = {}
+                self.errors.record(
+                    session_id, scope="finalist_playbooks", severity="warning",
+                    message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+                )
+                self.events.append(
+                    session_id, level="warn", actor="agent",
+                    action="finalist_playbooks_failed",
+                    detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
+                )
+            if playbooks:
+                model.finalist_playbooks = playbooks
+        body, render_error = self._render_report_body(session_id, model, build_error)
 
         # Adversarial validation of the deliverable: gates + per-opportunity
         # chain-of-custody checks. A failing report is delivered as
@@ -4029,21 +4328,20 @@ class ResearchRunner:
             evidence=self.evidence,
         ).validate(session_id, report_body=body)
 
-        # The validation verdict lives in the model too, so re-renders keep it.
+        # The validation verdict lives in the model, and the renderer shows it
+        # from there — so a report re-rendered later from its stored model
+        # keeps the exact same FINAL / PROVISIONAL status.
         model.validation = validation.to_dict()
-        badge = (
-            "**Report status: FINAL** — passed adversarial validation."
-            if validation.passed
-            else (
-                "**Report status: PROVISIONAL** — adversarial validation found issues:\n"
-                + "\n".join(f"- {f}" for f in validation.failures[:10])
+        try:
+            from app.report_model import render_fallback_markdown
+
+            body = (
+                render_fallback_markdown(model, render_error)
+                if render_error is not None
+                else render_markdown(model)
             )
-        )
-        body = body.replace(
-            "## Executive summary",
-            f"{badge}\n\n## Executive summary",
-            1,
-        )
+        except Exception:
+            pass  # the validated body above already holds the full analysis
         store = ReportStore(self.db, self.config)
         rep = store.save(
             session_id,
@@ -4057,11 +4355,23 @@ class ResearchRunner:
                 "mode": validation.mode,
             },
         )
-        # Persist the structured model: the report remains re-renderable.
+        # Persist the structured model: PDF export and re-rendering both read
+        # it, so a failure here must be visible even though the markdown body
+        # is already durable.
         try:
             store.save_model_json(session_id, report=rep, model_json=model.to_json())
-        except Exception:
-            pass  # rendering already persisted; model persistence is additive
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="report_model_json", severity="warning",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
+            self.events.append(
+                session_id, level="warn", actor="agent",
+                action="report_model_json_failed",
+                detail={"error": f"{type(exc).__name__}: {exc}"[:300],
+                        "note": "markdown is saved; PDF export and re-render "
+                                "need this structured model"},
+            )
         self.events.append(
             session_id, level="info", actor="agent", action="final_report_written",
             detail={"mode": validation.mode, "failures": len(validation.failures)},

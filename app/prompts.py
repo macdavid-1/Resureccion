@@ -113,6 +113,12 @@ def build_system_prompt(phase: str) -> str:
         "source is a duplicate, not research, and does not count as progress.\n"
         "- Evidence must come from pages you actually inspected via actions. "
         "Never fabricate rankings, prices, review counts, or KDSpy numbers.\n"
+        "- EVERY analysis item you emit must carry 'evidence_ids': the ids from "
+        "EVIDENCE SO FAR that the finding rests on. A finding with no id is a "
+        "model assertion: it is recorded as unsupported, it counts against the "
+        "session's integrity, and it can make the final report provisional. "
+        "If a claim has no captured evidence behind it, do not assert it — say "
+        "what is missing instead.\n"
         "- KDSpy Pro figures are third-party ESTIMATES, never measurements: "
         "treat them as leads. They may never decide a candidate on their own — "
         "confirm anything that matters with a real page capture (search result "
@@ -317,9 +323,23 @@ def build_user_prompt(
         parts.append("\nADJACENCY: " + adjacency_note)
 
     if prior_phase_outputs:
-        parts.append(
-            "\nPRIOR PHASE DECISIONS: " + _compact(prior_phase_outputs, limit=4000)
-        )
+        # Rendered PER PHASE, each with its own bounded budget. A single
+        # flat slice of the whole dict let one large phase (discovery) eat
+        # the whole allowance, so synthesis never saw the demand verdicts,
+        # gap analyses and adversarial verdicts that decide what may ship.
+        chunks: list[str] = []
+        for key in PHASE_ORDER:
+            out = (prior_phase_outputs or {}).get(key)
+            if not out:
+                continue
+            chunks.append(
+                f"[{PHASE_TITLES.get(key, key)}] " + _compact(out, limit=2200)
+            )
+        if chunks:
+            body = "\n".join(chunks)
+            if len(body) > 16000:
+                body = body[:15999] + "…"
+            parts.append("\nPRIOR PHASE DECISIONS: " + body)
 
     # --- cross-session market memory ----------------------------------------
     # One owner-scoped knowledge base accumulated over earlier runs. Fresh

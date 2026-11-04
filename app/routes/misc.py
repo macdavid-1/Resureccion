@@ -339,9 +339,12 @@ async def rerender_report(session_id: str, report_id: str, request: Request) -> 
     data = st.reports.read_model_json(rep)
     if data is None:
         raise HTTPException(status_code=404, detail="no structured model stored for this report")
-    from app.report_model import ReportModel, render_markdown
+    # Rendered through the guarded path: a defect in one section must not
+    # turn a working report into a 500, and the stored validation verdict is
+    # rendered back into the body (FINAL / PROVISIONAL).
+    from app.report_model import ReportModel, safe_render_markdown
 
-    body = render_markdown(ReportModel.from_dict(data))
+    body = safe_render_markdown(ReportModel.from_dict(data))
     updated = st.reports.save(
         session_id, kind="final", title=rep.title, body_markdown=body,
         meta={**(rep.meta or {}), "rerendered_from_model": True},

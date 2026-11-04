@@ -10,7 +10,8 @@ configured entirely via environment variables:
                          with ModelConfigError)
 - MODEL_BASE_URL        (default https://api.deepinfra.com/v1/openai)
 - MODEL_NAME            (default XiaomiMiMo/MiMo-V2.6-Flash)
-- MODEL_MAX_TOKENS      (default 8192)
+- MODEL_MAX_TOKENS      (default 16384; raised automatically when a reply is
+                         cut off mid-answer)
 - MODEL_TEMPERATURE     (default 0.4)
 - MODEL_THINKING        (default true — ask a reasoning model to think)
 - MODEL_REASONING_EFFORT(default high — none|low|medium|high)
@@ -48,6 +49,13 @@ from app.thoughts import STATUS_DONE, STATUS_FAILED, ThoughtStore
 # blow up a request payload.
 MAX_REFERENCE_IMAGES_PARTS = 6
 
+# A reply cut off at max_tokens (`finish_reason: "length"`) is retried once
+# with double the room, up to this ceiling. Synthesis output (ten full
+# opportunity dossiers) and adversarial verdict tables are the calls most
+# likely to outgrow the configured limit, and losing them to truncation at
+# the very end of a long run is exactly what this prevents.
+MAX_TOKENS_CEILING = 65_536
+
 
 class ModelConfigError(Exception):
     """MODEL_API_KEY missing or invalid configuration."""
@@ -55,6 +63,20 @@ class ModelConfigError(Exception):
 
 class ModelError(Exception):
     """Model call failed after retries."""
+
+
+class ModelRequestError(ModelError):
+    """The endpoint rejected the REQUEST itself (auth, billing, bad model,
+    bad payload).
+
+    Deterministic: an identical retry fails identically, so the runner must
+    not spend research iterations on it — the owner has to fix configuration
+    (key, credits, model name, endpoint) and resume. Everything else
+    (network, 429/5xx, truncated or unparseable JSON) is a transient
+    iteration failure the runner absorbs. The two are deliberately different
+    classes so one bad reply never pauses a healthy six-hour run, and a truly
+    broken endpoint never silently burns the whole budget.
+    """
 
 
 class ModelContractError(ModelError):
@@ -76,6 +98,12 @@ class _Retryable(Exception):
 # and billing (401/402/403) are deliberately NOT here — a second identical
 # request would fail the same way, so surface it at once.
 _STREAM_UNSUPPORTED = frozenset({400, 405, 415, 422, 501})
+
+# Statuses that mean "the request itself is wrong / not authorized": retrying
+# the identical request cannot help, so they surface as ModelRequestError
+# (the runner pauses instead of burning iterations). 408/409/425/429 and 5xx
+# stay transient and are retried.
+_REQUEST_REJECTED = frozenset({400, 401, 402, 403, 404, 413, 422})
 
 # Providers spell reasoning differently: DeepInfra documents
 # `reasoning_content`, OpenRouter uses `reasoning` (string) or
@@ -188,17 +216,25 @@ def _extract_json(text: str) -> dict[str, Any]:
         raise ModelError("model JSON is not an object")
     except json.JSONDecodeError:
         pass
-    # Last resort: first {...} block.
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
+    # Last resort: the first DECODABLE object anywhere in the text. A greedy
+    # "first { to last }" slice breaks as soon as the model adds a sentence
+    # after its JSON that itself contains braces (common: "see {evidence}"),
+    # and it cannot skip leading chatter. Scanning with raw_decode finds the
+    # real object and its exact end.
+    if "{" not in text:
         raise ModelError("no JSON object found in model output")
-    try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError as exc:
-        raise ModelError(f"model JSON parse failed: {exc}") from exc
-    if not isinstance(obj, dict):
-        raise ModelError("model JSON is not an object")
-    return obj
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            candidate, _end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(candidate, dict):
+            return candidate
+        idx = text.find("{", idx + 1)
+    raise ModelError("no JSON object found in model output")
 
 
 class ModelClient:
@@ -340,6 +376,37 @@ class ModelClient:
                 data = await self._request(payload, client, thought_id=thought_id)
                 choice = (data.get("choices") or [{}])[0]
                 message = choice.get("message") or {}
+                # Truncated output (the answer hit max_tokens) is not a valid
+                # reply: it is a JSON object cut in half. Instead of parsing
+                # the wreckage (or failing the iteration), ask again with
+                # more room — once per call, within a sane ceiling.
+                if (
+                    str(choice.get("finish_reason") or "") == "length"
+                    and attempt < max_retries
+                    and int(payload.get("max_tokens") or 0) < MAX_TOKENS_CEILING
+                ):
+                    previous = int(payload.get("max_tokens") or 0)
+                    payload = {
+                        **payload,
+                        "max_tokens": min(previous * 2, MAX_TOKENS_CEILING),
+                    }
+                    if self.events is not None:
+                        self.events.append(
+                            session_id, level="warn", actor="model",
+                            action="model_output_truncated",
+                            detail={"attempt": attempt,
+                                    "max_tokens_was": previous,
+                                    "max_tokens_now": payload["max_tokens"],
+                                    "label": label[:120]},
+                        )
+                    # Keep the owner's thought clean: it described the
+                    # answer we are about to replace.
+                    if self.thoughts is not None and thought_id is not None:
+                        try:
+                            self.thoughts.restart(thought_id)
+                        except Exception:
+                            pass
+                    continue
                 # Non-streamed answers carry their reasoning on the message;
                 # `_capture_reasoning` skips it when the stream already fed
                 # the thought, so the text is never recorded twice.
@@ -507,6 +574,10 @@ class ModelClient:
             raise _Retryable(f"model transport error: {exc}") from exc
         if resp.status_code in (429,) or resp.status_code >= 500:
             raise _Retryable(f"model endpoint {resp.status_code}: {resp.text[:200]}")
+        if resp.status_code in _REQUEST_REJECTED:
+            raise ModelRequestError(
+                f"model request rejected ({resp.status_code}): {resp.text[:300]}"
+            )
         if resp.status_code >= 400:
             raise ModelError(f"model request rejected ({resp.status_code}): {resp.text[:300]}")
         try:
@@ -535,6 +606,7 @@ class ModelClient:
         reasoning_parts: list[str] = []
         usage: dict[str, Any] = {}
         chunks = 0
+        finish_reason = ""
         try:
             async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
                 if resp.status_code != 200:
@@ -543,6 +615,10 @@ class ModelClient:
                         raise _Retryable(f"model endpoint {resp.status_code}: {raw[:200]}")
                     if resp.status_code in _STREAM_UNSUPPORTED:
                         return None  # "stream not accepted here" → plain POST
+                    if resp.status_code in _REQUEST_REJECTED:
+                        raise ModelRequestError(
+                            f"model request rejected ({resp.status_code}): {raw[:300]}"
+                        )
                     raise ModelError(f"model request rejected ({resp.status_code}): {raw[:300]}")
                 ctype = resp.headers.get("content-type", "")
                 if "text/event-stream" not in ctype:
@@ -576,6 +652,8 @@ class ModelClient:
                     for ch in chunk.get("choices") or []:
                         if not isinstance(ch, dict):
                             continue
+                        if ch.get("finish_reason"):
+                            finish_reason = str(ch["finish_reason"])
                         delta = ch.get("delta") or {}
                         if not isinstance(delta, dict):
                             continue
@@ -602,7 +680,12 @@ class ModelClient:
         reasoning = "".join(reasoning_parts)
         if reasoning:
             message["reasoning_content"] = reasoning
-        return {"choices": [{"message": message}], "usage": usage}
+        # Surface the stream's finish reason so a truncated answer is retried
+        # with more room exactly like the plain-POST path.
+        return {
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
 
     # ------------------------------------------------------------ diagnostics
     def usage_dict(self) -> dict[str, Any]:
