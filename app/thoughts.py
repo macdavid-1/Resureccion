@@ -168,7 +168,12 @@ class ThoughtStore:
 
     # -------------------------------------------------------------- reading
     def recent(self, session_id: str, *, limit: int = RECENT_LIMIT) -> list[dict]:
-        """Summaries, oldest first, WITHOUT reasoning text (bounded payload)."""
+        """Summaries, NEWEST first, WITHOUT reasoning text (bounded payload).
+
+        Newest first because the panel is read top-down during a live run: the
+        thought the owner cares about is the one that just finished, and it
+        must not sit at the bottom of a scrolling list.
+        """
         limit = max(1, min(int(limit), 200))
         with self.db.read() as conn:
             rows = conn.execute(
@@ -177,7 +182,7 @@ class ThoughtStore:
                 (session_id, limit),
             ).fetchall()
         out = []
-        for row in reversed(list(rows)):
+        for row in rows:
             t = _row(row)
             buf = self._live.get(t.id)
             if buf is not None:  # DB lags up to a second while streaming

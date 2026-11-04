@@ -444,7 +444,8 @@
   }
 
   // ---------- owner's chain of thought ----------
-  // One row per model call: the summary line always visible, the full
+  // One row per model call, newest at the top. The summary line always
+  // visible, the full
   // reasoning under it ONLY for the row the owner tapped. Rows are built
   // once and updated in place, so an open row keeps its scroll position and
   // its expanded state while the stream keeps pushing — tapping one row
@@ -463,6 +464,20 @@
       '<div class="thought-body" hidden><pre class="thought-detail"></pre></div>';
     el.querySelector(".thought-head").addEventListener("click", () => toggleThought(id));
     return el;
+  }
+
+  // Newest first: rows are kept in descending thought id, so the thought the
+  // agent just finished sits at the top instead of pushing the panel down.
+  // Order-aware (not a plain prepend) because the seeded list and a thought
+  // that starts streaming arrive from opposite ends.
+  function placeThought(wrap, el, id) {
+    for (const sib of wrap.children) {
+      if (Number(sib.dataset.thought) < id) {
+        wrap.insertBefore(el, sib);
+        return;
+      }
+    }
+    wrap.appendChild(el);
   }
 
   function setThoughtOpen(el, open) {
@@ -489,7 +504,7 @@
       if (live && live.id === t.id && typeof live.detail === "string") rec.detail = live.detail;
       state.ws.thoughts.set(t.id, rec);
       let el = wrap.querySelector(`[data-thought="${t.id}"]`);
-      if (!el) { el = createThoughtRow(t.id); wrap.appendChild(el); }
+      if (!el) { el = createThoughtRow(t.id); placeThought(wrap, el, t.id); }
       updateThoughtRow(el, rec);
     }
     // The server keeps the newest rows only; drop what it no longer sends so

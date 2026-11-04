@@ -194,7 +194,9 @@ class TestApi:
         assert res.status_code == 200
         line = next(l for l in res.text.splitlines() if l.startswith("data: "))
         snap = json.loads(line[6:])
-        assert [t["label"] for t in snap["thoughts"]] == ["Finished thought", "Phase 2 · step 1"]
+        # NEWEST first: the panel is read top-down while a call streams, so the
+        # most recent thought leads the list.
+        assert [t["label"] for t in snap["thoughts"]] == ["Phase 2 · step 1", "Finished thought"]
         assert all("detail" not in t for t in snap["thoughts"])
         assert snap["live_thought"]["id"] == live_id
         assert snap["live_thought"]["detail"] == "streaming reasoning in progress"

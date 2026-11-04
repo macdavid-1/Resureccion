@@ -129,7 +129,7 @@ async def activity(session_id: str, request: Request, after_id: int = 0, limit: 
 
 @router.get("/{session_id}/thoughts")
 async def thoughts(session_id: str, request: Request, limit: int = 50) -> dict:
-    """Chain-of-thought SUMMARIES, oldest first (no reasoning text — that
+    """Chain-of-thought SUMMARIES, newest first (no reasoning text — that
     is fetched per-row on tap, so the list stays cheap on a phone)."""
     _auth(request)
     st = request.app.state
