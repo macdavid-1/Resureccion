@@ -28,6 +28,7 @@ with a clear message in that case, and the rest of Resurrección works.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -76,67 +77,333 @@ class BrowserManagerError(Exception):
 # and they swallow clicks aimed at the page underneath, so every research
 # navigation dismisses them automatically before anything is captured.
 #
+# WHY the old click selector missed them: Amazon renders EVERY button as
+#   <span class="a-button"><span class="a-button-inner">
+#     <input class="a-button-input" type="submit">        ← no value, no label
+#     <span class="a-button-text" aria-hidden="true">Dismiss</span>
+#   </span></span>
+# The input carries no text at all, and the span that DOES say "Dismiss" was
+# not in the query — so nothing was ever clicked, and the tooltip sat over the
+# result total in every screenshot. The scan now runs over the label-bearing
+# nodes and clicks the surrounding `.a-button`, and it is gated on the
+# shipping tooltip text: scanning every button on an Amazon page (thousands,
+# each `innerText` forcing layout) cost whole seconds per navigation.
+#
 # ONLY refusal labels are ever clicked ("Dismiss", "No thanks", …): clicking
 # something like "Change Address" or "Accept" would alter the owner's
 # session state, which research must never do.
+_OVERLAY_CONTAINERS = (
+    '.a-popover, [role="dialog"], .a-modal, .a-modal-scroller, '
+    '.a-notification-container, #sp-cc-banner, .glow-ingress, '
+    '#nav-global-location-slot, [data-a-popover]'
+)
+# The interstitial's own words. Text-matching the container (not a fixed id)
+# means a markup change still gets caught; a normal delivery block never says
+# this, so ordinary page text is never touched.
+_SHIPPING_TEXT_JS = (
+    # `\s+` because the notice wraps across lines in Amazon's own markup
+    # ("…items that ship\n to a different country…").
+    "const SHIP = /showing you items that ship\\s+to|change your delivery address/i;"
+)
+
 _OVERLAY_DISMISS_JS = """() => {
   const clicked = [];
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-  const REFUSALS = new Set(['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip']);
+  const REFUSALS = new Set(['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip', 'close']);
+  const CONTAINERS = CONTAINERS_SEL;
+  const BTN = 'button, [role="button"], a.a-button-link, input[type="button"], ' +
+              'input[type="submit"], span.a-button-text, [data-action="a-popover-close"]';
+  SHIPPING_TEXT
   const visible = (el) => {
     try {
       if (!el.getClientRects || !el.getClientRects().length) return false;
       const st = window.getComputedStyle(el);
       if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
-      if (Number(st.opacity || 1) < 0.15) return false;
-      return true;
+      return Number(st.opacity || 1) >= 0.15;
     } catch (e) { return false; }
   };
-  let nodes = [];
+  const labelOf = (el) => {
+    let t = norm(el.innerText || el.textContent || el.value);
+    if (!t && el.getAttribute) {
+      const ref = el.getAttribute('aria-labelledby');
+      if (ref) { const n = document.getElementById(ref); if (n) t = norm(n.textContent); }
+    }
+    if (!t && el.getAttribute) t = norm(el.getAttribute('aria-label'));
+    return t;
+  };
+  // Cheap gate first: without the interstitial on the page there is nothing
+  // to dismiss, and no reason to walk thousands of page buttons.
+  let roots = [];
   try {
-    nodes = Array.from(document.querySelectorAll(
-      'button, [role="button"], a.a-button-link, input[type="button"], input[type="submit"]'
-    ));
+    for (const el of document.querySelectorAll(CONTAINERS)) {
+      try {
+        if (el.getAttribute('data-resur-hidden')) continue;
+        if (!el.getClientRects().length) continue;
+        if (SHIP.test(el.textContent || '')) roots.push(el);
+      } catch (e) {}
+    }
   } catch (e) { return clicked; }
-  for (const el of nodes) {
+  if (!roots.length) return clicked;
+  for (const root of roots) {
     if (clicked.length >= 4) break;
-    const label = norm(el.innerText || el.value || el.getAttribute('aria-label'));
-    if (!REFUSALS.has(label)) continue;
-    if (!visible(el)) continue;
-    const inOverlay = !!el.closest(
-      '.a-popover, [role="dialog"], .a-modal, .a-modal-scroller, ' +
-      '.a-notification-container, #sp-cc-banner, .glow-ingress'
-    );
-    // "Dismiss" on its own is unambiguous; the softer labels only count
-    // when they are inside a real overlay.
-    if (!inOverlay && label !== 'dismiss') continue;
-    try { el.click(); clicked.push(label); } catch (e) {}
+    let nodes = [];
+    try { nodes = Array.from(root.querySelectorAll(BTN)); } catch (e) { continue; }
+    for (const el of nodes) {
+      const label = labelOf(el);
+      if (!REFUSALS.has(label)) continue;
+      const target = (el.closest && el.closest('.a-button')) || el;
+      if (!visible(target)) continue;
+      // Mark it so a REAL pointer click can follow if the synthetic one is
+      // ignored (some handlers only react to trusted events).
+      try { target.setAttribute('data-resur-dismiss', label); } catch (e) {}
+      try { target.click(); clicked.push(label); } catch (e) {}
+      break;  // one refusal per overlay per pass
+    }
   }
   return clicked;
 }"""
 
+_OVERLAY_PRESENT_JS = """() => {
+  SHIPPING_TEXT
+  const CONTAINERS = CONTAINERS_SEL;
+  let n = 0;
+  try {
+    for (const el of document.querySelectorAll(CONTAINERS)) {
+      try {
+        if (el.getAttribute('data-resur-hidden')) continue;
+        if (!el.getClientRects().length) continue;
+        if (el.getAttribute('data-resur-dismissed')) continue;
+        if (SHIP.test(el.textContent || '')) n++;
+      } catch (e) {}
+    }
+  } catch (e) { return 0; }
+  return n;
+}"""
 
-async def dismiss_amazon_overlays(page: Any) -> list[str]:
-    """Click away blocking Amazon overlays (shipping-country tooltip, …).
+# Last resort so a capture can never be obstructed: hide the overlay itself.
+# It is purely informational (it carries no session state), and the guard
+# un-hides it the moment its text stops being the shipping notice, so a shared
+# Amazon popover element is never left invisible.
+_OVERLAY_HIDE_JS = """() => {
+  SHIPPING_TEXT
+  const CONTAINERS = CONTAINERS_SEL;
+  let hidden = 0;
+  try {
+    // Restore any overlay that no longer shows the shipping notice.
+    for (const el of document.querySelectorAll('[data-resur-hidden]')) {
+      try {
+        if (SHIP.test(el.textContent || '')) continue;
+        el.style.removeProperty('display');
+        el.removeAttribute('data-resur-hidden');
+      } catch (e) {}
+    }
+    for (const el of document.querySelectorAll(CONTAINERS)) {
+      try {
+        if (!el.getClientRects().length) continue;
+        if (!SHIP.test(el.textContent || '')) continue;
+        el.style.setProperty('display', 'none', 'important');
+        el.setAttribute('data-resur-hidden', '1');
+        hidden++;
+      } catch (e) {}
+    }
+  } catch (e) { return hidden; }
+  return hidden;
+}"""
 
-    Best-effort by design: a page without the overlay, a fake test page, or
-    a script error all return an empty list — this never affects the
-    navigation it follows. Returns the labels that were actually clicked so
-    callers can journal the dismissal.
-    """
+# Installed on every page/context as an init script: a MutationObserver that
+# dismisses the interstitial the INSTANT Amazon renders it — before any
+# screenshot, before the agent knows it exists, and on every single
+# appearance (a search page re-shows it once per page load). This is what
+# makes dismissal independent of the model: no action has to be requested.
+_OVERLAY_GUARD_JS = """(() => {
+  if (window.__resurreccionOverlayGuard) return;
+  window.__resurreccionOverlayGuard = true;
+  SHIPPING_TEXT
+  const CONTAINERS = CONTAINERS_SEL;
+  const BTN = 'button, [role="button"], a.a-button-link, input[type="button"], ' +
+              'input[type="submit"], span.a-button-text, [data-action="a-popover-close"]';
+  const REFUSALS = ['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip', 'close'];
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  let last = 0;
+  const labelOf = (el) => {
+    let t = norm(el.innerText || el.textContent || el.value);
+    if (!t && el.getAttribute) {
+      const ref = el.getAttribute('aria-labelledby');
+      if (ref) { const n = document.getElementById(ref); if (n) t = norm(n.textContent); }
+    }
+    if (!t && el.getAttribute) t = norm(el.getAttribute('aria-label'));
+    return t;
+  };
+  const roots = () => {
+    const out = [];
+    try {
+      for (const el of document.querySelectorAll(CONTAINERS)) {
+        try {
+          if (el.getAttribute('data-resur-hidden')) continue;
+          if (!el.getClientRects().length) continue;
+          if (el.getAttribute('data-resur-dismissed')) continue;
+          if (SHIP.test(el.textContent || '')) out.push(el);
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return out;
+  };
+  const sweep = () => {
+    // Un-hide a container whose content changed away from the notice.
+    try {
+      for (const el of document.querySelectorAll('[data-resur-hidden]')) {
+        try {
+          if (SHIP.test(el.textContent || '')) continue;
+          el.style.removeProperty('display');
+          el.removeAttribute('data-resur-hidden');
+        } catch (e) {}
+      }
+    } catch (e) {}
+    const found = roots();
+    for (const root of found) {
+      let nodes = [];
+      try { nodes = root.querySelectorAll(BTN); } catch (e) { continue; }
+      for (const el of nodes) {
+        if (REFUSALS.indexOf(labelOf(el)) < 0) continue;
+        const target = (el.closest && el.closest('.a-button')) || el;
+        try { target.click(); } catch (e) {}
+        break;
+      }
+    }
+    if (!found.length) return;
+    // If the click did not close it, hide it: a capture must never be blocked.
+    setTimeout(() => {
+      for (const el of roots()) {
+        try {
+          if (!SHIP.test(el.textContent || '')) continue;
+          el.style.setProperty('display', 'none', 'important');
+          el.setAttribute('data-resur-hidden', '1');
+        } catch (e) {}
+      }
+    }, 400);
+  };
+  let timer = null;
+  const schedule = () => {
+    // Coalesce bursts of mutations WITHOUT dropping the last one: an
+    // appearance that lands inside the window must still be swept, a beat
+    // later — dropping it would leave the tooltip up for the whole page.
+    if (timer) return;
+    const wait = Math.max(0, 200 - (Date.now() - last));
+    timer = setTimeout(() => {
+      timer = null;
+      last = Date.now();
+      try { sweep(); } catch (e) {}
+    }, wait);
+  };
+  try {
+    // Observe `document`, not `document.documentElement`: an init script can
+    // run before the root element exists, and `observe(null)` would silently
+    // install nothing (the exact reason a late overlay was never caught).
+    new MutationObserver(schedule).observe(document, {
+      childList: true, subtree: true,
+    });
+  } catch (e) {}
+  try { document.addEventListener('DOMContentLoaded', schedule); } catch (e) {}
+  try { window.addEventListener('load', schedule); } catch (e) {}
+  schedule();
+})();"""
+
+
+def _overlay_script(template: str) -> str:
+    """Fill the shared shipping-text pattern / container selector into JS."""
+    return template.replace(
+        "CONTAINERS_SEL", json.dumps(_OVERLAY_CONTAINERS)
+    ).replace("SHIPPING_TEXT", _SHIPPING_TEXT_JS)
+
+
+async def _overlay_present(page: Any) -> bool:
+    """True while a shipping-distance interstitial still covers the page."""
     try:
-        clicked = await page.evaluate(_OVERLAY_DISMISS_JS)
+        count = await page.evaluate(_overlay_script(_OVERLAY_PRESENT_JS))
+    except Exception:
+        return False
+    return isinstance(count, int) and not isinstance(count, bool) and count > 0
+
+
+async def _click_marked(page: Any) -> list[str]:
+    """Issue trusted pointer clicks on the refusal buttons the JS marked."""
+    try:
+        handles = await page.query_selector_all("[data-resur-dismiss]")
     except Exception:
         return []
-    if not isinstance(clicked, list) or not clicked:
-        return []
+    clicked: list[str] = []
+    for handle in handles[:3]:
+        try:
+            await handle.click(timeout=1500, force=True)
+        except Exception:
+            continue
+        try:
+            label = await handle.get_attribute("data-resur-dismiss")
+        except Exception:
+            label = None
+        if label:
+            clicked.append(str(label))
     try:
-        # Give the overlay's close animation a beat so the next capture
-        # (screenshot / result-count read) sees the unobstructed page.
-        await page.wait_for_timeout(250)
+        await page.evaluate(
+            "() => document.querySelectorAll('[data-resur-dismiss]')"
+            ".forEach((e) => e.removeAttribute('data-resur-dismiss'))"
+        )
     except Exception:
         pass
-    return [str(c) for c in clicked][:4]
+    return clicked
+
+
+async def _hide_overlays(page: Any) -> int:
+    try:
+        hidden = await page.evaluate(_overlay_script(_OVERLAY_HIDE_JS))
+    except Exception:
+        return 0
+    return hidden if isinstance(hidden, int) and not isinstance(hidden, bool) else 0
+
+
+async def dismiss_amazon_overlays(page: Any, *, rounds: int = 2) -> list[str]:
+    """Click away blocking Amazon overlays (shipping-country tooltip, …).
+
+    Runs on EVERY navigation, every evidence capture and every screenshot, so
+    the interstitial can never reach the model's eyes: the printed
+    "1-16 of over 958 results" line is the competition figure the research
+    reports, and a tooltip sitting on it turns 958 into a number the model
+    reads as 4.
+
+    Repeatable by design — one call per appearance, and the in-page guard
+    (`_OVERLAY_GUARD_JS`) fires on its own for appearances between calls.
+
+    Best-effort: a page without the overlay, a fake test page, or a script
+    error all return an empty list; this never affects the navigation it
+    follows. Returns the labels actually dismissed so callers can journal it.
+    """
+    clicked: list[str] = []
+    try:
+        first = await page.evaluate(_overlay_script(_OVERLAY_DISMISS_JS))
+    except Exception:
+        return []
+    if isinstance(first, list) and first:
+        clicked.extend(str(c) for c in first[:4])
+        try:
+            # Give the overlay's close animation a beat so the next capture
+            # (screenshot / result-count read) sees the unobstructed page.
+            await page.wait_for_timeout(250)
+        except Exception:
+            pass
+    if not await _overlay_present(page):
+        return clicked[:4]
+    # Still there: retry with real pointer events, then hide it outright.
+    for _ in range(max(0, rounds - 1)):
+        clicked.extend(await _click_marked(page))
+        try:
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
+        if not await _overlay_present(page):
+            return clicked[:4]
+    if await _hide_overlays(page):
+        clicked.append("hidden")
+    return clicked[:4]
 
 
 # Consecutive browser-level proxy refusals (no successful navigation in
@@ -222,6 +489,9 @@ class BrowserManager:
         self._last_activity: float | None = None
         self._last_launched: float | None = None
         self._launch_error: str | None = None
+        # The context the overlay guard init script was installed on (the
+        # guard re-installs whenever that context is replaced).
+        self._overlay_guard_context: Any = None
         # Egress actually in effect for the current context: "relay" | "proxy"
         # | "direct" | None. A launch-time health check demotes a dead
         # BROWSER_PROXY to direct egress (policy permitting) instead of
@@ -438,6 +708,8 @@ class BrowserManager:
             except Exception:
                 pass
             self._context = None
+        # A new context needs the overlay guard installed again.
+        self._overlay_guard_context = None
         if self._camoufox is not None:
             # The Camoufox handle owns the Playwright driver when active.
             try:
@@ -494,6 +766,7 @@ class BrowserManager:
         page = await ctx.new_page()
         if interactive:
             page._resurreccion_protected = True
+        await self._install_overlay_guard(page)
         # Viewport policy: research pages and desktop-class owner pages get
         # an explicit full-PC viewport (1920×1080 by default) — screenshots
         # show the whole desktop layout, with no fold cutoffs for the AI's
@@ -579,9 +852,18 @@ class BrowserManager:
         ignore it behave as before.
         """
         try:
-            return await self._goto_resilient(page, url)
+            target = await self._goto_resilient(page, url)
         except PlaywrightError as exc:  # pragma: no cover - defensive
             raise BrowserManagerError(f"navigation failed: {exc}") from exc
+        # Overlays belong to the page, not to an action: dismiss on EVERY
+        # navigation so the interstitial is gone before the model's first
+        # look at the results page — including a run resumed mid-phase, which
+        # asks the model for nothing before it navigates.
+        try:
+            await dismiss_amazon_overlays(target)
+        except Exception:
+            pass
+        return target
 
     async def _goto_resilient(self, page: Any, url: str) -> Any:
         """page.goto wrapped in the full egress-recovery ladder.
@@ -866,6 +1148,15 @@ class BrowserManager:
             data = await page.screenshot(type="png", full_page=False)
         except Exception as exc:
             raise BrowserManagerError(f"screenshot failed: {exc}") from exc
+        # An overlay can render DURING the capture (it appears a beat after
+        # load). Re-check and retake, so the model is never shown a number
+        # that the tooltip is covering.
+        try:
+            if await _overlay_present(page):
+                await dismiss_amazon_overlays(page)
+                data = await page.screenshot(type="png", full_page=False)
+        except Exception:
+            pass
         self._touch()
         return data
 
@@ -881,6 +1172,10 @@ class BrowserManager:
             pages = [p for p in self._context.pages if not getattr(p, "_resurreccion_protected", False)]
             if not pages:
                 return None
+            try:
+                await dismiss_amazon_overlays(pages[-1])
+            except Exception:
+                pass
             data = await pages[-1].screenshot(type="png", full_page=False)
             self._touch()
             return data
@@ -915,7 +1210,24 @@ class BrowserManager:
         if not self.is_running:
             await self.launch()
         assert self._context is not None
+        # Context-level guard: every document in every tab (including popups
+        # Amazon opens itself) dismisses the shipping interstitial the moment
+        # it renders — no model action, no screenshot round trip. A resumed
+        # paused run gets it on the context it relaunches with.
+        if self._overlay_guard_context is not self._context:
+            try:
+                await self._context.add_init_script(_overlay_script(_OVERLAY_GUARD_JS))
+                self._overlay_guard_context = self._context
+            except Exception:
+                pass
         return self._context
+
+    async def _install_overlay_guard(self, page: Any) -> None:
+        """Per-page guard, so pages that predate the context hook get it too."""
+        try:
+            await page.add_init_script(_overlay_script(_OVERLAY_GUARD_JS))
+        except Exception:
+            pass
 
 
 def _iso_from(ts: float | None) -> str | None:

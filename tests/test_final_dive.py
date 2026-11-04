@@ -186,6 +186,34 @@ async def test_dismiss_returns_labels_and_waits_for_the_animation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_navigation_dismisses_the_overlay_before_the_agent_sees_it(monkeypatch) -> None:
+    """Every navigation is a dismissal point.
+
+    A paused run that resumes mid-phase asks the model for nothing before it
+    navigates, so the navigation itself has to clear the tooltip — otherwise
+    the first screenshot after a resume is the one that lies about the total.
+    """
+    from app import browser_manager as bm
+
+    calls: list[object] = []
+
+    async def fake_dismiss(page, **_kwargs):
+        calls.append(page)
+        return ["dismiss"]
+
+    monkeypatch.setattr(bm, "dismiss_amazon_overlays", fake_dismiss)
+    manager = bm.BrowserManager.__new__(bm.BrowserManager)
+    page = object()
+
+    async def _goto(p, _url):
+        return p
+
+    manager._goto_resilient = _goto
+    assert await manager.navigate(page, "https://www.amazon.com/s?k=x") is page
+    assert calls == [page]
+
+
+@pytest.mark.asyncio
 async def test_dismiss_never_raises_on_a_page_without_the_overlay() -> None:
     class Page:
         async def evaluate(self, _js):

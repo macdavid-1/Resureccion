@@ -48,6 +48,10 @@ ignore = ["BLE001", "S110", "S112"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Real Camoufox browser tests (skip themselves when no browser launches).
+    "browser: launches a real browser and asserts on captured pixels",
+]
 
 [tool.setuptools]
 packages = ["app"]
