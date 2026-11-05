@@ -95,7 +95,12 @@ class BrowserManagerError(Exception):
 _OVERLAY_CONTAINERS = (
     '.a-popover, [role="dialog"], .a-modal, .a-modal-scroller, '
     '.a-notification-container, #sp-cc-banner, .glow-ingress, '
-    '#nav-global-location-slot, [data-a-popover]'
+    '#nav-global-location-slot, [data-a-popover], '
+    # The shipping-country prompt is a "glow toaster", not a popover, and its
+    # own ids are generated per render. These are only a cheap first guess;
+    # matching the notice's WORDS (see `overlayRoots`) is what guarantees it
+    # is found — the container list alone silently missed it in production.
+    '#glow-toaster-slot, [id^="glow-toaster"], [class*="glow-toaster"]'
 )
 # The interstitial's own words. Text-matching the container (not a fixed id)
 # means a markup change still gets caught; a normal delivery block never says
@@ -106,90 +111,165 @@ _SHIPPING_TEXT_JS = (
     "const SHIP = /showing you items that ship\\s+to|change your delivery address/i;"
 )
 
-_OVERLAY_DISMISS_JS = """() => {
-  const clicked = [];
-  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-  const REFUSALS = new Set(['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip', 'close']);
-  const CONTAINERS = CONTAINERS_SEL;
-  const BTN = 'button, [role="button"], a.a-button-link, input[type="button"], ' +
-              'input[type="submit"], span.a-button-text, [data-action="a-popover-close"]';
-  SHIPPING_TEXT
-  const visible = (el) => {
-    try {
-      if (!el.getClientRects || !el.getClientRects().length) return false;
-      const st = window.getComputedStyle(el);
-      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
-      return Number(st.opacity || 1) >= 0.15;
-    } catch (e) { return false; }
-  };
-  const labelOf = (el) => {
-    let t = norm(el.innerText || el.textContent || el.value);
-    if (!t && el.getAttribute) {
-      const ref = el.getAttribute('aria-labelledby');
-      if (ref) { const n = document.getElementById(ref); if (n) t = norm(n.textContent); }
-    }
-    if (!t && el.getAttribute) t = norm(el.getAttribute('aria-label'));
-    return t;
-  };
-  // Cheap gate first: without the interstitial on the page there is nothing
-  // to dismiss, and no reason to walk thousands of page buttons.
-  let roots = [];
+# Shared discovery for every pass below. The prompt is found by its WORDS as
+# well as by container, because Amazon renders this notice as a "glow toaster"
+# whose ids are generated per render: the container list alone missed it, so
+# the tooltip sat over the printed "1-16 of over 958 results" line and the
+# model read the total as 4.
+_OVERLAY_HELPERS_JS = r"""
+const OVERLAY_KNOWN = CONTAINERS_SEL;
+const BTN = 'button, [role="button"], a.a-button-link, input[type="button"], ' +
+            'input[type="submit"], span.a-button-text, [data-action="a-popover-close"]';
+const REFUSALS = new Set(['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip', 'close']);
+SHIPPING_TEXT
+const SHIP_STRONG = /showing you items that ship\s+to/i;
+const onorm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const olabel = (el) => {
+  let t = onorm(el.innerText || el.textContent || el.value);
+  if (!t && el.getAttribute) {
+    const ref = el.getAttribute('aria-labelledby');
+    if (ref) { const n = document.getElementById(ref); if (n) t = onorm(n.textContent); }
+  }
+  if (!t && el.getAttribute) t = onorm(el.getAttribute('aria-label'));
+  return t;
+};
+const ovisible = (el) => {
   try {
-    for (const el of document.querySelectorAll(CONTAINERS)) {
+    if (!el.getClientRects || !el.getClientRects().length) return false;
+    const st = window.getComputedStyle(el);
+    if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+    return Number(st.opacity || 1) >= 0.15;
+  } catch (e) { return false; }
+};
+const oskipped = (el) => {
+  try {
+    return !!(el.getAttribute('data-resur-hidden') ||
+              el.getAttribute('data-resur-dismissed'));
+  } catch (e) { return false; }
+};
+const oshaped = (el) => {
+  try {
+    const st = window.getComputedStyle(el);
+    const sig = String(el.id || '') + ' ' + String(el.className || '');
+    return st.position === 'fixed' || st.position === 'absolute' ||
+           /popover|modal|tooltip|toaster|notification/i.test(sig);
+  } catch (e) { return false; }
+};
+// The refusal control inside a box, plus what to click: Amazon's
+// `.a-button-input` carries no text at all, so the surrounding `.a-button` is
+// the element that has to be clicked.
+const orefusal = (el) => {
+  let nodes = [];
+  try { nodes = el.querySelectorAll(BTN); } catch (e) { return null; }
+  for (const b of nodes) {
+    const label = olabel(b);
+    if (!REFUSALS.has(label)) continue;
+    const target = (b.closest && b.closest('.a-button')) || b;
+    if (!ovisible(target)) continue;
+    return { target: target, label: label };
+  }
+  return null;
+};
+// What to hide when a click is ignored: the notice plus the positioned /
+// popover-shaped box it is drawn inside.
+const ohideTargets = (el) => {
+  const out = [el];
+  let up = el.parentElement;
+  for (let i = 0; up && i < 4; i++, up = up.parentElement) {
+    const tag = String(up.tagName || '').toUpperCase();
+    if (tag === 'BODY' || tag === 'HTML') break;
+    if (oshaped(up)) { out.push(up); break; }
+  }
+  return out;
+};
+// Every element carrying the notice: known containers first (cheap), then the
+// DOM's text nodes, each match climbed back up to the box that holds it.
+const overlayRoots = (deep) => {
+  const out = [];
+  const push = (el) => { if (el && out.indexOf(el) < 0) out.push(el); };
+  // Keep only the innermost matches: hiding an outer container would black
+  // out the whole page, and its first refusal may be a different control.
+  const innermost = (list) =>
+    list.filter((el) => !list.some((other) => other !== el && el.contains(other)));
+  try {
+    for (const el of document.querySelectorAll(OVERLAY_KNOWN)) {
       try {
-        if (el.getAttribute('data-resur-hidden')) continue;
-        if (!el.getClientRects().length) continue;
-        if (SHIP.test(el.textContent || '')) roots.push(el);
+        if (oskipped(el) || !el.getClientRects().length) continue;
+        if (SHIP.test(el.textContent || '')) push(el);
       } catch (e) {}
     }
-  } catch (e) { return clicked; }
-  if (!roots.length) return clicked;
-  for (const root of roots) {
-    if (clicked.length >= 4) break;
-    let nodes = [];
-    try { nodes = Array.from(root.querySelectorAll(BTN)); } catch (e) { continue; }
-    for (const el of nodes) {
-      const label = labelOf(el);
-      if (!REFUSALS.has(label)) continue;
-      const target = (el.closest && el.closest('.a-button')) || el;
-      if (!visible(target)) continue;
-      // Mark it so a REAL pointer click can follow if the synthetic one is
-      // ignored (some handlers only react to trusted events).
-      try { target.setAttribute('data-resur-dismiss', label); } catch (e) {}
-      try { target.click(); clicked.push(label); } catch (e) {}
-      break;  // one refusal per overlay per pass
+  } catch (e) {}
+  if (out.length || deep === false) return innermost(out);
+  let walker = null;
+  try {
+    walker = document.createTreeWalker(
+      document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+  } catch (e) { return out; }
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const text = n.nodeValue;
+    if (!text || text.length < 8 || !SHIP.test(text)) continue;
+    // Only PAINTED text counts. A page's own inline JS/template carries the
+    // notice's words too (Amazon's does), and matching that would report an
+    // overlay that is nowhere on screen.
+    const parent = n.parentElement;
+    if (!parent) continue;
+    const tag = String(parent.tagName || '').toUpperCase();
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') continue;
+    if (!parent.getClientRects().length || !ovisible(parent)) continue;
+    let el = parent;
+    let pick = null;
+    let shaped = null;
+    let refused = false;
+    for (let i = 0; el && i < 10; i++, el = el.parentElement) {
+      if (oskipped(el)) { pick = null; break; }
+      if (orefusal(el)) { pick = el; refused = true; break; }
+      if (!pick) pick = el;
+      if (oshaped(el)) shaped = el;
     }
+    if (!refused) {
+      // Without a refusal control only the whole notice is trusted: a page's
+      // own help text ("...change your delivery address") is never hidden.
+      pick = shaped || pick;
+      if (!pick || !SHIP_STRONG.test(pick.textContent || '')) continue;
+      if (!ovisible(pick)) continue;
+    }
+    if (pick && !oskipped(pick)) push(pick);
+    if (out.length >= 8) break;
+  }
+  return innermost(out);
+};
+"""
+
+_OVERLAY_DISMISS_JS = r"""() => {
+  OVERLAY_HELPERS
+  const clicked = [];
+  for (const root of overlayRoots(true)) {
+    if (clicked.length >= 4) break;
+    const hit = orefusal(root);
+    if (!hit) continue;
+    // Mark it so a REAL pointer click can follow if the synthetic one is
+    // ignored (some handlers only react to trusted events).
+    try { hit.target.setAttribute('data-resur-dismiss', hit.label); } catch (e) {}
+    try { hit.target.click(); clicked.push(hit.label); } catch (e) {}
   }
   return clicked;
 }"""
 
-_OVERLAY_PRESENT_JS = """() => {
-  SHIPPING_TEXT
-  const CONTAINERS = CONTAINERS_SEL;
-  let n = 0;
-  try {
-    for (const el of document.querySelectorAll(CONTAINERS)) {
-      try {
-        if (el.getAttribute('data-resur-hidden')) continue;
-        if (!el.getClientRects().length) continue;
-        if (el.getAttribute('data-resur-dismissed')) continue;
-        if (SHIP.test(el.textContent || '')) n++;
-      } catch (e) {}
-    }
-  } catch (e) { return 0; }
-  return n;
+_OVERLAY_PRESENT_JS = r"""() => {
+  OVERLAY_HELPERS
+  return overlayRoots(true).length;
 }"""
 
 # Last resort so a capture can never be obstructed: hide the overlay itself.
 # It is purely informational (it carries no session state), and the guard
 # un-hides it the moment its text stops being the shipping notice, so a shared
 # Amazon popover element is never left invisible.
-_OVERLAY_HIDE_JS = """() => {
-  SHIPPING_TEXT
-  const CONTAINERS = CONTAINERS_SEL;
+_OVERLAY_HIDE_JS = r"""() => {
+  OVERLAY_HELPERS
   let hidden = 0;
   try {
-    // Restore any overlay that no longer shows the shipping notice.
+    // Restore any overlay that no longer shows the shipping notice: Amazon
+    // reuses nodes, and a page must never be left hidden by mistake.
     for (const el of document.querySelectorAll('[data-resur-hidden]')) {
       try {
         if (SHIP.test(el.textContent || '')) continue;
@@ -197,16 +277,17 @@ _OVERLAY_HIDE_JS = """() => {
         el.removeAttribute('data-resur-hidden');
       } catch (e) {}
     }
-    for (const el of document.querySelectorAll(CONTAINERS)) {
+  } catch (e) {}
+  for (const root of overlayRoots(true)) {
+    for (const el of ohideTargets(root)) {
       try {
         if (!el.getClientRects().length) continue;
-        if (!SHIP.test(el.textContent || '')) continue;
         el.style.setProperty('display', 'none', 'important');
         el.setAttribute('data-resur-hidden', '1');
         hidden++;
       } catch (e) {}
     }
-  } catch (e) { return hidden; }
+  }
   return hidden;
 }"""
 
@@ -218,36 +299,9 @@ _OVERLAY_HIDE_JS = """() => {
 _OVERLAY_GUARD_JS = """(() => {
   if (window.__resurreccionOverlayGuard) return;
   window.__resurreccionOverlayGuard = true;
-  SHIPPING_TEXT
-  const CONTAINERS = CONTAINERS_SEL;
-  const BTN = 'button, [role="button"], a.a-button-link, input[type="button"], ' +
-              'input[type="submit"], span.a-button-text, [data-action="a-popover-close"]';
-  const REFUSALS = ['dismiss', 'no thanks', 'no, thanks', 'not now', 'skip', 'close'];
-  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  OVERLAY_HELPERS
   let last = 0;
-  const labelOf = (el) => {
-    let t = norm(el.innerText || el.textContent || el.value);
-    if (!t && el.getAttribute) {
-      const ref = el.getAttribute('aria-labelledby');
-      if (ref) { const n = document.getElementById(ref); if (n) t = norm(n.textContent); }
-    }
-    if (!t && el.getAttribute) t = norm(el.getAttribute('aria-label'));
-    return t;
-  };
-  const roots = () => {
-    const out = [];
-    try {
-      for (const el of document.querySelectorAll(CONTAINERS)) {
-        try {
-          if (el.getAttribute('data-resur-hidden')) continue;
-          if (!el.getClientRects().length) continue;
-          if (el.getAttribute('data-resur-dismissed')) continue;
-          if (SHIP.test(el.textContent || '')) out.push(el);
-        } catch (e) {}
-      }
-    } catch (e) {}
-    return out;
-  };
+  let deepLast = 0;
   const sweep = () => {
     // Un-hide a container whose content changed away from the notice.
     try {
@@ -259,26 +313,34 @@ _OVERLAY_GUARD_JS = """(() => {
         } catch (e) {}
       }
     } catch (e) {}
-    const found = roots();
+    // The text pass walks every text node of the page, which is too much to
+    // repeat on a marketplace page's mutation stream: it runs at most once a
+    // second, while the container pass runs on every sweep.
+    const deep = Date.now() - deepLast >= 1200;
+    if (deep) deepLast = Date.now();
+    const found = overlayRoots(deep);
+    if (!deep) {
+      // A throttled sweep must not become a missed appearance: retry the text
+      // pass as soon as the cooldown allows, instead of waiting for the page
+      // to mutate again (it may never do).
+      setTimeout(sweep, Math.max(0, 1200 - (Date.now() - deepLast)) + 20);
+    }
     for (const root of found) {
-      let nodes = [];
-      try { nodes = root.querySelectorAll(BTN); } catch (e) { continue; }
-      for (const el of nodes) {
-        if (REFUSALS.indexOf(labelOf(el)) < 0) continue;
-        const target = (el.closest && el.closest('.a-button')) || el;
-        try { target.click(); } catch (e) {}
-        break;
-      }
+      const hit = orefusal(root);
+      if (!hit) continue;
+      try { hit.target.click(); } catch (e) {}
     }
     if (!found.length) return;
     // If the click did not close it, hide it: a capture must never be blocked.
     setTimeout(() => {
-      for (const el of roots()) {
-        try {
-          if (!SHIP.test(el.textContent || '')) continue;
-          el.style.setProperty('display', 'none', 'important');
-          el.setAttribute('data-resur-hidden', '1');
-        } catch (e) {}
+      for (const root of overlayRoots(true)) {
+        for (const el of ohideTargets(root)) {
+          try {
+            if (!el.getClientRects().length) continue;
+            el.style.setProperty('display', 'none', 'important');
+            el.setAttribute('data-resur-hidden', '1');
+          } catch (e) {}
+        }
       }
     }, 400);
   };
@@ -310,10 +372,12 @@ _OVERLAY_GUARD_JS = """(() => {
 
 
 def _overlay_script(template: str) -> str:
-    """Fill the shared shipping-text pattern / container selector into JS."""
-    return template.replace(
-        "CONTAINERS_SEL", json.dumps(_OVERLAY_CONTAINERS)
-    ).replace("SHIPPING_TEXT", _SHIPPING_TEXT_JS)
+    """Expand the shared discovery helper, selectors and notice pattern."""
+    return (
+        template.replace("OVERLAY_HELPERS", _OVERLAY_HELPERS_JS)
+        .replace("CONTAINERS_SEL", json.dumps(_OVERLAY_CONTAINERS))
+        .replace("SHIPPING_TEXT", _SHIPPING_TEXT_JS)
+    )
 
 
 async def _overlay_present(page: Any) -> bool:

@@ -11,7 +11,11 @@ from typing import ClassVar
 
 import pytest
 
-from app.browser_manager import _OVERLAY_DISMISS_JS, dismiss_amazon_overlays
+from app.browser_manager import (
+    _OVERLAY_DISMISS_JS,
+    _overlay_script,
+    dismiss_amazon_overlays,
+)
 from app.evidence_capture import _extract_results_summary
 from app.final_dive import FinalCandidateDive, competition_label
 from app.marketplace import AMAZON_MARKETPLACES
@@ -160,7 +164,11 @@ def test_dismiss_script_only_ever_clicks_refusal_labels() -> None:
     """
     import re
 
-    m = re.search(r"REFUSALS = new Set\(\[(.*?)\]\)", _OVERLAY_DISMISS_JS)
+    # Search the script as the browser actually receives it (the refusal set
+    # lives in the shared discovery helper that is expanded into it).
+    m = re.search(
+        r"REFUSALS = new Set\(\[(.*?)\]\)", _overlay_script(_OVERLAY_DISMISS_JS)
+    )
     assert m, "the dismiss script must declare an explicit click set"
     labels = m.group(1)
     assert "'dismiss'" in labels and "'no thanks'" in labels

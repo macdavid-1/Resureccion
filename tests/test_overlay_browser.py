@@ -94,6 +94,59 @@ _BASE_HTML = """<!doctype html>
 """
 
 
+# The production regression, reproduced: the notice is MOUNTED IN A CONTAINER
+# THE DETECTOR NEVER LISTED. Amazon renders it as a generated "glow toaster"
+# (`#nav-tip-…`, `.nav-tip`), so matching known containers found nothing at
+# all and the tooltip stayed on screen; only the notice's own words are stable.
+_TOASTER_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  body { font: 16px sans-serif; margin: 0; background: #ffffff; }
+  #topline { margin: 20px; font-size: 18px; }
+  #nav-tip-7c1 { position: fixed; top: 40px; left: 40px; width: 460px;
+                 height: 130px; background: rgb(255, 0, 170); z-index: 99999;
+                 padding: 12px; color: #111; }
+</style></head>
+<body>
+  <div id="topline">1-16 of over 958 results for "pesticide applicator"</div>
+  <script>
+    document.body.dataset.accepted = '0';
+    document.body.dataset.shown = '0';
+    const TEMPLATE = document.createElement('div');
+    TEMPLATE.innerHTML = `
+      <div id="nav-tip-7c1" class="nav-tip">
+        <span>
+          We're showing you items that ship to Nigeria. To see items that ship
+          to a different country, change your delivery address.
+        </span>
+        <span class="a-button a-button-primary a-button-small" id="dismiss-btn">
+          <span class="a-button-inner">
+            <input class="a-button-input" type="submit" aria-labelledby="dismiss-label">
+            <span class="a-button-text" aria-hidden="true" id="dismiss-label">Dismiss</span>
+          </span>
+        </span>
+        <span class="a-button a-button-base" id="change-btn">
+          <span class="a-button-inner">
+            <span class="a-button-text" aria-hidden="true">Change Address</span>
+          </span>
+        </span>
+      </div>`;
+    document.addEventListener('resur-show', () => {
+      document.querySelectorAll('#nav-tip-7c1').forEach((n) => n.remove());
+      const node = TEMPLATE.firstElementChild.cloneNode(true);
+      node.querySelector('#dismiss-btn').addEventListener('click', () => node.remove());
+      node.querySelector('#change-btn').addEventListener('click', () => {
+        document.body.dataset.accepted = '1';
+      });
+      document.body.appendChild(node);
+      document.body.dataset.shown = String(Number(document.body.dataset.shown || 0) + 1);
+    });
+    setTimeout(() => document.dispatchEvent(new Event('resur-show')), 700);
+  </script>
+</body></html>
+"""
+
+
 def _write_page(tmp: pathlib.Path, *, dismissible: bool = True, auto: bool = True) -> str:
     html = _BASE_HTML % {
         "dismissible": "true" if dismissible else "false",
@@ -251,6 +304,68 @@ def test_a_clean_results_page_is_left_untouched(browser, loop, tmp_path) -> None
         assert await _overlay_present(page) is False
         assert "958" in await page.inner_text("#topline")
         assert await page.is_visible("#topline")
+
+    loop.run_until_complete(run())
+
+
+def test_the_notice_is_found_in_a_container_the_detector_never_listed(
+    config, browser, loop, tmp_path
+) -> None:
+    """The production regression: the prompt lives in a generated container.
+
+    Its id and class are random per render, so only matching the notice's
+    WORDS can find it. This is the case that shipped broken: the tooltip sat
+    over "1-16 of over 958 results" and the count was read as 4.
+    """
+
+    async def run() -> None:
+        path = tmp_path / "toaster.html"
+        path.write_text(_TOASTER_HTML, encoding="utf-8")
+        page = await browser.new_page()
+        await page.set_viewport_size({"width": 1280, "height": 800})
+        await page.add_init_script(_overlay_script(_OVERLAY_GUARD_JS))
+        await page.goto(path.as_uri())
+        await page.wait_for_timeout(1000)  # it auto-shows at 700 ms
+        assert await page.evaluate("() => document.body.dataset.shown") == "1"
+
+        # The in-page guard alone must clear it — no model, no Python call.
+        for _ in range(40):
+            await page.wait_for_timeout(50)
+            if not await _overlay_present(page):
+                break
+        assert await _overlay_present(page) is False, "the tooltip was never dismissed"
+
+        data = await _manager(config).screenshot(page)
+        assert not _has_banner_pixels(data), "the captured PNG still shows the tooltip"
+        assert await page.evaluate("() => document.body.dataset.accepted") == "0"
+
+    loop.run_until_complete(run())
+
+
+def test_page_text_that_merely_mentions_delivery_is_never_hidden(browser, loop, tmp_path) -> None:
+    """A help paragraph is not the interstitial: nothing may be touched.
+
+    The words alone are not enough — without a refusal control the whole
+    notice has to be present before anything is hidden.
+    """
+
+    async def run() -> None:
+        html = (
+            "<html><body>"
+            "<p id=help>To send a gift, change your delivery address in Your Account.</p>"
+            "<div id=keep>1-16 of over 958 results</div>"
+            "</body></html>"
+        )
+        path = tmp_path / "help.html"
+        path.write_text(html, encoding="utf-8")
+        page = await browser.new_page()
+        await page.add_init_script(_overlay_script(_OVERLAY_GUARD_JS))
+        await page.goto(path.as_uri())
+        await page.wait_for_timeout(300)
+
+        assert await dismiss_amazon_overlays(page) == []
+        assert await page.is_visible("#help")
+        assert await page.is_visible("#keep")
 
     loop.run_until_complete(run())
 
