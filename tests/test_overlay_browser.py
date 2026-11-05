@@ -328,12 +328,20 @@ def test_the_notice_is_found_in_a_container_the_detector_never_listed(
         await page.wait_for_timeout(1000)  # it auto-shows at 700 ms
         assert await page.evaluate("() => document.body.dataset.shown") == "1"
 
-        # The in-page guard alone must clear it — no model, no Python call.
-        for _ in range(40):
-            await page.wait_for_timeout(50)
-            if not await _overlay_present(page):
-                break
-        assert await _overlay_present(page) is False, "the tooltip was never dismissed"
+        # The in-page guard alone must clear EVERY appearance — no model, no
+        # Python call. Repeats matter: only the first sweep is unthrottled, so
+        # a later one depends on the deep pass being retried, not skipped.
+        for appearance in range(3):
+            if appearance:
+                await page.evaluate("() => document.dispatchEvent(new Event('resur-show'))")
+                assert await _overlay_present(page) is True, "the fixture did not re-show"
+            for _ in range(40):
+                await page.wait_for_timeout(50)
+                if not await _overlay_present(page):
+                    break
+            assert await _overlay_present(page) is False, (
+                f"appearance {appearance + 1} was never dismissed"
+            )
 
         data = await _manager(config).screenshot(page)
         assert not _has_banner_pixels(data), "the captured PNG still shows the tooltip"
