@@ -4025,6 +4025,8 @@ class ResearchRunner:
                     "candidate_id": cand.id,
                     "niche": cand.niche[:120],
                     "keywords_measured": res.keywords_measured,
+                    "phrases_mined": res.phrases_mined,
+                    "phrases_derived_from_niche": res.phrases_derived,
                     "books_categories": len(res.books_categories),
                     "kindle_categories": len(res.kindle_categories),
                     "reviews_read": len(res.reviews),

@@ -562,3 +562,103 @@ def test_dive_evidence_is_indexed_by_niche_for_the_report() -> None:
     assert slot["category_evidence_id"] == "ev_cat"
     assert slot["books"][0]["category"] == "A"
     assert slot["kindle_store"][0]["category"] == "B"
+
+
+# ------------------------------------------------- completion endpoint + fallback
+def test_completion_uses_the_endpoint_amazon_still_serves() -> None:
+    """`/suggestion` 404s on amazon.com now (the storefront uses
+    `/api/2017/suggestions` with the marketplace id), and pointing the dive at
+    it mined ZERO phrases on every run: the keyword list and its accounting
+    were permanently empty."""
+    from app import final_dive
+    from app.frontier import SUGGEST_JS, mid_for
+
+    assert "/api/2017/suggestions" in SUGGEST_JS
+    assert "/suggestion?" in SUGGEST_JS, "the retired path stays as a fallback"
+    assert mid_for("amazon.com") != mid_for("amazon.co.uk")
+    assert mid_for("www.amazon.de") == mid_for("amazon.de")
+    assert final_dive._SUGGEST_JS is SUGGEST_JS, "one endpoint list, not two"
+
+
+@pytest.mark.asyncio
+async def test_keywords_are_measured_when_autocomplete_returns_nothing(db, config):
+    """No suggestion data must never mean no keywords: the niche's own phrases
+    are measured with real searches and labelled as niche-derived."""
+    from app.browser_store import BrowserEvidenceStore
+
+    _seed(db)
+
+    async def _empty(_js, arg=None):
+        return []
+
+    class _NoSuggestions(_DiveBrowser):
+        async def open_marketplace(self, mkt, path: str = "/"):
+            page = await super().open_marketplace(mkt, path)
+            if path == "/":
+                page.evaluate = _empty
+            return page
+
+    res = await FinalCandidateDive(
+        _NoSuggestions(), BrowserEvidenceStore(db),
+        max_keywords=4, max_categories=0, autocomplete_queries=6,
+        time_budget_seconds=30,
+    ).run(
+        session_id="s1",
+        marketplaces=[AMAZON_MARKETPLACES["us"]],
+        niche="grief journals for adult children",
+        candidate_id="c1",
+    )
+
+    assert res.error is None, res.error
+    assert res.phrases_mined == 0
+    assert res.phrases_derived >= 1
+    assert res.keywords, "the keyword section was left empty"
+    assert all(k.get("measured") for k in res.keywords)
+    assert {k.get("source") for k in res.keywords} == {"niche"}
+    assert res.keywords_measured == len(res.keywords)
+    kinds = {e.kind for e in BrowserEvidenceStore(db).list("s1")}
+    assert "keyword_research" in kinds, "the measured keywords never reached evidence"
+
+
+@pytest.mark.asyncio
+async def test_categories_include_their_ancestors_and_can_fill_the_target(db, config):
+    """One product carries a whole category PATH. Recording only its leaf meant
+    `max_categories` could never be reached (a 10-category target stalled at
+    the number of products walked), which is why the accounting always read
+    '3 of 10 ... the rest were not read'."""
+    from app.browser_store import BrowserEvidenceStore
+
+    _seed(db)
+
+    class _DeepBreadcrumbs(_DiveBrowser):
+        async def navigate(self, page, url: str):
+            if "/dp/" not in url:
+                return page
+            return _Page(
+                url,
+                breadcrumbs=[
+                    "Books", "Children's Books", "Growing Up & Facts of Life",
+                    "Difficult Discussions", "Death & Dying",
+                ],
+                product={"title": "Product"},
+            )
+
+    res = await FinalCandidateDive(
+        _DeepBreadcrumbs(), BrowserEvidenceStore(db),
+        max_keywords=0, max_categories=5, products_per_store=1,
+        time_budget_seconds=30,
+    ).run(
+        session_id="s1",
+        marketplaces=[AMAZON_MARKETPLACES["us"]],
+        niche="grief journals for adult children",
+        candidate_id="c1",
+    )
+
+    assert res.error is None, res.error
+    assert len(res.books_categories) == 5, "a category PATH must fill the target"
+    assert [r["category"] for r in res.books_categories][:2] == [
+        "Death & Dying", "Difficult Discussions",
+    ]
+    assert [r["depth"] for r in res.books_categories] == [0, 1, 2, 3, 4]
+    assert all(r["breadcrumb"].startswith("Books >") for r in res.books_categories)
+    assert len(res.kindle_categories) == 5

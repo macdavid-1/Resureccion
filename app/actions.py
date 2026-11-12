@@ -29,6 +29,7 @@ from app.browser_manager import (
 )
 from app.events import EventLog
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
+from app.frontier import ALIAS, SUGGEST_JS, mid_for
 from app.marketplace import (
     AMAZON_MARKETPLACES,
     Marketplace,
@@ -420,16 +421,13 @@ class ActionExecutor:
         try:
             suggestion: list[str] = []
             try:
-                # Firefox/Safari block cross-origin fetch; Chromium's page context
-                # with correct referrer usually permits this same-domain call.
+                # Same-domain completion call. The endpoint list (and the
+                # marketplace id it needs) lives in app.frontier: Amazon
+                # retired the legacy path, so hard-coding it here made this
+                # action return zero suggestions on every run.
                 suggestion = await page.evaluate(
-                    """async (q) => {
-                        const res = await fetch('/suggestion?alias=stripbooks&prefix=' + encodeURIComponent(q), {headers: {'accept': 'application/json'}});
-                        if (!res.ok) return [];
-                        const data = await res.json();
-                        return (data && Array.isArray(data[1])) ? data[1].slice(0, 12) : [];
-                    }""",
-                    query,
+                    SUGGEST_JS,
+                    [ALIAS, mid_for(getattr(mkt, "domain", "")), query],
                 )
             except Exception:
                 suggestion = []

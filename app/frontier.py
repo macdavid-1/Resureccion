@@ -37,18 +37,85 @@ from app.redact import redact, scrub_url
 # Amazon's books alias (the KDP-relevant completion stream).
 ALIAS = "stripbooks"
 
-# Same-origin suggestion call, executed inside the already-open marketplace
-# page (Firefox blocks cross-origin fetch; this is same-domain, like the
-# existing `autocomplete` action).
-_SUGGEST_JS = f"""async (q) => {{
-  try {{
-    const res = await fetch('/suggestion?alias={ALIAS}&prefix=' + encodeURIComponent(q),
-                            {{headers: {{'accept': 'application/json'}}}});
-    if (!res.ok) return [];
-    const data = await res.json();
-    return (Array.isArray(data) && Array.isArray(data[1])) ? data[1].slice(0, 10) : [];
-  }} catch (e) {{ return []; }}
-}}"""
+# Marketplace ids the completion API needs. Amazon RETIRED the legacy
+# `/suggestion` path — it now answers 404 on amazon.com while the storefront's
+# own search box calls `/api/2017/suggestions` — so the legacy path is only a
+# fallback for a marketplace that still serves it. Without this, autocomplete
+# (discovery AND the finalists' backend keywords) silently mined NOTHING.
+MARKETPLACE_IDS: dict[str, str] = {
+    "amazon.com": "ATVPDKIKX0DER",
+    "amazon.co.uk": "A1F83G8C2ARO7P",
+    "amazon.de": "A1PA6795UKMFR9",
+    "amazon.fr": "A13V1IB3VIYZZH",
+    "amazon.it": "APJ6JRA9NG5V4",
+    "amazon.es": "A1RKKUPIHCS9HS",
+    "amazon.ca": "A2EUQ1WTGCTBG2",
+    "amazon.com.au": "A39IBJ37TRP1C6",
+    "amazon.co.jp": "A1VC38T7YXB528",
+    "amazon.in": "A21TJRUUN4KGV",
+    "amazon.com.mx": "A1AM78C64UM0Y8",
+    "amazon.com.br": "A2Q3Y263D00KWC",
+    "amazon.nl": "A1805IZSGTT6HS",
+    "amazon.se": "A2NODRKZP88ZB9",
+    "amazon.pl": "A1C3SOZRARQ6R3",
+    "amazon.com.tr": "A33AVAJ2PDY3EV",
+    "amazon.ae": "A2VIGQ35RCS4UG",
+    "amazon.sa": "A17E79C6D8DWNP",
+    "amazon.sg": "A19VAU5U5O7RUS",
+    "amazon.eg": "ARBP9OOSHTCHU",
+    "amazon.com.be": "AMEN7PMS3EDWL",
+}
+DEFAULT_MARKETPLACE_ID = "ATVPDKIKX0DER"
+
+
+def mid_for(domain: str) -> str:
+    """Marketplace id for a domain (US when the marketplace is unknown)."""
+    d = str(domain or "").strip().lower().lstrip(".")
+    if d in MARKETPLACE_IDS:
+        return MARKETPLACE_IDS[d]
+    for known, mid in MARKETPLACE_IDS.items():
+        if d.endswith("." + known):
+            return mid
+    return DEFAULT_MARKETPLACE_ID
+
+
+# Same-origin completion call, executed inside the already-open marketplace
+# page (Firefox blocks cross-origin fetch; this is same-domain). The modern
+# endpoint is tried FIRST and the retired one second, so a marketplace that
+# still serves `/suggestion` keeps working. Both response shapes are read
+# (`["", [..]]` legacy, `{"suggestions": [{"value": ..}]}` current).
+SUGGEST_JS = """async ([alias, mid, prefix]) => {
+  const paths = [];
+  if (mid) {
+    paths.push('/api/2017/suggestions?limit=11&prefix=' + encodeURIComponent(prefix)
+      + '&suggestion-type=WIDGET&alias=' + encodeURIComponent(alias)
+      + '&mid=' + encodeURIComponent(mid)
+      + '&lop=en_US&site-variant=desktop&client=amazon-search-ui&fb=1&plain-mid=1');
+  }
+  paths.push('/suggestion?alias=' + encodeURIComponent(alias)
+    + '&prefix=' + encodeURIComponent(prefix)
+    + (mid ? '&mid=' + encodeURIComponent(mid) : ''));
+  for (const path of paths) {
+    try {
+      const res = await fetch(path, {headers: {'accept': 'application/json'}});
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (Array.isArray(data) && Array.isArray(data[1])) {
+        return data[1].filter((t) => typeof t === 'string').slice(0, 11);
+      }
+      if (data && Array.isArray(data.suggestions)) {
+        return data.suggestions
+          .map((s) => (s && typeof s === 'object' ? s.value : s))
+          .filter((t) => typeof t === 'string' && t.trim())
+          .slice(0, 11);
+      }
+    } catch (e) { /* try the next endpoint */ }
+  }
+  return [];
+}"""
+
+# Backwards-compatible alias for callers that only need the script.
+_SUGGEST_JS = SUGGEST_JS
 
 # Fallback seeds for a run with NO topic (mode 'auto'): book-format roots.
 # They are deliberately generic — the point is to harvest the long tail that
@@ -176,6 +243,7 @@ class AutocompleteFrontier:
         # Open ONE page per marketplace for the whole sweep.
         pages: dict[str, Any] = {}
         page_urls: dict[str, str] = {}
+        mkt_by_code = {m.code: m for m in mkts}
         for mkt in mkts:
             if result.queries_run >= self.max_queries:
                 break
@@ -200,7 +268,11 @@ class AutocompleteFrontier:
                 result.per_marketplace.get(mkt_code, 0) + 1
             )
             try:
-                out = await page.evaluate(_SUGGEST_JS, prefix)
+                mkt = mkt_by_code.get(mkt_code)
+                out = await page.evaluate(
+                    SUGGEST_JS,
+                    [ALIAS, mid_for(getattr(mkt, "domain", "")), prefix],
+                )
             except Exception:
                 return []  # one failed call never aborts the sweep
             if not isinstance(out, list):

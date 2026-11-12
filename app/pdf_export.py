@@ -487,12 +487,18 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
         )
         if kws:
             table(
-                ["#", "Backend keyword", "Competition", "Amazon results",
-                 "Median reviews (top 10)", "Demand", "Marketplace"],
+                ["#", "Backend keyword", "Sourced from", "Competition",
+                 "Amazon results", "Median reviews (top 10)", "Demand",
+                 "Marketplace"],
                 [
                     [
                         k.get("rank"),
                         str(k.get("keyword") or "—"),
+                        (
+                            "buyer typing (autocomplete)"
+                            if (k.get("source") or "autocomplete") == "autocomplete"
+                            else "the researched niche"
+                        ),
                         str(k.get("competition") or "not measured"),
                         _kw_total_txt(k),
                         k.get("top10_review_median")

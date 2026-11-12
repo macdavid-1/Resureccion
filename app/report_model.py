@@ -1199,12 +1199,33 @@ def _finalist_sections(
                 break
 
         measured_kw = sum(1 for k in keywords if k.get("measured"))
+        from_suggestions = sum(
+            1 for k in keywords
+            if k.get("measured") and (k.get("source") or "autocomplete") == "autocomplete"
+        )
+        from_niche = sum(
+            1 for k in keywords
+            if k.get("measured") and k.get("source") == "niche"
+        )
         notes: list[str] = []
         if keyword_target and len(keywords) < keyword_target:
             notes.append(
                 f"{len(keywords)} of {keyword_target} backend keywords were "
-                "measured for this candidate (the dive's budget or the "
-                "marketplace's suggestion data ran out first)."
+                "measured for this candidate (the dive's budget ran out first)."
+            )
+        if from_niche and not from_suggestions:
+            notes.append(
+                "Amazon's completion stream returned nothing for this "
+                "marketplace, so these phrases were built from the researched "
+                "niche and then measured with real searches — they are "
+                "measured competition figures, not phrases shoppers were seen "
+                "typing."
+            )
+        elif from_niche:
+            notes.append(
+                f"{from_niche} phrase(s) came from the niche itself (the "
+                "completion stream did not cover them); they were measured the "
+                "same way as the mined ones."
             )
         if category_target and len(books) < category_target:
             notes.append(
@@ -1238,6 +1259,8 @@ def _finalist_sections(
             "keywords": keywords,
             "keyword_target": keyword_target,
             "keywords_measured": measured_kw,
+            "keywords_from_autocomplete": from_suggestions,
+            "keywords_from_niche": from_niche,
             "keywords_unmeasured": len(keywords) - measured_kw,
             "keyword_evidence_id": str(dive.get("keyword_evidence_id") or ""),
             "department": str(dive.get("department") or ""),

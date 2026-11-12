@@ -41,7 +41,13 @@ from app.evidence_capture import (
     _extract_review_snippets,
     _extract_search_items,
 )
-from app.frontier import ALIAS, phrase_score, seeds_from_text
+from app.frontier import (
+    ALIAS,
+    SUGGEST_JS,
+    mid_for,
+    phrase_score,
+    seeds_from_text,
+)
 from app.marketplace import Marketplace
 from app.redact import scrub_url
 
@@ -62,16 +68,10 @@ MAX_REVIEW_SNIPPETS = 24
 _LETTERS = "abcdefghklnoprstw"
 
 # Same-origin suggestion call inside the open marketplace page (Firefox
-# blocks cross-origin fetch; this mirrors app.frontier).
-_SUGGEST_JS = f"""async (q) => {{
-  try {{
-    const res = await fetch('/suggestion?alias={ALIAS}&prefix=' + encodeURIComponent(q),
-                            {{headers: {{'accept': 'application/json'}}}});
-    if (!res.ok) return [];
-    const data = await res.json();
-    return (Array.isArray(data) && Array.isArray(data[1])) ? data[1].slice(0, 10) : [];
-  }} catch (e) {{ return []; }}
-}}"""
+# blocks cross-origin fetch; the endpoint list lives in app.frontier, because
+# Amazon RETIRED the legacy /suggestion path — pointing the dive at it mined
+# zero phrases on every run, which is why the keyword section was always empty).
+_SUGGEST_JS = SUGGEST_JS
 
 
 def competition_label(total: int | None) -> str:
@@ -142,6 +142,8 @@ class DiveResult:
     review_products_read: int = 0
     evidence_ids: list[str] = field(default_factory=list)
     phrases_mined: int = 0
+    # Phrases built from the niche because the completion stream gave nothing.
+    phrases_derived: int = 0
     keywords_measured: int = 0
     queries_run: int = 0
     pages_opened: int = 0
@@ -168,6 +170,7 @@ class DiveResult:
             "review_products_read": self.review_products_read,
             "evidence_ids": self.evidence_ids,
             "phrases_mined": self.phrases_mined,
+            "phrases_derived": self.phrases_derived,
             "keywords_measured": self.keywords_measured,
             "queries_run": self.queries_run,
             "pages_opened": self.pages_opened,
@@ -227,6 +230,15 @@ class FinalCandidateDive:
             phrases = await self._mine_phrases(
                 session_id, mkt, res, deadline
             )
+            if not phrases:
+                # Amazon's completion stream can be unavailable (retired
+                # endpoint, bot wall, a marketplace with no suggestion data).
+                # Falling through with an empty list is what left the report's
+                # keyword section and its accounting permanently empty: the
+                # niche's OWN phrases are measurable too, so they are searched
+                # for real and labelled honestly.
+                phrases = self._phrases_from_niche(res.niche)
+                res.phrases_derived = len(phrases)
             if not (self._expired(deadline) or self.should_stop()):
                 await self._measure_keywords(
                     session_id, mkt, res, phrases, deadline
@@ -277,7 +289,10 @@ class FinalCandidateDive:
                     return
                 res.queries_run += 1
                 try:
-                    out = await page.evaluate(_SUGGEST_JS, prefix)
+                    out = await page.evaluate(
+                        _SUGGEST_JS,
+                        [ALIAS, mid_for(getattr(mkt, "domain", "")), prefix],
+                    )
                 except Exception:
                     return  # one failed call never aborts the dive
                 if not isinstance(out, list):
@@ -326,12 +341,54 @@ class FinalCandidateDive:
                 "keyword": phrase,
                 "demand_score": score,
                 "suggestion_hits": count,
+                "source": "autocomplete",
             })
         # Buyer demand first (how often shoppers complete it), then alphabet
         # for determinism. Measurement trims to max_keywords below.
         shortlist.sort(key=lambda d: (-d["demand_score"], d["keyword"]))
         res.phrases_mined = len(shortlist)
         return shortlist
+
+    @staticmethod
+    def _phrases_from_niche(niche: str) -> list[dict[str, Any]]:
+        """Deterministic phrases built from the niche itself.
+
+        Used when the suggestion box yields nothing. Each phrase is still
+        MEASURED with a real Books-department search — a measured result total
+        and review barrier is useful even when Amazon would not complete the
+        query — and is marked ``source: "niche"`` so the report never implies
+        buyers typed it.
+        """
+        text = _clean_phrase(niche).lower()
+        if not text:
+            return []
+        words = text.split()
+        candidates: list[str] = [text]
+        head = text.split(" for ")[0].strip()
+        if head and head != text:
+            candidates.append(head)
+            audience = text.split(" for ", 1)[1].strip()
+            if audience:
+                candidates.append(f"{head} for {audience.split()[0]}")
+        for n in (2, 3):
+            trimmed = " ".join(words[:n])
+            if trimmed and trimmed not in candidates:
+                candidates.append(trimmed)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for phrase in candidates:
+            phrase = _clean_phrase(phrase)
+            key = phrase.lower()
+            if not phrase or key in seen or len(phrase) < 6 or len(phrase.split()) < 2:
+                continue
+            seen.add(key)
+            out.append({
+                "keyword": phrase,
+                "demand_score": phrase_score(phrase, frequency=1),
+                "suggestion_hits": 0,
+                "source": "niche",
+            })
+        return out
 
     # ---------------------------------------------------------- measurement
     async def _measure_keywords(
@@ -387,6 +444,7 @@ class FinalCandidateDive:
                 measured.append({
                     "keyword": kw,
                     "measured": True,
+                    "source": entry.get("source") or "autocomplete",
                     "department": "books",
                     "total_results": total,
                     "total_results_are_approximate": summary.get(
@@ -560,23 +618,35 @@ class FinalCandidateDive:
         seen: set[str] = set()
 
         def add(breadcrumb: list[str], asin: str, url: str, fallback: str) -> None:
-            leaf = ""
-            if breadcrumb:
-                leaf = str(breadcrumb[-1]).strip()
-            leaf = leaf or str(fallback or "").strip()
-            if not leaf:
-                return
-            key = " ".join(leaf.lower().split())
-            if key in seen or len(rows) >= self.max_categories:
-                return
-            seen.add(key)
-            rows.append({
-                "store": store,
-                "category": leaf[:120],
-                "breadcrumb": " > ".join(str(c) for c in breadcrumb[:8]),
-                "asin": asin,
-                "source_url": url,
-            })
+            """Record the product's real category path — leaf AND its ancestors.
+
+            A KDP book is filed under a leaf deeper in the tree, but the
+            ancestors are real, choosable categories too. Recording only the
+            leaf could never fill `max_categories`: one product yields one
+            leaf, so a 10-category target stalled at `products_per_store`
+            rows and the report's accounting said "3 of 10 ... the rest were
+            not read" on every run.
+            """
+            crumbs = [str(c).strip() for c in (breadcrumb or []) if str(c).strip()]
+            levels: list[str] = list(reversed(crumbs))
+            if not levels:
+                only = str(fallback or "").strip()
+                levels = [only] if only else []
+            for depth, name in enumerate(levels):
+                if not name or len(rows) >= self.max_categories:
+                    return
+                key = " ".join(name.lower().split())
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "store": store,
+                    "category": name[:120],
+                    "breadcrumb": " > ".join(crumbs[:8]) or name[:120],
+                    "depth": depth,
+                    "asin": asin,
+                    "source_url": url,
+                })
 
         try:
             page = await self.browser.open_marketplace(mkt, path)
@@ -584,7 +654,11 @@ class FinalCandidateDive:
             items = await _extract_search_items(page, 20)
             asins = [str(i.get("asin") or "") for i in items if i.get("asin")]
             urls.append(scrub_url(getattr(page, "url", "") or ""))
-            for asin in asins[: self.products_per_store]:
+            # Products are how categories are found, so the walk is bounded by
+            # the CATEGORY target as well: `products_per_store` alone could
+            # never reach `max_categories` (and duplicates reduce it further).
+            product_cap = max(self.products_per_store, self.max_categories)
+            for asin in asins[:product_cap]:
                 if self._expired(deadline) or self.should_stop():
                     break
                 if len(rows) >= self.max_categories:
