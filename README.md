@@ -223,6 +223,13 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
 - ONE persistent browser shared by all research (Playwright
   `launch_persistent_context`); profile at `$DATA_DIR/browser_profiles/kdspy`
   survives restarts, preserving Amazon authentication across runs.
+- **The model drives it itself** (`app/model_browser.py`): `navigate`, `click`,
+  `type`, `press`, `scroll` are real Playwright actions on a real page, paced
+  like a person (pointer path, per-character typing, stepped scrolling) — so
+  it can, for example, see Amazon's shipping-country notice in a screenshot and
+  click "Dismiss" before reading the result total. Navigation stays
+  deny-by-default (marketplaces + the external research allow-list); the DOM is
+  the model's to drive.
 - **Engine** (fixed): Camoufox — anti-detect Firefox. Fingerprint consistency
   is enforced by the browser binary itself (canvas/audio/fonts/WebGL/UA all
   coherent, spoofed at the C++ layer), so the tap-refusal class of Chromium

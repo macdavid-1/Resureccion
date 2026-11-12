@@ -241,8 +241,13 @@ def test_guard_fires_for_every_appearance_without_the_agent(browser, loop, tmp_p
             # A fresh appearance, exactly like a new results page. Nothing on
             # the Python side is called: the in-page guard must do the work.
             await page.evaluate("() => document.dispatchEvent(new Event('resur-show'))")
-            assert await _overlay_present(page) is True, f"appearance {i + 1} did not render"
-            for _ in range(30):  # up to ~1.5 s, the in-page guard alone must clear it
+            # It really appeared (the fixture counts renderings). Whether the
+            # guard has ALREADY cleared it by the next round-trip is a race in
+            # the test, not a fact about the page — the guard is that prompt.
+            assert await page.evaluate("() => document.body.dataset.shown") == str(i + 1), (
+                f"appearance {i + 1} did not render"
+            )
+            for _ in range(50):  # up to ~2.5 s, the in-page guard alone must clear it
                 await page.wait_for_timeout(50)
                 if not await _overlay_present(page):
                     break
@@ -393,5 +398,41 @@ def test_the_guard_never_touches_a_page_without_the_notice(browser, loop, tmp_pa
         assert await dismiss_amazon_overlays(page) == []
         assert await page.is_visible("#keep")
         assert await page.is_visible("button")
+
+    loop.run_until_complete(run())
+
+
+def test_the_model_dismisses_the_notice_with_its_own_playwright_click(
+    browser, loop, tmp_path, monkeypatch
+) -> None:
+    """The model's OWN click must clear the notice — that is the whole point of
+    giving it navigate/click/type/press/scroll instead of a special verb: it
+    sees "Dismiss" in a screenshot and clicks it like a person would, with a
+    real pointer press, and never touches "Change Address".
+
+    No guard script on this page, so nothing else can dismiss it first.
+    """
+    from app import model_browser
+
+    monkeypatch.setenv("BROWSER_ACTION_PACE", "off")
+
+    async def run() -> None:
+        page = await browser.new_page()
+        await page.set_viewport_size({"width": 1280, "height": 800})
+        await page.goto(_write_page(tmp_path, dismissible=True, auto=False))
+        await page.wait_for_timeout(200)
+        await page.evaluate("() => document.dispatchEvent(new Event('resur-show'))")
+        await page.wait_for_timeout(150)
+
+        assert await _overlay_present(page) is True, "the fixture did not render"
+        assert await page.evaluate("() => document.body.dataset.shown") == "1"
+
+        label = await model_browser.click(page, "Dismiss")
+
+        assert label == "Dismiss"
+        assert await _overlay_present(page) is False, "the model's click did not dismiss it"
+        assert await page.evaluate("() => document.body.dataset.accepted") == "0", (
+            "the model accepted the shipping change instead of refusing it"
+        )
 
     loop.run_until_complete(run())

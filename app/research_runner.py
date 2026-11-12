@@ -368,9 +368,13 @@ class ResearchRunner:
         self.claims = claims or ClaimStore(db)
         self.assessments = assessments or IntegrityAssessmentStore(db)
         self.filter_engine = CandidateFilterEngine(self.thresholds, self.assessments)
+        # The verification ROWS live here, not only inside the engine: the
+        # integrity pipeline must know which candidates the engine actually
+        # judged (a status alone is not a verdict).
+        self.verifications = VerificationStore(db)
         self.verification_engine = VerificationEngine(
             self.thresholds, self.claims,
-            VerificationStore(db), self.assessments,
+            self.verifications, self.assessments,
         )
         # --- autonomy layer -----------------------------------------------------
         self.trace = trace or ActivityTrace(db)
@@ -2691,8 +2695,28 @@ class ResearchRunner:
         # failed, and a page-limited read left the newest (most promising)
         # rows permanently unverified and stuck in 'discovered'.
         live = self.candidates.list(session_id, limit=500)
-        candidates = [c for c in live if c.status not in ("rejected", "verified")]
-        reused_verified = sum(1 for c in live if c.status == "verified")
+        # A candidate is FINISHED only when THIS ENGINE judged it. Phase 8's
+        # adversarial "pass" sets status='verified', but a status with no
+        # verification row is the model's opinion, not a verdict — and the
+        # synthesis/report path rejects an opportunity whose candidate has no
+        # record ("no verification record — opportunity is unverified").
+        # Skipping those rows by status alone is how a run ended with zero
+        # reportable opportunities while its own ledger said "verified".
+        judged = {
+            str(v.candidate_id)
+            for v in self.verifications.list(session_id, limit=500)
+            if str(getattr(v, "verdict", "") or "").strip()
+        }
+        candidates = [
+            c for c in live
+            if not (
+                c.status == "rejected"
+                or (c.status == "verified" and str(c.id) in judged)
+            )
+        ]
+        reused_verified = sum(
+            1 for c in live if c.status == "verified" and str(c.id) in judged
+        )
         existing_niches = [c.niche for c in self.candidates.list(session_id, limit=500)]
         accepted = 0
         downgraded = 0

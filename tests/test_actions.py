@@ -196,31 +196,138 @@ async def test_search_targets_a_department_and_reports_amazons_total(wired):
     assert not bad.ok and "department" in (bad.error or "")
 
 
+class _FakeLocator:
+    """A locator that records the click it was asked to perform."""
+
+    def __init__(self, page: _VerbPage, matched: bool) -> None:
+        self.page = page
+        self.matched = matched
+        self.first = self
+
+    async def count(self) -> int:
+        return 1 if self.matched else 0
+
+    async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+        return None
+
+    async def bounding_box(self) -> dict[str, float]:
+        return {"x": 10.0, "y": 20.0, "width": 100.0, "height": 30.0}
+
+    async def click(self, timeout: int = 0) -> None:
+        self.page.clicked.append("locator")
+
+    async def fill(self, _value: str) -> None:
+        self.page.filled.append(_value)
+
+
+class _FakeMouse:
+    def __init__(self, page: _VerbPage) -> None:
+        self.page = page
+
+    async def move(self, *a: Any, **k: Any) -> None:
+        self.page.moves += 1
+
+    async def down(self) -> None:
+        self.page.clicked.append("down")
+
+    async def up(self) -> None:
+        self.page.clicked.append("up")
+
+    async def wheel(self, _x: int, dy: int) -> None:
+        self.page.wheels.append(dy)
+
+
+class _FakeKeyboard:
+    def __init__(self, page: _VerbPage) -> None:
+        self.page = page
+
+    async def type(self, text: str, delay: int = 0) -> None:
+        self.page.typed.append((text, delay))
+
+    async def press(self, key: str) -> None:
+        self.page.pressed.append(key)
+
+
+class _VerbPage:
+    """Playwright-shaped page for the model's own browser verbs."""
+
+    def __init__(self, url: str = "https://www.amazon.com/s?k=space+facts") -> None:
+        self.url = url
+        self.clicked: list[str] = []
+        self.moves = 0
+        self.wheels: list[int] = []
+        self.typed: list[tuple[str, int]] = []
+        self.pressed: list[str] = []
+        self.filled: list[str] = []
+        self.goto_urls: list[str] = []
+        self.mouse = _FakeMouse(self)
+        self.keyboard = _FakeKeyboard(self)
+
+    def is_closed(self) -> bool:
+        return False
+
+    async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+
+    async def wait_for_load_state(self, *a: Any, **k: Any) -> None:
+        return None
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self, matched=selector.lstrip("#.") != "")
+
+    def get_by_text(self, text: str, exact: bool = False) -> _FakeLocator:
+        return _FakeLocator(self, matched=text.strip().lower() == "dismiss")
+
+    def get_by_role(self, role: str, name: str = "") -> _FakeLocator:
+        return _FakeLocator(self, matched=False)
+
+
 @pytest.mark.asyncio
-async def test_dismiss_overlay_action_clears_amazon_overlays(wired):
-    """The model must be able to say 'click Dismiss' the moment it sees the
-    shipping-country overlay — the backend honours it on every open Amazon
-    page, and only ever clicks refusal labels."""
+async def test_dismiss_overlay_is_gone_the_model_clicks_it_itself(wired, monkeypatch):
+    """The old 'dismiss_overlay' verb is REMOVED: it never did anything the
+    model could observe. The model now clicks the refusal control itself with
+    its own Playwright click, and that click is real."""
+    monkeypatch.setenv("BROWSER_ACTION_PACE", "off")
     executor, *_ = wired
+    page = _VerbPage()
+    executor.browser.new_page = lambda: _async(page)  # type: ignore[assignment]
 
-    class Page:
-        url = "https://www.amazon.com/s?k=space+facts"
+    with pytest.raises(ActionError):
+        await executor.execute(session_id="s1", action="dismiss_overlay", args={})
 
-        async def evaluate(self, _js):
-            return ["dismiss"]
-
-        async def wait_for_timeout(self, _ms):
-            return None
-
-    async def pages():
-        return [Page()]
-
-    executor.browser.pages = pages
     res = await executor.execute(
-        session_id="s1", action="dismiss_overlay", args={},
+        session_id="s1", action="click", args={"target": "Dismiss"},
     )
     assert res.ok, res.error
-    assert "dismiss" in res.summary
+    assert "Dismiss" in res.summary
+    assert page.clicked, "nothing was clicked on the page"
+
+
+@pytest.mark.asyncio
+async def test_model_navigation_is_allowlisted_and_paced(wired, monkeypatch):
+    """The model navigates real pages, but only within the research hosts —
+    'full Playwright access' is access to the page, not to the network."""
+    monkeypatch.setenv("BROWSER_ACTION_PACE", "off")
+    executor, *_ = wired
+    page = _VerbPage()
+    executor.browser.new_page = lambda: _async(page)  # type: ignore[assignment]
+
+    ok = await executor.execute(
+        session_id="s1", action="navigate",
+        args={"url": "https://www.amazon.co.uk/s?k=grief+journals"},
+    )
+    assert ok.ok, ok.error
+    assert page.goto_urls == ["https://www.amazon.co.uk/s?k=grief+journals"]
+
+    refused = await executor.execute(
+        session_id="s1", action="navigate", args={"url": "https://example.com/x"},
+    )
+    assert not refused.ok and "allow-listed" in (refused.error or "")
+
+
+async def _async(page: Any) -> Any:
+    return page
 
 
 @pytest.mark.asyncio

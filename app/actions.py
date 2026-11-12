@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
+from app import model_browser
 from app.amazon_auth import ACCOUNT_AMAZON, AmazonAuthManager
 from app.browser_manager import (
     BrowserManager,
     BrowserManagerError,
-    dismiss_amazon_overlays,
 )
 from app.events import EventLog
 from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
@@ -193,6 +193,10 @@ class ActionExecutor:
         # Marketplace rotation state within a research run.
         self._marketplace_cycle: list[Marketplace] = []
         self._cycle_pos = 0
+        # The page the model is driving ITSELF (navigate/click/type/press/
+        # scroll). Kept across actions so a click lands on the page the model
+        # just navigated, not on a fresh blank one.
+        self._working: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ setup
     def set_marketplaces(self, marketplaces: list[Marketplace]) -> None:
@@ -750,38 +754,109 @@ class ActionExecutor:
             evidence_ids=[], summary=f"waited {seconds}s",
         )
 
-    async def _do_dismiss_overlay(self, session_id: str, args: dict[str, Any]) -> ActionResult:
-        """Click Amazon's refusal overlays (shipping-country tooltip, …).
+    # ---------------------------------------------- the model's own browser
+    # The model drives a real Playwright page itself: navigate, click, type,
+    # press, scroll. That is how it dismisses Amazon's shipping-country notice
+    # when it sees one (``click`` with target "Dismiss") instead of relying on
+    # a special-purpose verb — and how it can do anything else a page needs.
+    # The page SURVIVES between actions, so a click lands on the page the model
+    # just navigated. Pacing is human (app.model_browser).
+    async def _working_page(self, session_id: str) -> Any:
+        page = self._working.get(session_id)
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:
+                pass
+            self._working.pop(session_id, None)
+        page = await self.browser.new_page()
+        self._working[session_id] = page
+        return page
 
-        The backend already dismisses them at navigation, capture and
-        screenshot time; this action exists so the MODEL can force a
-        dismissal the moment it SEES one in a screenshot ("click Dismiss")
-        instead of reading a page an overlay is covering — and again every
-        time it reappears. Only refusal labels are ever clicked; acceptance
-        buttons ("Change Address") would alter the owner's session state.
+    def _allowed_nav_hosts(self) -> set[str]:
+        """Hosts the model may navigate to: the marketplaces it researches
+        plus the external research allow-list. Everything else is refused —
+        the model gets full access to the PAGE, never to the network."""
+        hosts = {m.domain for m in AMAZON_MARKETPLACES.values()}
+        hosts |= set(EXTERNAL_DOMAIN_ALLOWLIST)
+        return {h.lstrip(".") for h in hosts if h}
+
+    async def _after_model_action(
+        self, session_id: str, page: Any, summary: str, action: str
+    ) -> ActionResult:
+        """Refresh the screenshot the model will see, and report the state.
+
+        ``browser.screenshot`` dismisses any refusal overlay BEFORE it captures,
+        so the image attached to the next model call can never show the notice
+        covering the result total. The model does not need to be told to look
+        for it first — but if it does see one, ``click`` on "Dismiss" works.
         """
         try:
-            pages = await self.browser.pages()
+            self.collector.last_screenshot = await self.browser.screenshot(page)
         except Exception:
-            pages = []
-        clicked: list[str] = []
-        for page in pages:
-            url = str(getattr(page, "url", "") or "")
-            if marketplace_from_url(url) is None:
-                continue  # only ever click on Amazon pages
-            try:
-                clicked.extend(await dismiss_amazon_overlays(page))
-            except Exception:
-                continue  # dismissal is hygiene, never a research dependency
-        summary = (
-            f"dismissed {len(clicked)} overlay(s): "
-            + ", ".join(sorted(set(clicked)))
-            if clicked else
-            "no overlay was present — nothing needed dismissing"
-        )
+            pass  # a missing screenshot never invalidates the action itself
+        mkt = marketplace_from_url(str(getattr(page, "url", "") or ""))
         return ActionResult(
-            action="dismiss_overlay", ok=True, marketplace="", url="",
+            action=action, ok=True,
+            marketplace=mkt.code if mkt else "",
+            url=scrub_url(str(getattr(page, "url", "") or "")),
             evidence_ids=[], summary=summary,
+        )
+
+    async def _model_verb(
+        self, session_id: str, action: str, op: Any
+    ) -> ActionResult:
+        """Run one Playwright verb the model requested, then refresh its view."""
+        page = await self._working_page(session_id)
+        try:
+            summary = await op(page)
+        except model_browser.BrowserActionError as exc:
+            raise ActionError(str(exc)) from exc
+        return await self._after_model_action(session_id, page, summary, action)
+
+    async def _do_navigate(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        url = str(args.get("url") or "").strip()
+        return await self._model_verb(
+            session_id, "navigate",
+            lambda page: model_browser.navigate(
+                page, url, allowed_hosts=self._allowed_nav_hosts()
+            ),
+        )
+
+    async def _do_click(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        target = str(
+            args.get("target") or args.get("text") or args.get("selector") or ""
+        )
+        return await self._model_verb(
+            session_id, "click", lambda page: model_browser.click(page, target)
+        )
+
+    async def _do_type(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        target = str(
+            args.get("target") or args.get("selector") or args.get("field") or ""
+        )
+        text = str(args.get("text") or args.get("value") or "")
+        return await self._model_verb(
+            session_id, "type",
+            lambda page: model_browser.type_text(page, target, text),
+        )
+
+    async def _do_press(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        key = str(args.get("key") or "")
+        return await self._model_verb(
+            session_id, "press", lambda page: model_browser.press(page, key)
+        )
+
+    async def _do_scroll(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        direction = str(args.get("direction") or "down")
+        try:
+            amount = int(args.get("amount") or 1)
+        except (TypeError, ValueError):
+            amount = 1
+        return await self._model_verb(
+            session_id, "scroll",
+            lambda page: model_browser.scroll(page, direction, amount),
         )
 
     # ------------------------------------------------------------------ helpers

@@ -259,7 +259,7 @@ SPECS: dict[str, PhaseSpec] = {
             "search_marketplace", "open_category", "autocomplete",
             "bestsellers", "new_releases", "related_products",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -297,7 +297,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "open_category",
             "related_products", "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "niches",  # list of {niche, parent_market, chain, evidence_ids, demand_hints}
@@ -328,7 +328,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "related_products",
             "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "competitive_maps",  # list of {niche, competitors[], saturation, pricing, patterns}
@@ -358,7 +358,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "open_product", "read_reviews", "capture_evidence",
             "record_observation", "wait", "forum_search", "goodreads_check",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
@@ -389,7 +389,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "kdspy_data",
             "open_product", "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -426,7 +426,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "capture_evidence", "record_observation", "wait", "forum_search",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
@@ -450,7 +450,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "autocomplete",
             "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "cross_market_checks",  # list of {niche, marketplace, verdict, notes}
@@ -478,7 +478,7 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
-            "dismiss_overlay",
+            "navigate", "click", "type", "press", "scroll",
         ),
         output_contract=(
             "verdicts",  # list of {niche, verdict: pass|downgrade|reject, contradictions[], reasons}

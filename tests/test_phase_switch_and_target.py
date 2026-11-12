@@ -218,10 +218,15 @@ async def test_integrity_pipeline_never_reverifies_the_verified(db, config, sess
     cands.set_status(session, done.id, "verified")
     cands.create(session, niche="fresh candidate niche", marketplace="us")
     verifs = VerificationStore(db)
+    # "Verified" means the ENGINE judged it — the precondition the pipeline
+    # honours. A status without a verification record is only the model's
+    # Phase-8 opinion (see test_verified_without_a_verdict_is_judged).
+    record = verifs.create(session, candidate_id=done.id)
+    verifs.complete(session, record.id, status="passed", verdict="verified", confidence=0.8)
 
     runner._run_integrity_pipeline(session, {})
-    # The verified candidate was NOT re-judged...
-    assert verifs.for_candidate(session, done.id) == []
+    # The verified candidate was NOT re-judged: its one engine record stands...
+    assert len(verifs.for_candidate(session, done.id)) == 1
     assert cands.get(session, done.id).status == "verified"
     done_events = [
         e for e in EventLog(db).tail(session)
@@ -231,8 +236,27 @@ async def test_integrity_pipeline_never_reverifies_the_verified(db, config, sess
 
     # A second pass (target refill) still never re-verifies it.
     runner._run_integrity_pipeline(session, {})
-    assert verifs.for_candidate(session, done.id) == []
+    assert len(verifs.for_candidate(session, done.id)) == 1
     assert cands.get(session, done.id).status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_verified_without_a_verdict_is_judged(db, config, session):
+    """Phase 8's adversarial "pass" sets status='verified' before the
+    deterministic engine runs. Skipping such a row by status left it with NO
+    verification record, which the report's coverage gate then rejected — the
+    run ended with zero opportunities while the ledger said "verified"."""
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    cands = CandidateStore(db)
+    cand = cands.create(session, niche="model said pass niche", marketplace="us")
+    cands.set_status(session, cand.id, "verified")  # Phase-8 opinion, no record
+    verifs = VerificationStore(db)
+
+    runner._run_integrity_pipeline(session, {})
+
+    assert verifs.for_candidate(session, cand.id), (
+        "a 'verified' candidate with no verification record was never judged"
+    )
 
 
 @pytest.mark.asyncio

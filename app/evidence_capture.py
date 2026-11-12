@@ -25,6 +25,7 @@ from app.artifacts import ArtifactStore
 from app.browser_manager import (
     BrowserManager,
     BrowserManagerError,
+    _overlay_present,
     dismiss_amazon_overlays,
 )
 from app.browser_store import BrowserEvidence, BrowserEvidenceStore
@@ -102,13 +103,27 @@ class EvidenceCollector:
             await dismiss_amazon_overlays(page)
         except Exception:
             pass
+        # The printed total is only a MEASUREMENT when nothing covers it. When
+        # the notice survives the dismissal, the count is recorded as UNCLEAR
+        # instead: reading a total through an overlay is how a page with 958
+        # results got reported as 95, and a wrong competition figure is worse
+        # than a missing one.
+        covered = await _overlay_present(page)
         items = await _extract_search_items(page, max_items)
-        data = {
+        data: dict[str, Any] = {
             "query": query,
             "result_count": len(items),
             "results": items,
+            "results_count_clear": not covered,
         }
-        data.update(await _extract_results_summary(page))
+        if covered:
+            data["results_count_note"] = (
+                "the shipping-country notice was still covering the page when "
+                "this search was read; any printed total is unverified — "
+                "dismiss it (click \"Dismiss\") and capture again"
+            )
+        else:
+            data.update(await _extract_results_summary(page))
         return [await self._persist(
             page,
             session_id=session_id,
