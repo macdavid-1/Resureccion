@@ -375,7 +375,7 @@ filter, a gate or a verification verdict:
   marketplace noise, dangling prefixes and phrases that drifted off the
   candidate are dropped, with the reason recorded. Survivors are then searched
   **one by one** in the Books department and refused if Amazon's printed total
-  exceeds `DIVE_MAX_COMPETITION` (default 25,000) or is otherwise unwinnable;
+  exceeds `DIVE_MAX_COMPETITION` (default 1,000) or is otherwise unwinnable;
   the walk keeps going until `DIVE_MAX_KEYWORDS` phrases are accepted, then a
   bounded second sweep mines deeper from the accepted ones. Every accept and
   every refusal lands in `browser_evidence` as an ordinary record, so the

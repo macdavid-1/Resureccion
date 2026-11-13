@@ -89,7 +89,7 @@ class _CompetitionBrowser(_DiveBrowser):
         from urllib.parse import parse_qs, urlparse
 
         query = parse_qs(urlparse(path).query).get("k", [""])[0]
-        total = 7_000_000 if "workbook" in query else 3_000
+        total = 7_000_000 if "workbook" in query else 800
         cards = [_Card(f"{i:09d}", f"Book {i}", 10) for i in range(3)]
         return _Page(
             url,
@@ -117,18 +117,18 @@ async def test_high_competition_phrases_are_rejected_not_ranked_last(db, config)
 
     assert res.error is None, res.error
     assert res.keywords_measured == 3, "the loop must keep going past rejects"
-    assert all(k["total_results"] == 3_000 for k in res.keywords)
+    assert all(k["total_results"] == 800 for k in res.keywords)
     assert not any("workbook" in k["keyword"] for k in res.keywords)
 
     refused = [r for r in res.rejected if r["reason"] == "too_much_competition"]
     assert refused, "a 7,000,000-result phrase must be refused"
     assert all(r["stage"] == "measured" for r in refused)
     assert all(r["total_results"] == 7_000_000 for r in refused)
-    assert res.competition_ceiling == 25_000
+    assert res.competition_ceiling == 1_000
 
     # The refusal is durable evidence, not just an in-memory detail.
     row = next(e for e in store.list("s1") if e.kind == "keyword_research")
-    assert row.data["competition_ceiling"] == 25_000
+    assert row.data["competition_ceiling"] == 1_000
     assert any(
         r["reason"] == "too_much_competition" for r in row.data["rejected"]
     )

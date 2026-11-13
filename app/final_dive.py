@@ -65,10 +65,12 @@ CATEGORY_ROOTS = frozenset({
 # Competition buckets for a measured keyword (Amazon's total result count).
 LOW_COMPETITION_MAX = 5_000
 MEDIUM_COMPETITION_MAX = 25_000
-# Above this a phrase is REJECTED rather than merely ranked last: a head term
-# with tens of thousands of results (let alone millions) is not a niche keyword
-# a new book can rank for, and presenting it as "researched" is a lie.
-DEFAULT_MAX_COMPETITION = MEDIUM_COMPETITION_MAX
+# Above this a phrase is REJECTED rather than merely ranked last: a term with
+# more competing books than this is not a niche keyword a new book can rank
+# for, and presenting it as "researched" is a lie. The container's bar is
+# 1,000 competing results (not the 25,000 MEDIUM bucket boundary) — override
+# with DIVE_MAX_COMPETITION when a niche needs a wider net.
+DEFAULT_MAX_COMPETITION = 1_000
 
 # Real customer reviews read per opened competitor product page (the page is
 # already open for its category breadcrumbs, so this costs no navigation).

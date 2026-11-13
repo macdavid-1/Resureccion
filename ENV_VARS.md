@@ -140,7 +140,7 @@ engine.
 | `DIVE_ENABLED` | no | `true` | Finalist deep dive: once the report's candidates are chosen, measure their backend keywords and map both store category trees before the report is written |
 | `DIVE_MAX_CANDIDATES` | no | `12` | Report candidates that get the deep dive — default covers synthesis' maximum so every niche the report shows carries its measured keywords and category maps |
 | `DIVE_MAX_KEYWORDS` | no | `20` | Backend keywords **accepted** per candidate: phrases are screened (generic roots, noise and drift removed), then verified one by one with a real Books-department search, and refused if they print too much competition — the walk continues until this many pass |
-| `DIVE_MAX_COMPETITION` | no | `25000` | Competition ceiling: a measured phrase printing more Amazon results than this is rejected with its real total recorded in the evidence. `0` disables the ceiling |
+| `DIVE_MAX_COMPETITION` | no | `1000` | Competition ceiling: a measured phrase printing more Amazon results than this is rejected with its real total recorded in the evidence. `0` disables the ceiling |
 | `DIVE_MAX_CATEGORIES` | no | `10` | Categories mapped **per store** — the Kindle Store and the Books store are counted separately |
 | `DIVE_PRODUCTS_PER_STORE` | no | `6` | Top competitor product pages opened per store to read their real category breadcrumbs |
 | `DIVE_AUTOCOMPLETE_QUERIES` | no | `24` | Suggestion queries used to mine candidate keyword phrases (one page load, then same-origin fetches) |

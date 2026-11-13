@@ -130,7 +130,7 @@ class _DiveBrowser:
             _Card(f"{prefix}{i}", f"Book {i} for search", 10 * (i + 1))
             for i in range(3)
         ]
-        body = "1-16 of over 4,000 results for space facts"
+        body = "1-16 of over 900 results for space facts"
         return _Page(url, body=body, cards=cards)
 
     async def navigate(self, page, url: str):
@@ -318,7 +318,7 @@ async def test_dive_measures_keywords_and_both_store_category_trees(db, config):
     measured = [k for k in res.keywords if k.get("measured")]
     assert measured
     for k in measured:
-        assert k["total_results"] == 4000
+        assert k["total_results"] == 900
         assert k["competition"] == "low"
         assert k["department"] == "books"
         assert k["top10_review_median"] == 20
