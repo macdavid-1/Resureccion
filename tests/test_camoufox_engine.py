@@ -313,3 +313,28 @@ class TestEngineGenerationCompat:
         fp = ce.load_or_generate_fingerprint(cfg)
         assert isinstance(fp, dict)
         assert state["n"] == 1  # regenerated because the cache was unusable
+
+
+def test_launch_kwargs_present_the_owner_market_not_the_egress_ip(cfg: Config) -> None:
+    """Amazon picks currency/location from the IP; with geoip OFF the browser
+    must present New York explicitly (locale + timezone) instead of whatever
+    locale the Nigerian egress implies."""
+    kw = ce.launch_kwargs(cfg)
+    assert kw["locale"] == "en-US"
+    assert kw["config"]["timezone"] == "America/New_York"
+
+    cfg.browser_locale = "en-GB"
+    cfg.browser_timezone = "Europe/London"
+    kw = ce.launch_kwargs(cfg)
+    assert kw["locale"] == "en-GB"
+    assert kw["config"]["timezone"] == "Europe/London"
+
+
+def test_geoip_mode_keeps_the_ip_coherent_spoof(cfg: Config) -> None:
+    """With CAMOUFOX_GEOIP on, Camoufox derives them from the IP — an explicit
+    clock would fight the spoof, so it must not be layered on top."""
+    cfg.camoufox_geoip = True
+    kw = ce.launch_kwargs(cfg)
+    assert kw["geoip"] is True
+    assert "locale" not in kw
+    assert "config" not in kw

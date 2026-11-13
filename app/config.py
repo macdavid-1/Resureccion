@@ -266,6 +266,22 @@ class Config:
         self.browser_headless = os.environ.get("BROWSER_HEADLESS", "true").strip().lower() in (
             "1", "true", "yes", "on"
         )
+        # --- where Amazon thinks the visitor is ---------------------------------
+        # Amazon takes BOTH currency and delivery location from the IP: a
+        # Nigerian egress shows NGN prices and "Deliver to Nigeria" on
+        # amazon.com, which makes every price in the report wrong-market. The
+        # browser presents New York (locale/timezone) and, the first time an
+        # Amazon page opens, the delivery location is pinned through Amazon's
+        # own "Deliver to" dialog (app/amazon_location.py). No new service.
+        self.browser_locale = os.environ.get("BROWSER_LOCALE", "en-US").strip() or "en-US"
+        self.browser_timezone = (
+            os.environ.get("BROWSER_TIMEZONE", "America/New_York").strip()
+            or "America/New_York"
+        )
+        self.amazon_location_pin = _flag("AMAZON_LOCATION_PIN", True)
+        self.amazon_delivery_zip = (
+            os.environ.get("AMAZON_DELIVERY_ZIP", "10001").strip() or "10001"
+        )
         self.browser_idle_shutdown_seconds = _int_env("BROWSER_IDLE_SHUTDOWN_SECONDS", 300)
         # Keepalive cadence while the model is thinking. A research iteration
         # is dominated by the LLM call (often 30-180s) and nothing loads in the

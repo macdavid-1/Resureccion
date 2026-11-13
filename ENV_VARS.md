@@ -167,6 +167,10 @@ evidence exists.
 | `CAMOUFOX_GEOIP` | no | `false` | Camoufox: derive timezone/locale/geo from the egress IP so the spoof matches the exit network (downloads a GeoIP DB at first launch; needs the `geoip` extra, included in the Dockerfile) |
 | `BROWSER_ACTION_PACE` | no | `natural` | Cadence of the model's OWN browser actions (navigate / click / type / press / scroll): `natural` moves the pointer to the element in jittered steps, presses with a pause, types per character, scrolls in steps and lets every navigation settle. `off` (or `fast`) removes every pause — for tests and for an owner who wants raw speed. Amazon fingerprints input cadence as much as the UA, so `off` is a real tell |
 | `BROWSER_HEADLESS` | no | `true` | Run the browser headless |
+| `BROWSER_LOCALE` | no | `en-US` | Locale the browser presents when `CAMOUFOX_GEOIP` is off. Amazon uses language/clock hints alongside the IP when choosing its storefront, so this keeps the run on the US store even from another country's egress |
+| `BROWSER_TIMEZONE` | no | `America/New_York` | Timezone the browser presents when `CAMOUFOX_GEOIP` is off (New York by default) |
+| `AMAZON_LOCATION_PIN` | no | `true` | Pin Amazon's delivery location once per browser launch through Amazon's own “Deliver to” dialog, using the researched marketplace's currency. Without it a foreign egress shows NGN prices and “Deliver to Nigeria” on amazon.com |
+| `AMAZON_DELIVERY_ZIP` | no | `10001` | Delivery zip used by the pin (10001 = Manhattan, New York). The header must confirm it; a pin that cannot be confirmed is reported in the browser status, never assumed |
 | `BROWSER_CHANNEL` | no | `chromium` | Playwright channel (chromium engine only); bundled chromium supports extensions headless |
 | `BROWSER_NO_SANDBOX` | no | auto | Chromium engine: launch with `--no-sandbox`. Auto-detected: on when running as root or inside a container (HF Spaces/Docker), off locally. Set explicitly to `true`/`false` to override. |
 | `BROWSER_EXTRA_ARGS` | no | — | Chromium engine: space/comma-separated extra launch args (deploy-specific tuning) |

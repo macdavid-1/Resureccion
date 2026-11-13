@@ -366,6 +366,15 @@ filter, a gate or a verification verdict:
   `MEMORY_FRESH_DAYS` are reused as fact; older rows are carried as stale
   hints the model must cheaply re-verify. Every run stops paying twice for
   the same numbers, and autonomous runs get smarter over time.
+- **Amazon pricing follows the marketplace, not the egress IP**
+  (`app/amazon_location.py`) — Amazon takes both the currency and the
+  delivery location from the visitor's IP, so a foreign exit makes
+  amazon.com show NGN prices and "Deliver to Nigeria". The browser presents
+  New York (`BROWSER_LOCALE`/`BROWSER_TIMEZONE`) and, once per launch, sets
+  the marketplace's currency cookie and pins the delivery zip
+  (`AMAZON_DELIVERY_ZIP`, default 10001) through Amazon's own "Deliver to"
+  dialog — no extra service, no login. The header must confirm the zip; an
+  unconfirmed pin is reported in the browser status instead of assumed.
 - **Finalist deep dive** (`app/final_dive.py`) — once the methodology has
   chosen the candidates that will reach the report, each one gets **screened,
   then verified** backend keywords plus its category map for **both** stores

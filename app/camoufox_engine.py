@@ -464,6 +464,19 @@ def launch_kwargs(
         # coherent with the exit network (a US IP with a Paris clock is a
         # classic tell). Requires the geoip extra; guarded by config.
         kwargs["geoip"] = True
+    else:
+        # No IP-derived spoof: present the owner's market explicitly instead of
+        # whatever locale the egress IP implies. Amazon reads the clock and
+        # language when choosing its storefront, and a Nigerian egress would
+        # otherwise surface NGN prices on amazon.com.
+        locale = (getattr(config, "browser_locale", "") or "").strip()
+        if locale:
+            kwargs["locale"] = locale
+        timezone_id = (getattr(config, "browser_timezone", "") or "").strip()
+        if timezone_id:
+            props = dict(kwargs.get("config") or {})
+            props.setdefault("timezone", timezone_id)
+            kwargs["config"] = props
     kwargs.update(_proxy_kwargs(config, relay_addr, egress_mode))
 
     kwargs["fingerprint"] = load_or_generate_fingerprint(config)

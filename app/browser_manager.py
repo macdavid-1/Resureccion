@@ -35,11 +35,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from app import camoufox_engine, privacy
+from app import amazon_location, camoufox_engine, privacy
 from app.browser_store import BrowserEvidenceStore
 from app.config import Config
 from app.kdspy import KDSpyManager
-from app.marketplace import Marketplace
+from app.marketplace import Marketplace, marketplace_from_url
 from app.proxy_spec import (
     is_proxy_nav_error,
     probe_proxy,
@@ -504,6 +504,10 @@ class BrowserStatus:
     engine_note: str | None
     egress_mode: str | None
     egress_note: str | None
+    # Which delivery location Amazon was pinned to ("New York 10001"), or why
+    # it could not be pinned — visible instead of silently serving NGN prices.
+    location_note: str | None = None
+    location_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -576,6 +580,15 @@ class BrowserManager:
         self._crash_count = 0
         self._kdspy_extension_id: str | None = None
         self._idle_task: asyncio.Task | None = None
+        # Amazon's delivery location is pinned once per launch: the profile is
+        # persistent, so later launches normally inherit it, and retrying on
+        # every navigation would spend a page load per search.
+        self._location_pinned = False
+        self._location_note: str | None = None
+        self._location_text: str | None = None
+        # Cookie domains whose currency/language prefs are already applied in
+        # this context (re-writing them on every navigation is pure overhead).
+        self._market_prefs_domains: set[str] = set()
 
     # ------------------------------------------------------------------ state
     @property
@@ -612,6 +625,8 @@ class BrowserManager:
             engine_note=self._engine_note,
             egress_mode=self._egress_mode,
             egress_note=self._egress_note,
+            location_note=self._location_note,
+            location_text=self._location_text,
         )
 
     # --------------------------------------------------------------- lifecycle
@@ -627,6 +642,12 @@ class BrowserManager:
                 return self.status()
             if self._context is not None:
                 await self._teardown_context()
+            # A fresh context re-evaluates the location pin (the cookies live
+            # in the profile, so a warm profile still confirms immediately).
+            self._location_pinned = False
+            self._location_note = None
+            self._location_text = None
+            self._market_prefs_domains = set()
             self.profile_dir.mkdir(parents=True, exist_ok=True)
             # A Firefox profile lock left by a crashed browser ("Camoufox is
             # already running, but is not responding") bricks every later
@@ -890,6 +911,9 @@ class BrowserManager:
             raise BrowserManagerError("marketplace path must start with '/'")
         url = f"{marketplace.base_url}{path}"
         page = await self.new_page()
+        # Currency/language cookies must exist BEFORE the first request, or the
+        # first page renders in whatever currency the egress IP implies.
+        await self._prime_market_location(page, url)
         try:
             await self._goto_resilient(page, url)
         except BrowserManagerError:
@@ -903,8 +927,76 @@ class BrowserManager:
             await dismiss_amazon_overlays(page)
         except Exception:
             pass  # dismissal is hygiene, never a research dependency
+        await self._pin_market_location(page, url)
         self._touch()
         return page
+
+    async def _prime_market_location(self, page: Any, url: str) -> None:
+        """Apply the marketplace's currency/language cookies before a request.
+
+        Amazon picks the currency from the visitor's IP; the preference cookie
+        (`i18n-prefs`) is what its own currency switcher writes, so a US
+        marketplace stays in USD even from a Nigerian egress.
+        """
+        cfg = getattr(self, "config", None)
+        if not getattr(cfg, "amazon_location_pin", True):
+            return
+        marketplace = marketplace_from_url(url)
+        if marketplace is None:
+            return
+        domain = amazon_location.cookie_domain(url)
+        applied = getattr(self, "_market_prefs_domains", None)
+        if applied is None:
+            applied = self._market_prefs_domains = set()
+        if domain in applied:
+            return
+        applied.add(domain)
+        try:
+            await amazon_location.apply_market_prefs(
+                page,
+                url=url,
+                currency=marketplace.currency,
+                language=marketplace.language.replace("-", "_"),
+            )
+        except Exception:
+            pass  # a cookie that will not set is hygiene, never a dependency
+
+    async def _pin_market_location(self, page: Any, url: str) -> None:
+        """Set Amazon's delivery location (New York by default) once per launch.
+
+        Without it every page says "Deliver to Nigeria" and the report's
+        prices belong to a market the owner is not publishing into. The
+        profile is persistent, so this normally costs one dialog per launch.
+        """
+        cfg = getattr(self, "config", None)
+        if not getattr(cfg, "amazon_location_pin", True):
+            return
+        if getattr(self, "_location_pinned", False):
+            return
+        marketplace = marketplace_from_url(url)
+        if marketplace is None:
+            return
+        self._location_pinned = True
+        try:
+            status = await amazon_location.pin_delivery_location(
+                page,
+                zip_code=str(getattr(cfg, "amazon_delivery_zip", "10001")),
+                currency=marketplace.currency,
+                language=marketplace.language.replace("-", "_"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            status = {
+                "ok": False,
+                "location": "",
+                "detail": f"{type(exc).__name__}: {exc}"[:200],
+            }
+        self._location_text = (status.get("location") or "") or None
+        self._location_note = (
+            f"delivery location pinned: {self._location_text}"
+            if status.get("ok")
+            else f"delivery location not pinned: {status.get('detail') or 'unknown'}"
+        )
+        self._touch()
 
     async def navigate(self, page: Any, url: str) -> Any:
         """Navigate a page; returns the page the navigation actually used.
@@ -915,6 +1007,7 @@ class BrowserManager:
         page across navigations should adopt the return value; callers that
         ignore it behave as before.
         """
+        await self._prime_market_location(page, url)
         try:
             target = await self._goto_resilient(page, url)
         except PlaywrightError as exc:  # pragma: no cover - defensive
@@ -927,6 +1020,7 @@ class BrowserManager:
             await dismiss_amazon_overlays(target)
         except Exception:
             pass
+        await self._pin_market_location(target, url)
         return target
 
     async def _goto_resilient(self, page: Any, url: str) -> Any:
