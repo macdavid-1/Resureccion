@@ -135,6 +135,108 @@ _NOISE = (
     "kindle edition", " AUD", " mp3 ",
 )
 
+# Words that name the FORMAT, not the subject. A phrase built only from these
+# ("journal for women", "self help book", "kids activity book") is a category
+# root, not hidden demand: it competes with the whole store and describes no
+# reader. Suggestions are stripped of them before anything is researched, so
+# the model starts from specific demand language instead of a pile of roots.
+GENERIC_TOKENS = frozenset(
+    ["book", "books", "ebook", "ebooks", "workbook", "workbooks", "journal", "journals", "notebook", "notebooks", "planner", "planners", "log", "logs", "diary", "diaries", "guide", "guides", "handbook", "handbooks", "manual", "manuals", "checklist", "checklists", "tracker", "trackers", "worksheet", "worksheets", "coloring", "colouring", "activity", "activities", "gift", "gifts", "idea", "ideas", "best", "top", "new", "free", "amazon", "kindle", "paperback", "hardcover", "audiobook", "audible", "pdf", "epub", "volume", "vol", "edition", "series", "set", "bundle", "box", "kit", "pack", "printable", "downloads", "download", "ebook-only", "self", "help", "how", "to"]
+)
+
+# Whole-phrase filler: audience/format with no subject of its own.
+TRAILING_FILLER = frozenset(
+    ["for", "with", "and", "the", "a", "an", "of", "to", "in", "on", "or", "by", "from", "at", "your", "my", "our", "is", "are"]
+)
+
+GENERIC_FILLER: tuple[str, ...] = (
+    "for women", "for men", "for kids", "for adults", "for beginners",
+    "for teens", "for children", "for seniors", "for girls", "for boys",
+    "for dummies", "in 30 days", "step by step", "large print", "all ages",
+)
+
+
+def topical_tokens(text: str, *, min_len: int = 3) -> set[str]:
+    """The SUBJECT words of a phrase — format/audience filler removed."""
+    out: set[str] = set()
+    for raw in str(text or "").lower().replace("-", " ").replace("/", " ").split():
+        w = "".join(ch for ch in raw if ch.isalnum())
+        if len(w) < min_len or w in _STOPWORDS or w in GENERIC_TOKENS:
+            continue
+        out.add(w)
+    return out
+
+
+def screen_phrase(phrase: str, topic_tokens: set[str]) -> tuple[bool, str]:
+    """Deterministic accept/reject for one demand phrase, with the reason.
+
+    The suggestion stream happily returns roots ("book for women") and drift
+    ("therapy worksheets for ptsd" for a grief niche). Researching those wastes
+    searches and, worse, presents unwinnable generic terms as validated. This
+    is the same screen the finalist dive applies before it measures a phrase,
+    so discovery and the report agree on what a usable keyword is.
+    """
+    import re
+
+    t = " ".join(str(phrase or "").lower().split())
+    if not t:
+        return False, "empty"
+    if any(n.lower() in t for n in _NOISE):
+        return False, "noise"
+    if re.search(r"https?://|\bwww\.|\d{4,}", t):
+        return False, "noise"
+    words = t.split()
+    if len(words) < 2:
+        return False, "too_broad"
+    if len(words) > 12 or len(t) > 70:
+        return False, "too_abstract"
+    # A truncated prefix ("grief journals for") is not demand language; it is
+    # what an unfinished query looks like. Only FUNCTION words count here: a
+    # phrase may legitimately end in a format word ("grief journal workbook").
+    if words[-1] in TRAILING_FILLER:
+        return False, "incomplete"
+    topical = topical_tokens(t)
+    if not topical:
+        return False, "too_generic"
+    filler = any(f in t for f in GENERIC_FILLER)
+    if filler and len(topical) < 2:
+        return False, "too_generic"
+    if topic_tokens and not (topical & topic_tokens):
+        return False, "off_niche"
+    return True, ""
+
+
+def filter_demand_terms(
+    terms: Iterable[str],
+    seeds: Iterable[str],
+    *,
+    limit: int = 60,
+) -> tuple[list[str], dict[str, int]]:
+    """Keep the demand phrases worth researching; count why the rest went.
+
+    Returns (kept, rejected-by-reason). The kept list is what the model sees
+    as STARTING POINTS — never as its research boundary.
+    """
+    topics = set()
+    for seed in seeds:
+        topics |= topical_tokens(seed)
+    kept: list[str] = []
+    seen: set[str] = set()
+    rejected: dict[str, int] = {}
+    for term in terms:
+        key = " ".join(str(term or "").lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ok, reason = screen_phrase(key, topics)
+        if not ok:
+            rejected[reason] = rejected.get(reason, 0) + 1
+            continue
+        kept.append(key)
+        if len(kept) >= limit:
+            break
+    return kept, rejected
+
 
 def seeds_from_text(text: str, *, limit: int = 6) -> list[str]:
     """Deterministic seed extraction from the owner's brief/objective."""
@@ -177,6 +279,8 @@ class FrontierResult:
     terms: list[str] = field(default_factory=list)
     evidence_ids: list[str] = field(default_factory=list)
     per_marketplace: dict[str, int] = field(default_factory=dict)
+    # Why suggestions were dropped before the model ever saw them.
+    rejected: dict[str, int] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
     stopped_reason: str = "completed"
 
@@ -185,6 +289,7 @@ class FrontierResult:
             "queries_run": self.queries_run,
             "term_count": len(self.terms),
             "terms": self.terms[:80],
+            "rejected": dict(self.rejected),
             "evidence_ids": self.evidence_ids,
             "per_marketplace": dict(self.per_marketplace),
             "elapsed_seconds": round(self.elapsed_seconds, 1),
@@ -366,9 +471,14 @@ class AutocompleteFrontier:
             if rec:
                 result.evidence_ids.append(rec)
 
+        # Screen BEFORE the model sees them: roots ("book for women") and
+        # drift ("therapy worksheets for ptsd" off a grief seed) are counted as
+        # filtered, not handed over as research targets.
         ranked = self._rank_terms(freq)
-        result.terms = ranked[:80]
-        if ranked:
+        kept, rejected = filter_demand_terms(ranked, seeds, limit=80)
+        result.terms = kept
+        result.rejected = rejected
+        if kept:
             rec = self._record(
                 session_id=session_id,
                 marketplace=mkts[0].code if mkts else "",
@@ -378,9 +488,10 @@ class AutocompleteFrontier:
                 data={
                     "terms": [
                         {"term": t, "completions_seen": freq.get(t, 1)}
-                        for t in ranked[:80]
+                        for t in kept
                     ],
                     "seeds": list(seeds),
+                    "filtered_out": rejected,
                     "queries_run": result.queries_run,
                 },
             )

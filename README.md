@@ -367,15 +367,22 @@ filter, a gate or a verification verdict:
   hints the model must cheaply re-verify. Every run stops paying twice for
   the same numbers, and autonomous runs get smarter over time.
 - **Finalist deep dive** (`app/final_dive.py`) — once the methodology has
-  chosen the candidates that will reach the report, each one gets measured
-  backend keywords (mined from Amazon's suggestion box, then each searched
-  for real so Amazon's own printed result total is the competition figure,
-  up to `DIVE_MAX_KEYWORDS`) plus its category map for **both** stores — the
-  Kindle Store and the Books store keep separate category trees, so both are
-  walked independently (up to `DIVE_MAX_CATEGORIES` each). Results land in
-  `browser_evidence` as ordinary records: the report renders them, the
-  analyst model may only interpret them, and an unmeasured keyword is
-  printed as "not searched in this run" rather than as a number.
+  chosen the candidates that will reach the report, each one gets **screened,
+  then verified** backend keywords plus its category map for **both** stores
+  (the Kindle Store and the Books store keep separate category trees, so both
+  are walked independently, up to `DIVE_MAX_CATEGORIES` each). Phrases are
+  first screened deterministically — generic roots ("journal for women"),
+  marketplace noise, dangling prefixes and phrases that drifted off the
+  candidate are dropped, with the reason recorded. Survivors are then searched
+  **one by one** in the Books department and refused if Amazon's printed total
+  exceeds `DIVE_MAX_COMPETITION` (default 25,000) or is otherwise unwinnable;
+  the walk keeps going until `DIVE_MAX_KEYWORDS` phrases are accepted, then a
+  bounded second sweep mines deeper from the accepted ones. Every accept and
+  every refusal lands in `browser_evidence` as an ordinary record, so the
+  report can show the keywords that survived **and** why the rest did not;
+  a phrase with no search is printed as "not searched in this run" rather
+  than as a number. The initial autocomplete suggestions the model sees use
+  the same screen and are presented as starting points, never as a boundary.
 
 Supporting changes:
 

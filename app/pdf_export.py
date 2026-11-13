@@ -512,6 +512,19 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
             )
         else:
             p("No backend keyword was measured for this candidate — no phrase is presented as validated.")
+        if sec.get("keyword_rejections"):
+            p(
+                f"Screened out — {sec.get('keywords_rejected', 0)} phrase(s) were "
+                "refused before they could become keywords: "
+                + ", ".join(
+                    f"{n} {str(reason).replace('_', ' ')}"
+                    for reason, n in sorted(
+                        (sec.get("keyword_rejections") or {}).items(),
+                        key=lambda kv: (-kv[1], kv[0]),
+                    )
+                )
+                + "."
+            )
         if pb.get("keyword_plan"):
             p(pb["keyword_plan"])
         titles = [t for t in (pb.get("titles") or []) if isinstance(t, dict)]

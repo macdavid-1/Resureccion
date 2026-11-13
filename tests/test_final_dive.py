@@ -98,7 +98,11 @@ class _Page:
         return []
 
     async def evaluate(self, _js: str, arg=None):
-        base = str(arg or "").strip()
+        # The completion call passes [alias, mid, prefix]; the suggestion text
+        # is the last element. Returning the prefix's completions keeps the
+        # fixture shaped like the real stream.
+        raw = arg[-1] if isinstance(arg, (list, tuple)) and arg else arg
+        base = " ".join(str(raw or "").split()).strip()
         if not base:
             return []
         return [f"{base} workbook", f"{base} for kids"]
@@ -638,7 +642,7 @@ async def test_categories_include_their_ancestors_and_can_fill_the_target(db, co
                 url,
                 breadcrumbs=[
                     "Books", "Children's Books", "Growing Up & Facts of Life",
-                    "Difficult Discussions", "Death & Dying",
+                    "Difficult Discussions", "Death & Dying", "Grief & Loss",
                 ],
                 product={"title": "Product"},
             )
@@ -657,8 +661,18 @@ async def test_categories_include_their_ancestors_and_can_fill_the_target(db, co
     assert res.error is None, res.error
     assert len(res.books_categories) == 5, "a category PATH must fill the target"
     assert [r["category"] for r in res.books_categories][:2] == [
-        "Death & Dying", "Difficult Discussions",
+        "Grief & Loss", "Death & Dying",
     ]
+    assert not [r for r in res.books_categories if r["category"].lower() == "books"]
     assert [r["depth"] for r in res.books_categories] == [0, 1, 2, 3, 4]
     assert all(r["breadcrumb"].startswith("Books >") for r in res.books_categories)
     assert len(res.kindle_categories) == 5
+
+
+def test_store_roots_are_not_presented_as_categories() -> None:
+    """"Books" and "Kindle Store" are where a category lives, not a category
+    you can file a book under — they must never reach the report as targets."""
+    from app.final_dive import CATEGORY_ROOTS
+
+    assert "books" in CATEGORY_ROOTS and "kindle store" in CATEGORY_ROOTS
+    assert "children's books" not in CATEGORY_ROOTS

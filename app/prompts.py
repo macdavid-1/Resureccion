@@ -249,9 +249,16 @@ def build_user_prompt(
             "\nAUTOCOMPLETE FRONTIER (phrases real buyers actually type, mined "
             "deterministically from Amazon's suggestion stream):\n"
             + _compact(list(frontier_terms)[:60], limit=2400)
-            + "\nThese are demand-language seeds: a long phrase with thin "
-            "results is hidden demand in plain sight. Search the ones that "
-            "match your signals and niche them down."
+            + "\nThese are STARTING POINTS, not your boundary. The list has "
+            "already been screened — generic roots (format/audience words only) "
+            "and phrases that drifted away from the brief were removed — so the "
+            "ones left are specific enough to research. But it is a sample, not "
+            "a fence: research only the ones that fit the brief, refine them "
+            "into narrower niches, and propose niches of your own from the "
+            "census, the charts and what you find in your own searches. A "
+            "phrase with thin results and real demand is hidden demand in plain "
+            "sight; a phrase with huge results is a store root in disguise — "
+            "leave it and niche it down instead."
         )
 
     # --- strategic focus pivot (autonomous re-discovery) --------------------

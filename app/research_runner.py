@@ -38,7 +38,11 @@ from app.db import Database
 from app.events import EventLog
 from app.evidence_capture import EvidenceCollector
 from app.filters import CandidateFilterEngine
-from app.final_dive import FinalCandidateDive, order_for_marketplace
+from app.final_dive import (
+    DEFAULT_MAX_COMPETITION,
+    FinalCandidateDive,
+    order_for_marketplace,
+)
 from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
@@ -2120,10 +2124,12 @@ class ResearchRunner:
                     seeds=seeds,
                 )
                 frontier_out = fres.to_dict()
+                dropped = sum(fres.rejected.values())
                 self.trace.record(
                     session_id, KIND_DISCOVERY,
                     f"Autocomplete frontier: {len(fres.terms)} demand-language "
-                    f"phrase(s) mined from {fres.queries_run} suggestion query(ies) "
+                    f"phrase(s) kept from {fres.queries_run} suggestion query(ies), "
+                    f"{dropped} screened out (roots, noise, drift) "
                     f"({fres.stopped_reason})",
                 )
                 if not (self._cancelled or self._pause_requested) and "error" not in frontier_out:
@@ -3987,6 +3993,9 @@ class ResearchRunner:
             autocomplete_queries=int(getattr(cfg, "dive_autocomplete_queries", 24)),
             products_per_store=int(getattr(cfg, "dive_products_per_store", 6)),
             time_budget_seconds=float(getattr(cfg, "dive_time_budget_seconds", 300)),
+            max_competition=int(
+                getattr(cfg, "dive_max_competition", DEFAULT_MAX_COMPETITION)
+            ),
             should_stop=lambda: self._cancelled or self._pause_requested,
         )
         wrote_evidence = False
@@ -4025,6 +4034,8 @@ class ResearchRunner:
                     "candidate_id": cand.id,
                     "niche": cand.niche[:120],
                     "keywords_measured": res.keywords_measured,
+                    "keywords_rejected": len(res.rejected),
+                    "competition_ceiling": res.competition_ceiling,
                     "phrases_mined": res.phrases_mined,
                     "phrases_derived_from_niche": res.phrases_derived,
                     "books_categories": len(res.books_categories),

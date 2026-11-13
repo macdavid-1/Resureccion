@@ -178,6 +178,10 @@ class Config:
         # report SHOWS must carry its measured keywords and category maps.
         self.dive_max_candidates = max(1, _int_env("DIVE_MAX_CANDIDATES", 12))
         self.dive_max_keywords = max(0, _int_env("DIVE_MAX_KEYWORDS", 20))
+        # A measured phrase printing more Amazon results than this is REJECTED,
+        # not merely ranked last: it is a term no new book can rank for. 0
+        # disables the ceiling.
+        self.dive_max_competition = max(0, _int_env("DIVE_MAX_COMPETITION", 25_000))
         self.dive_max_categories = max(0, _int_env("DIVE_MAX_CATEGORIES", 10))
         self.dive_products_per_store = max(1, _int_env("DIVE_PRODUCTS_PER_STORE", 6))
         self.dive_autocomplete_queries = max(

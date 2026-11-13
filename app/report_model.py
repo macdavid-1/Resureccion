@@ -831,6 +831,7 @@ def _dive_index(ev_rows: list[Any]) -> dict[str, dict[str, Any]]:
             "niche": str(d.get("niche") or ""),
             "keywords": [], "keyword_evidence_id": "", "department": "",
             "ranked_by": "", "marketplace": "",
+            "rejected": [], "unmeasured": [], "competition_ceiling": 0,
             "books": [], "kindle_store": [], "category_evidence_id": "",
             "category_note": "",
             "reviews": [], "review_evidence_id": "", "review_products_read": 0,
@@ -843,6 +844,13 @@ def _dive_index(ev_rows: list[Any]) -> dict[str, dict[str, Any]]:
             slot["department"] = str(d.get("department") or "")
             slot["ranked_by"] = str(d.get("ranked_by") or "")
             slot["marketplace"] = str(_ev_field(e, "marketplace") or "")
+            slot["rejected"] = [
+                r for r in (d.get("rejected") or []) if isinstance(r, dict)
+            ]
+            slot["unmeasured"] = [
+                r for r in (d.get("unmeasured") or []) if isinstance(r, dict)
+            ]
+            slot["competition_ceiling"] = int(d.get("competition_ceiling") or 0)
         elif kind == "category_research" and not (
             slot["books"] or slot["kindle_store"]
         ):
@@ -1198,6 +1206,11 @@ def _finalist_sections(
             if len(seeds) >= 12:
                 break
 
+        rejected = [r for r in (dive.get("rejected") or []) if isinstance(r, dict)]
+        rejection_reasons: dict[str, int] = {}
+        for row in rejected:
+            reason = str(row.get("reason") or "other")
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
         measured_kw = sum(1 for k in keywords if k.get("measured"))
         from_suggestions = sum(
             1 for k in keywords
@@ -1212,6 +1225,24 @@ def _finalist_sections(
             notes.append(
                 f"{len(keywords)} of {keyword_target} backend keywords were "
                 "measured for this candidate (the dive's budget ran out first)."
+            )
+        if rejected:
+            counts = ", ".join(
+                f"{n} {reason.replace('_', ' ')}"
+                for reason, n in sorted(
+                    rejection_reasons.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            )
+            ceiling = int(dive.get("competition_ceiling") or 0)
+            notes.append(
+                f"{len(rejected)} candidate phrase(s) were screened out before "
+                f"they could become keywords ({counts})"
+                + (
+                    f"; measured phrases printing more than {ceiling:,} "
+                    "Amazon results were refused"
+                    if ceiling else ""
+                )
+                + ". The keywords above are the ones that survived."
             )
         if from_niche and not from_suggestions:
             notes.append(
@@ -1262,6 +1293,9 @@ def _finalist_sections(
             "keywords_from_autocomplete": from_suggestions,
             "keywords_from_niche": from_niche,
             "keywords_unmeasured": len(keywords) - measured_kw,
+            "keywords_rejected": len(rejected),
+            "keyword_rejections": rejection_reasons,
+            "competition_ceiling": int(dive.get("competition_ceiling") or 0),
             "keyword_evidence_id": str(dive.get("keyword_evidence_id") or ""),
             "department": str(dive.get("department") or ""),
             "ranked_by": str(dive.get("ranked_by") or ""),

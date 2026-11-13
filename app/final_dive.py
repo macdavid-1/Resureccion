@@ -46,7 +46,9 @@ from app.frontier import (
     SUGGEST_JS,
     mid_for,
     phrase_score,
+    screen_phrase,
     seeds_from_text,
+    topical_tokens,
 )
 from app.marketplace import Marketplace
 from app.redact import scrub_url
@@ -54,9 +56,19 @@ from app.redact import scrub_url
 # Amazon departments: Books and the Kindle Store are different catalogues.
 DEPARTMENT_PARAM = {"books": "stripbooks", "kindle": "digital-text"}
 
+# Breadcrumb levels that are store roots, not choosable KDP categories.
+CATEGORY_ROOTS = frozenset({
+    "books", "kindle store", "kindle ebooks", "kindle books", "kindle",
+    "audible audiobooks", "audible", "amazon", "everything else",
+})
+
 # Competition buckets for a measured keyword (Amazon's total result count).
 LOW_COMPETITION_MAX = 5_000
 MEDIUM_COMPETITION_MAX = 25_000
+# Above this a phrase is REJECTED rather than merely ranked last: a head term
+# with tens of thousands of results (let alone millions) is not a niche keyword
+# a new book can rank for, and presenting it as "researched" is a lie.
+DEFAULT_MAX_COMPETITION = MEDIUM_COMPETITION_MAX
 
 # Real customer reviews read per opened competitor product page (the page is
 # already open for its category breadcrumbs, so this costs no navigation).
@@ -145,6 +157,14 @@ class DiveResult:
     # Phrases built from the niche because the completion stream gave nothing.
     phrases_derived: int = 0
     keywords_measured: int = 0
+    # Phrases that were screened out before measuring (`stage: "screened"`) or
+    # measured and then refused (`stage: "measured"`), each with its reason and
+    # its real result total when one was read. This is the audit trail that
+    # shows the dive FILTERED instead of pouring every suggestion in.
+    rejected: list[dict[str, Any]] = field(default_factory=list)
+    # Screened phrases with no search yet (budget ran out).
+    unmeasured: list[dict[str, Any]] = field(default_factory=list)
+    competition_ceiling: int = 0
     queries_run: int = 0
     pages_opened: int = 0
     stopped_reason: str = "completed"
@@ -172,6 +192,10 @@ class DiveResult:
             "phrases_mined": self.phrases_mined,
             "phrases_derived": self.phrases_derived,
             "keywords_measured": self.keywords_measured,
+            "keywords_rejected": len(self.rejected),
+            "rejected": self.rejected[:40],
+            "unmeasured": self.unmeasured[:20],
+            "competition_ceiling": self.competition_ceiling,
             "queries_run": self.queries_run,
             "pages_opened": self.pages_opened,
             "stopped_reason": self.stopped_reason,
@@ -194,6 +218,7 @@ class FinalCandidateDive:
         autocomplete_queries: int = 24,
         products_per_store: int = 6,
         time_budget_seconds: float = 300.0,
+        max_competition: int = DEFAULT_MAX_COMPETITION,
         should_stop: Any = None,
     ) -> None:
         self.browser = browser
@@ -204,6 +229,8 @@ class FinalCandidateDive:
         self.max_queries = max(0, int(autocomplete_queries))
         self.products_per_store = max(1, int(products_per_store))
         self.time_budget = max(10.0, float(time_budget_seconds))
+        # 0 disables the ceiling (every measured phrase is then eligible).
+        self.max_competition = max(0, int(max_competition))
         # Cooperative stop: owner pause / cancel yields within one step.
         self.should_stop = should_stop or (lambda: False)
 
@@ -226,6 +253,8 @@ class FinalCandidateDive:
             res.elapsed_seconds = time.monotonic() - start
             return res
         res.marketplace = getattr(mkt, "code", "")
+        res.competition_ceiling = self.max_competition
+        attempted: set[str] = set()
         try:
             phrases = await self._mine_phrases(
                 session_id, mkt, res, deadline
@@ -241,10 +270,38 @@ class FinalCandidateDive:
                 res.phrases_derived = len(phrases)
             if not (self._expired(deadline) or self.should_stop()):
                 await self._measure_keywords(
-                    session_id, mkt, res, phrases, deadline
+                    session_id, mkt, res, phrases, deadline, attempted=attempted
                 )
+            # ---- deepening pass: mine FROM the phrases that measured well --
+            # The first sweep is anchored on the candidate's own niche words;
+            # buyers complete those into phrasings the niche label never
+            # contains. One bounded second sweep, seeded by the accepted
+            # keywords, is what makes the keyword set deep instead of shallow.
+            if (
+                len(res.keywords) < self.max_keywords
+                and not (self._expired(deadline) or self.should_stop())
+            ):
+                seeds = [
+                    str(k.get("keyword") or "")
+                    for k in res.keywords[:4]
+                    if k.get("measured") and str(k.get("keyword") or "")
+                ]
+                if seeds:
+                    deeper = await self._mine_phrases(
+                        session_id, mkt, res, deadline, seeds=seeds
+                    )
+                    deeper = [
+                        d for d in deeper
+                        if d["keyword"].lower() not in attempted
+                    ]
+                    if deeper:
+                        await self._measure_keywords(
+                            session_id, mkt, res, deeper, deadline,
+                            attempted=attempted,
+                        )
             if not (self._expired(deadline) or self.should_stop()):
                 await self._map_categories(session_id, mkt, res, deadline)
+            self._finalize_keywords(res)
         except Exception as exc:  # a dive failure is a finding, never a crash
             res.error = f"{type(exc).__name__}: {exc}"[:200]
             res.stopped_reason = "error"
@@ -263,11 +320,21 @@ class FinalCandidateDive:
         mkt: Marketplace,
         res: DiveResult,
         deadline: float,
+        *,
+        seeds: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Mine buyer phrases from Amazon's suggestion box (one page)."""
-        seeds = seeds_from_text(res.niche, limit=4)
-        if not seeds:
-            seeds = [w for w in res.niche.split() if len(w) > 3][:3]
+        """Mine buyer phrases from Amazon's suggestion box (one page).
+
+        `seeds` lets the deepening pass re-mine from the phrases that already
+        measured well, instead of asking the same niche prefixes again.
+        """
+        from_niche = seeds is None
+        if from_niche:
+            seeds = seeds_from_text(res.niche, limit=4)
+            if not seeds:
+                seeds = [w for w in res.niche.split() if len(w) > 3][:3]
+        else:
+            seeds = [s for s in (_clean_phrase(x).lower() for x in seeds or []) if s][:4]
         if not seeds:
             return []
         freq: dict[str, int] = {}
@@ -276,10 +343,18 @@ class FinalCandidateDive:
             page = await self.browser.open_marketplace(mkt, "/")
             res.pages_opened += 1
 
+            # The first sweep leaves a slice of the query budget for the
+            # deepening sweep seeded by the accepted keywords: spending every
+            # query on the alphabet leaves the second (deeper) pass with
+            # nothing, which is how a dive ends up shallow.
+            limit = self.max_queries
+            if from_niche:
+                limit = max(4, int(self.max_queries * 0.7))
+
             async def ask(prefix: str) -> None:
                 nonlocal page
                 if (
-                    res.queries_run >= self.max_queries
+                    res.queries_run >= limit
                     or self._expired(deadline)
                     or self.should_stop()
                 ):
@@ -306,9 +381,10 @@ class FinalCandidateDive:
 
             # The niche itself, then each seed, then one letter frontier on
             # the most productive seed — bounded by max_queries.
-            await ask(res.niche)
+            if from_niche:
+                await ask(res.niche)
             for seed in seeds:
-                if res.queries_run >= self.max_queries:
+                if res.queries_run >= limit:
                     break
                 await ask(seed)
             productive = sorted(
@@ -318,7 +394,7 @@ class FinalCandidateDive:
             )
             for seed in productive[:2]:
                 for letter in _LETTERS:
-                    if res.queries_run >= self.max_queries:
+                    if res.queries_run >= limit:
                         break
                     if self._expired(deadline) or self.should_stop():
                         break
@@ -330,12 +406,24 @@ class FinalCandidateDive:
                 except Exception:
                     pass
 
+        # Screen BEFORE any search is spent: roots ("journal for women"), noise
+        # and phrases that have drifted away from this candidate are counted
+        # and dropped, never researched and never presented as keywords.
+        topics = topical_tokens(res.niche)
+        for seed in seeds:
+            topics |= topical_tokens(seed)
         shortlist: list[dict[str, Any]] = []
         for key, count in freq.items():
             phrase = _clean_phrase(key)
             score = phrase_score(phrase, frequency=count)
             words = len(phrase.split())
             if score <= 0 or words < 2 or len(phrase) < 6 or len(phrase) > 70:
+                if phrase:
+                    self._reject(res, phrase, "too_broad" if words < 2 else "noise")
+                continue
+            ok, reason = screen_phrase(phrase, topics)
+            if not ok:
+                self._reject(res, phrase, reason)
                 continue
             shortlist.append({
                 "keyword": phrase,
@@ -346,8 +434,19 @@ class FinalCandidateDive:
         # Buyer demand first (how often shoppers complete it), then alphabet
         # for determinism. Measurement trims to max_keywords below.
         shortlist.sort(key=lambda d: (-d["demand_score"], d["keyword"]))
-        res.phrases_mined = len(shortlist)
+        res.phrases_mined += len(shortlist)
         return shortlist
+
+    @staticmethod
+    def _reject(res: DiveResult, phrase: str, reason: str, **extra: Any) -> None:
+        """Journal one dropped phrase (bounded; the report shows the reasons)."""
+        if len(res.rejected) >= 120:
+            return
+        res.rejected.append({
+            "keyword": phrase[:120],
+            "reason": reason,
+            **extra,
+        })
 
     @staticmethod
     def _phrases_from_niche(niche: str) -> list[dict[str, Any]]:
@@ -376,10 +475,16 @@ class FinalCandidateDive:
                 candidates.append(trimmed)
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
+        topics = topical_tokens(text)
         for phrase in candidates:
             phrase = _clean_phrase(phrase)
             key = phrase.lower()
             if not phrase or key in seen or len(phrase) < 6 or len(phrase.split()) < 2:
+                continue
+            ok, _reason = screen_phrase(phrase, topics)
+            if not ok:
+                # Derived phrases are held to the same bar as mined ones: a
+                # dangling "... for" is not a keyword, it is a cut-off query.
                 continue
             seen.add(key)
             out.append({
@@ -391,6 +496,16 @@ class FinalCandidateDive:
         return out
 
     # ---------------------------------------------------------- measurement
+    def _competition_reason(self, total: Any) -> str:
+        """Why a measured phrase is refused, or '' when it is eligible."""
+        if (
+            self.max_competition > 0
+            and isinstance(total, int)
+            and total > self.max_competition
+        ):
+            return "too_much_competition"
+        return ""
+
     async def _measure_keywords(
         self,
         session_id: str,
@@ -398,28 +513,43 @@ class FinalCandidateDive:
         res: DiveResult,
         phrases: list[dict[str, Any]],
         deadline: float,
+        *,
+        attempted: set[str] | None = None,
     ) -> None:
-        """Run a real Books-department search per shortlisted phrase."""
+        """Verify phrases ONE BY ONE and keep only the ones worth a book.
+
+        Each screened phrase gets a real Books-department search; the measured
+        total is the accept/reject decision (above the competition ceiling the
+        phrase is refused with its number attached, not silently ranked last).
+        The loop keeps walking the ranked pool until `max_keywords` phrases are
+        ACCEPTED or the pool/budget runs out — so the report gets a verified
+        set instead of the first N suggestions that happened to come back.
+        """
         if not phrases or self.max_keywords == 0:
             return
-        target = phrases[: self.max_keywords * 2]  # oversample; budget trims
-        measured: list[dict[str, Any]] = []
+        attempted = attempted if attempted is not None else set()
+        pool = phrases[: self.max_keywords * 3]  # oversample; rejects trim
         unmeasured: list[dict[str, Any]] = []
         dept = DEPARTMENT_PARAM["books"]
         page = None
         try:
-            for i, entry in enumerate(target):
-                if len(measured) >= self.max_keywords:
+            for i, entry in enumerate(pool):
+                if len(res.keywords) >= self.max_keywords:
                     break
+                kw = str(entry.get("keyword") or "")
+                if not kw or kw.lower() in attempted:
+                    continue
                 if self._expired(deadline) or self.should_stop():
                     unmeasured.extend(
                         {"keyword": p["keyword"], "measured": False,
                          "demand_score": p["demand_score"],
-                         "suggestion_hits": p["suggestion_hits"]}
-                        for p in target[i:]
+                         "suggestion_hits": p["suggestion_hits"],
+                         "source": p.get("source") or "autocomplete"}
+                        for p in pool[i:]
+                        if p["keyword"].lower() not in attempted
                     )
                     break
-                kw = entry["keyword"]
+                attempted.add(kw.lower())
                 path = f"/s?k={quote_plus(kw)}&i={dept}"
                 try:
                     if page is None:
@@ -441,7 +571,7 @@ class FinalCandidateDive:
                     int(r["review_count"]) for r in items
                     if r.get("review_count") is not None
                 ]
-                measured.append({
+                row: dict[str, Any] = {
                     "keyword": kw,
                     "measured": True,
                     "source": entry.get("source") or "autocomplete",
@@ -462,7 +592,17 @@ class FinalCandidateDive:
                     "demand_score": entry["demand_score"],
                     "suggestion_hits": entry["suggestion_hits"],
                     "marketplace": mkt.code,
-                })
+                }
+                refused = self._competition_reason(total)
+                if refused:
+                    self._reject(
+                        res, kw, refused, stage="measured",
+                        total_results=total,
+                        competition=row["competition"],
+                        marketplace=mkt.code,
+                    )
+                    continue
+                res.keywords.append(row)
         finally:
             if page is not None:
                 try:
@@ -470,22 +610,8 @@ class FinalCandidateDive:
                 except Exception:
                     pass
 
-        # Lightest competition first (what actually lets a new book rank),
-        # then buyer demand, then the honest unmeasured tail (never a
-        # fabricated number).
-        measured.sort(key=lambda d: (
-            competition_rank(
-                d.get("total_results") if isinstance(d.get("total_results"), int) else None
-            ),
-            -int(d.get("demand_score") or 0),
-            d.get("total_results") if isinstance(d.get("total_results"), int) else 10**12,
-            d["keyword"].lower(),
-        ))
-        unmeasured.sort(key=lambda d: (-int(d.get("demand_score") or 0), d["keyword"].lower()))
-        res.keywords = measured[: self.max_keywords] + unmeasured[
-            : max(0, self.max_keywords - len(measured))
-        ]
-        res.keywords_measured = min(len(measured), self.max_keywords)
+        res.unmeasured.extend(unmeasured)
+        res.keywords_measured = len(res.keywords)
         if self._expired(deadline):
             res.stopped_reason = "budget_reached"
 
@@ -502,9 +628,13 @@ class FinalCandidateDive:
                     "requested": self.max_keywords,
                     "measured": res.keywords_measured,
                     "phrases_mined": res.phrases_mined,
+                    "competition_ceiling": self.max_competition,
+                    "rejected": res.rejected[:40],
+                    "unmeasured": res.unmeasured[:20],
                     "ranked_by": (
-                        "buyer demand first, then lightest competition "
-                        "(Amazon's own total-result count)"
+                        "screened for specificity, then verified one by one "
+                        "with a real search; competition must stay under "
+                        f"{self.max_competition} results; lightest first"
                     ),
                     "keywords": res.keywords,
                 },
@@ -512,6 +642,30 @@ class FinalCandidateDive:
             res.evidence_ids.append(str(rec.id))
         except Exception:
             pass  # measurement already happened; persistence is additive
+
+    def _finalize_keywords(self, res: DiveResult) -> None:
+        """Order the accepted set and attach the honest unmeasured tail."""
+        res.keywords.sort(key=lambda d: (
+            competition_rank(
+                d.get("total_results") if isinstance(d.get("total_results"), int) else None
+            ),
+            -int(d.get("demand_score") or 0),
+            d.get("total_results") if isinstance(d.get("total_results"), int) else 10**12,
+            d["keyword"].lower(),
+        ))
+        res.unmeasured.sort(
+            key=lambda d: (-int(d.get("demand_score") or 0), d["keyword"].lower())
+        )
+        room = max(0, self.max_keywords - len(res.keywords))
+        if room and res.unmeasured:
+            res.keywords.extend(
+                {"keyword": d["keyword"], "measured": False,
+                 "demand_score": d.get("demand_score", 0),
+                 "suggestion_hits": d.get("suggestion_hits", 0),
+                 "source": d.get("source") or "autocomplete"}
+                for d in res.unmeasured[:room]
+            )
+        res.keywords_measured = sum(1 for k in res.keywords if k.get("measured"))
 
     # ------------------------------------------------------------ categories
     async def _map_categories(
@@ -636,7 +790,7 @@ class FinalCandidateDive:
                 if not name or len(rows) >= self.max_categories:
                     return
                 key = " ".join(name.lower().split())
-                if key in seen:
+                if key in seen or key in CATEGORY_ROOTS:
                     continue
                 seen.add(key)
                 rows.append({
