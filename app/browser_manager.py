@@ -976,6 +976,13 @@ class BrowserManager:
         marketplace = marketplace_from_url(url)
         if marketplace is None:
             return
+        # The configured zip belongs to one store (a US zip is meaningless on
+        # amazon.co.uk). Spending the once-per-launch pin on whichever store
+        # happens to open first would leave the US pages reached later still
+        # quoting the IP-implied currency, so wait for the zip's own store.
+        target_market = str(getattr(cfg, "amazon_delivery_market", "us")).lower()
+        if target_market and marketplace.code != target_market:
+            return
         self._location_pinned = True
         try:
             status = await amazon_location.pin_delivery_location(

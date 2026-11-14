@@ -190,7 +190,10 @@ def _manager(**overrides):
 
     mgr = bm.BrowserManager.__new__(bm.BrowserManager)
     mgr.config = SimpleNamespace(
-        amazon_location_pin=True, amazon_delivery_zip="10001", **overrides
+        amazon_location_pin=True,
+        amazon_delivery_zip="10001",
+        amazon_delivery_market="us",
+        **overrides,
     )
     mgr._location_pinned = False
     mgr._location_note = None
@@ -253,3 +256,26 @@ async def test_non_amazon_pages_are_left_alone(monkeypatch) -> None:
     await mgr._pin_market_location(page, "https://example.com/")
     assert called == []
     assert mgr._location_note is None
+
+
+@pytest.mark.asyncio
+async def test_the_pin_waits_for_the_zip_s_own_store(monkeypatch) -> None:
+    """A US zip must not be spent on amazon.co.uk: multi-marketplace runs reach
+    the US store later, and the pin is once per launch."""
+    mgr = _manager()
+    calls: list[dict] = []
+
+    async def fake_pin(_page, **kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "location": "Deliver to New York 10001", "detail": ""}
+
+    monkeypatch.setattr(amazon_location, "pin_delivery_location", fake_pin)
+    page = _Page("https://www.amazon.co.uk/s?k=grief")
+
+    await mgr._pin_market_location(page, "https://www.amazon.co.uk/s?k=grief")
+    assert calls == []
+    assert mgr._location_pinned is False, "the pin must stay available for US"
+
+    await mgr._pin_market_location(page, "https://www.amazon.com/s?k=grief")
+    assert len(calls) == 1
+    assert calls[0]["currency"] == "USD"

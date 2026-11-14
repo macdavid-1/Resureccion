@@ -171,6 +171,7 @@ evidence exists.
 | `BROWSER_TIMEZONE` | no | `America/New_York` | Timezone the browser presents when `CAMOUFOX_GEOIP` is off (New York by default) |
 | `AMAZON_LOCATION_PIN` | no | `true` | Pin Amazon's delivery location once per browser launch through Amazon's own “Deliver to” dialog, using the researched marketplace's currency. Without it a foreign egress shows NGN prices and “Deliver to Nigeria” on amazon.com |
 | `AMAZON_DELIVERY_ZIP` | no | `10001` | Delivery zip used by the pin (10001 = Manhattan, New York). The header must confirm it; a pin that cannot be confirmed is reported in the browser status, never assumed |
+| `AMAZON_DELIVERY_MARKET` | no | `us` | Marketplace code the delivery zip belongs to. Multi-marketplace runs keep the once-per-launch pin for this store instead of spending it on whichever store opens first (a US zip is meaningless on amazon.co.uk) |
 | `BROWSER_CHANNEL` | no | `chromium` | Playwright channel (chromium engine only); bundled chromium supports extensions headless |
 | `BROWSER_NO_SANDBOX` | no | auto | Chromium engine: launch with `--no-sandbox`. Auto-detected: on when running as root or inside a container (HF Spaces/Docker), off locally. Set explicitly to `true`/`false` to override. |
 | `BROWSER_EXTRA_ARGS` | no | — | Chromium engine: space/comma-separated extra launch args (deploy-specific tuning) |

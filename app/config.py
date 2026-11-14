@@ -282,6 +282,13 @@ class Config:
         self.amazon_delivery_zip = (
             os.environ.get("AMAZON_DELIVERY_ZIP", "10001").strip() or "10001"
         )
+        # The zip belongs to ONE marketplace (a US zip is meaningless on
+        # amazon.co.uk). Multi-marketplace runs must not spend the once-per-
+        # launch pin on the first store they happen to open, or the US pages
+        # reached later would keep their IP-implied currency.
+        self.amazon_delivery_market = (
+            os.environ.get("AMAZON_DELIVERY_MARKET", "us").strip().lower() or "us"
+        )
         self.browser_idle_shutdown_seconds = _int_env("BROWSER_IDLE_SHUTDOWN_SECONDS", 300)
         # Keepalive cadence while the model is thinking. A research iteration
         # is dominated by the LLM call (often 30-180s) and nothing loads in the
