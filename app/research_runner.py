@@ -44,7 +44,7 @@ from app.final_dive import (
     order_for_marketplace,
 )
 from app.frontier import AutocompleteFrontier, seeds_for_session
-from app.integrity import IntegrityAssessmentStore
+from app.integrity import KIND_SYNTHESIS, IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
 from app.market_memory import MarketMemoryStore, harvest_session
 from app.marketplace import (
@@ -61,6 +61,7 @@ from app.methodology import (
     P5_DEMAND,
     P6_GAP,
     P8_ADVERSARIAL,
+    P9_SYNTHESIS,
     PHASE_ORDER,
     PHASE_TITLES,
     SESSION_PHASE_BY_METHOD_PHASE,
@@ -250,6 +251,31 @@ _TARGET_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bniche\s+target\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\b", re.IGNORECASE),
     re.compile(r"\btarget\s*(?:of|is|[:=]|to)?\s*(\d{1,3})\s+(?:verified\s+)?niches\b", re.IGNORECASE),
 )
+
+
+# Format words name a product shape, not a market: two labels that share only
+# "journal" or "book" are not the same niche. Dropped before comparing labels
+# so a rephrased synthesis niche is matched on its subject, not its format.
+_NICHE_FORMAT_TOKENS = frozenset({
+    "book", "journal", "notebook", "planner", "guide", "workbook", "logbook",
+    "diary", "tracker", "edition", "series", "volume",
+})
+_NICHE_STOP_TOKENS = frozenset({
+    "for", "with", "and", "the", "that", "your", "from", "into", "about",
+    "this", "these", "those", "all", "new",
+})
+
+
+def _niche_tokens(text: str) -> set[str]:
+    """Subject words of a niche label (plurals folded, format/stop words out)."""
+    out: set[str] = set()
+    for word in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+        if len(word) > 3 and word.endswith("s"):
+            word = word[:-1]
+        if len(word) < 3 or word in _NICHE_FORMAT_TOKENS or word in _NICHE_STOP_TOKENS:
+            continue
+        out.add(word)
+    return out
 
 
 def _phase_content(output: dict[str, Any]) -> dict[str, Any]:
@@ -763,6 +789,22 @@ class ResearchRunner:
                 if prior_out is not None:
                     phase_outputs[phase] = prior_out
                     completed_phases.add(phase)
+            # A committed synthesis is re-applied idempotently (existing
+            # opportunity rows are skipped) so a run paused before this fix —
+            # or interrupted between applying its effects and saving the
+            # marker — still gets its dossiers into the report on resume.
+            if phase_outputs.get(P9_SYNTHESIS):
+                try:
+                    self._apply_phase_effects(
+                        session_id, P9_SYNTHESIS, phase_outputs[P9_SYNTHESIS]
+                    )
+                except Exception as exc:
+                    self.errors.record(
+                        session_id, scope="opportunity_synthesis",
+                        severity="warning",
+                        message=f"re-apply on resume: {type(exc).__name__}: {exc}"[:300],
+                        recoverable=True,
+                    )
             # A model-directed phase switch that was in flight when the
             # session died is re-applied, so the jump is never silently lost.
             if self._reapply_pending_goto(session_id, pass_round, completed_phases):
@@ -1818,10 +1860,29 @@ class ResearchRunner:
                 # marketplace the registry does not recognise is a spelling,
                 # not a reason to throw away a verified dossier.
                 cid = str(o.get("candidate_id") or "").strip()
-                if not cid:
-                    match = self._find_candidate_by_niche(session_id, str(o.get("niche", "")))
-                    cid = match.id if match else ""
                 cand = self.candidates.get(session_id, cid) if cid else None
+                if cand is None:
+                    # The opportunity contract never asks the model for a
+                    # candidate id, so one it writes is a HINT — often invented,
+                    # sometimes omitted. Resolve the row the niche names instead
+                    # of discarding a complete dossier as an orphan (that is
+                    # how every synthesis died with "no matching candidate"
+                    # while the report's final candidates were full).
+                    niche_text = str(o.get("niche", ""))
+                    match = self._find_candidate_by_niche(
+                        session_id, niche_text, verified_only=True
+                    ) or self._find_candidate_by_niche(session_id, niche_text)
+                    if match is not None:
+                        if cid:
+                            self.events.append(
+                                session_id, level="warn", actor="agent",
+                                action="opportunity_candidate_id_corrected",
+                                detail={"candidate_id": cid[:80],
+                                        "matched": match.id,
+                                        "niche": niche_text[:120]},
+                            )
+                        cid = match.id
+                        cand = match
                 opp_markets = normalize_marketplace_codes(o.get("marketplaces"))
                 cand_markets = (
                     normalize_marketplace_codes(cand.marketplace) if cand else []
@@ -1848,12 +1909,50 @@ class ResearchRunner:
                 normalized = dict(o)
                 if opp_markets:
                     normalized["marketplaces"] = opp_markets
+                # The BACKEND owns these values: the verdict is the engine's,
+                # the parent market is the candidate's, and the list fields are
+                # optional metadata the report already falls back on. Requiring
+                # the model to restate them rejected complete dossiers for
+                # fields it could not know — the opportunity field stayed empty
+                # while the accounting blamed the research.
+                if not str(normalized.get("verification_status") or "").strip():
+                    normalized["verification_status"] = (
+                        self._authoritative_verification_status(session_id, cid)
+                        if cid else "unverified"
+                    )
+                if not str(normalized.get("parent_market") or "").strip():
+                    # Present (even when unknown) because the report owns the
+                    # "—" rendering; a missing KEY is a contract failure.
+                    normalized["parent_market"] = str(
+                        ((getattr(cand, "meta", None) or {}).get("parent_market")
+                         if cand is not None else "") or ""
+                    )
+                for key in ("evidence_ids", "keywords", "title_concepts", "risks"):
+                    value = normalized.get(key)
+                    if isinstance(value, list):
+                        continue
+                    # A model sometimes writes ONE value where a list is
+                    # required; keep it instead of dropping real content.
+                    normalized[key] = (
+                        [str(value)] if isinstance(value, str) and value.strip() else []
+                    )
+                for key in (
+                    "reader_problem", "competitive_landscape", "consumer_needs",
+                    "differentiation", "positioning",
+                ):
+                    if not isinstance(normalized.get(key), str):
+                        normalized[key] = ""
                 ok, problems = validate_opportunity(normalized)
                 if not ok:
                     self.events.append(
                         session_id, level="warn", actor="agent",
                         action="opportunity_rejected_invalid",
                         detail={"problems": problems, "niche": str(o.get("niche", ""))[:120]},
+                    )
+                    self._record_synthesis_rejection(
+                        session_id, str(o.get("niche", "")),
+                        "synthesized dossier rejected: " + "; ".join(problems[:4]),
+                        problems=problems[:8],
                     )
                     continue
                 if cand is None or cand.status != "verified":
@@ -1879,13 +1978,25 @@ class ResearchRunner:
                             ["the integrity pipeline did not verify this candidate"],
                         ),
                     )
+                    self._record_synthesis_rejection(
+                        session_id, str(o.get("niche", "")),
+                        "synthesized dossier dropped: "
+                        + (
+                            "no candidate matches its niche; the integrity "
+                            "pipeline never verified one"
+                            if cand is None else
+                            f"its candidate did not pass deterministic "
+                            f"verification (status {cand.status!r})"
+                        ),
+                        candidate_status=(cand.status if cand else "missing"),
+                    )
                     continue
                 if cid in known_opp_candidates:
                     # Already synthesized in an earlier pass — the existing
                     # opportunity row is the record for this candidate.
                     continue
-                keywords = o.get("keywords") or []
-                title_concepts = o.get("title_concepts")
+                keywords = normalized.get("keywords") or []
+                title_concepts = normalized.get("title_concepts")
                 title = (
                     str(title_concepts[0])
                     if isinstance(title_concepts, list) and title_concepts
@@ -1916,13 +2027,13 @@ class ResearchRunner:
                 # Chain-of-custody applies to the dossier too: evidence ids
                 # on the opportunity itself are filtered to ids that EXIST in
                 # this session — fabricated ids never reach the report.
-                meta = {k: o.get(k) for k in (
+                meta = {k: normalized.get(k) for k in (
                     "parent_market", "target_reader", "reader_problem",
                     "competitive_landscape", "consumer_needs", "market_gap",
                     "differentiation", "risks", "title_concepts",
-                ) if o.get(k) is not None}
+                ) if normalized.get(k) is not None}
                 meta["evidence_ids"] = self._valid_evidence_ids(
-                    session_id, [str(e) for e in (o.get("evidence_ids") or [])]
+                    session_id, [str(e) for e in (normalized.get("evidence_ids") or [])]
                 )
                 meta["verification_status"] = verification_status
                 meta["keyword_integrity"] = kw_screen.to_dict()
@@ -1932,7 +2043,7 @@ class ResearchRunner:
                     title=title[:200],
                     niche=str(o.get("niche", ""))[:200],
                     marketplace=",".join(opp_markets)[:60],
-                    angle=str(o.get("positioning") or "")[:500],
+                    angle=str(normalized.get("positioning") or "")[:500],
                     keywords=[k[:80] for k in clean_keywords][:20],
                     confidence=float(o.get("confidence") or 0.0),
                     meta=meta,
@@ -1943,6 +2054,35 @@ class ResearchRunner:
                     session_id, level="info", actor="agent", action="opportunities_created",
                     detail={"count": created},
                 )
+
+    def _record_synthesis_rejection(
+        self, session_id: str, niche: str, reason: str, **metrics: Any
+    ) -> None:
+        """Durable accounting for a dossier synthesis produced but we dropped.
+
+        Events alone left the report saying "0 opportunities" with no reason
+        beside it; this row is what the quality statement quotes back.
+        """
+        # Synthesis effects can be re-applied (resume, re-run phase): one
+        # accounting row per decision, never one per attempt.
+        existing = {
+            (str((a.metrics or {}).get("niche") or ""), str(a.reason or ""))
+            for a in self.assessments.list(
+                session_id, kind=KIND_SYNTHESIS, outcome="fail", limit=200
+            )
+        }
+        if (str(niche)[:200], str(reason)[:300]) in existing:
+            return
+        self.assessments.record(
+            session_id,
+            kind=KIND_SYNTHESIS,
+            subject_type="opportunity",
+            subject_id="",
+            stage="opportunity_synthesis",
+            outcome="fail",
+            reason=str(reason)[:300],
+            metrics={"niche": str(niche)[:200], **metrics},
+        )
 
     # ------------------------------------------------ deep-discovery layers
     def _phase_iterations(self, phase: str, mode: str) -> int:
@@ -3652,7 +3792,9 @@ class ResearchRunner:
         cp = self.checkpoints.get(session_id, "marketplace_plan")
         return str(cp.payload.get("mode")) if cp else "auto"
 
-    def _find_candidate_by_niche(self, session_id: str, niche: str):
+    def _find_candidate_by_niche(
+        self, session_id: str, niche: str, *, verified_only: bool = False
+    ):
         """Resolve a model-written niche label to a real candidate row.
 
         Exact match first. Otherwise the SAME containment rule the claims and
@@ -3662,22 +3804,63 @@ class ResearchRunner:
         the synthesis dossier built on that candidate. Containment is only
         trusted when exactly ONE candidate matches: an ambiguous label must
         never be attached to the wrong row.
+
+        Synthesis also REPHRASES instead of shortening — "guided grief
+        journals for adult children after a sudden loss" is a substring of
+        neither label — so a last tier compares the subject words and accepts
+        only an unambiguous winner. Without it every dossier whose niche the
+        model wrote in its own words was dropped as an orphan, leaving the
+        opportunities field empty on otherwise healthy runs.
         """
         wanted = (niche or "").strip().lower()
         if not wanted:
             return None
-        cands = self.candidates.list(session_id, limit=200)
+        cands = self.candidates.list(session_id, limit=500)
+        if verified_only:
+            cands = [c for c in cands if str(getattr(c, "status", "")) == "verified"]
         for c in cands:
             if c.niche.strip().lower() == wanted:
                 return c
-        if len(wanted) < 8:
+        if len(wanted) >= 8:
+            matches = [
+                c for c in cands
+                if len(c.niche.strip().lower()) >= 8
+                and (
+                    wanted in c.niche.strip().lower()
+                    or c.niche.strip().lower() in wanted
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return self._best_token_match(cands, wanted)
+
+    def _best_token_match(self, cands: list[Any], wanted_text: str):
+        """The single candidate whose subject words the label covers.
+
+        Coverage = share of the CANDIDATE's content words present in the
+        label. Two rows that fit equally well mean the label is ambiguous:
+        attach nothing rather than guess.
+        """
+        wanted = _niche_tokens(wanted_text)
+        if not wanted:
             return None
-        matches = [
-            c for c in cands
-            if len(c.niche.strip().lower()) >= 8
-            and (wanted in c.niche.strip().lower() or c.niche.strip().lower() in wanted)
-        ]
-        return matches[0] if len(matches) == 1 else None
+        scored: list[tuple[float, int, Any]] = []
+        for c in cands:
+            toks = _niche_tokens(c.niche)
+            shared = toks & wanted
+            if not shared or len(shared) < min(2, len(toks)):
+                continue
+            coverage = len(shared) / len(toks)
+            if coverage < 0.6:
+                continue
+            scored.append((coverage, len(shared), c))
+        if not scored:
+            return None
+        scored.sort(key=lambda row: (-row[0], -row[1]))
+        best = scored[0]
+        if len(scored) > 1 and scored[1][:2] == best[:2]:
+            return None
+        return best[2]
 
     # ------------------------------------------------------------- failure paths
     def _mark_job(self, session_id: str, status: str, detail: dict[str, Any] | None = None) -> None:

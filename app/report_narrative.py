@@ -114,6 +114,7 @@ def build_digest(model: dict[str, Any]) -> dict[str, Any]:
             "what_was_verified": q.get("verified"),
             "what_was_rejected": q.get("rejected"),
             "rejection_reasons": q.get("rejection_reasons"),
+            "synthesis_rejections": q.get("synthesis_rejections"),
             "remains_uncertain": q.get("remains_uncertain"),
             "verification_limitations": q.get("verification_limitations"),
             "estimate_policy": q.get("estimate_policy"),

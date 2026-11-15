@@ -358,6 +358,126 @@ async def test_shortened_opportunity_niche_still_reaches_its_candidate(db, confi
 
 
 @pytest.mark.asyncio
+async def test_rephrased_opportunity_niche_still_reaches_its_candidate(db, config, session):
+    """Synthesis rephrases the niche instead of repeating it verbatim.
+
+    The opportunity contract never asked the model to echo the candidate id,
+    and a rephrased label ("guided grief journals for adult children after a
+    sudden loss") is a substring of NEITHER row, so the containment lookup
+    found nothing and the verified dossier was thrown away as an orphan. The
+    report then showed a full final-candidate section beside an empty
+    opportunities field on every run.
+    """
+    from app.research_data import CandidateStore, OpportunityStore
+    from app.sessions import SessionStore
+
+    script = _script()
+    opp = script["opportunity_synthesis"][0]["opportunities"][0]
+    opp.pop("candidate_id", None)
+    opp["niche"] = (
+        "guided grief journals for adult children after a sudden loss"
+    )
+    runner = make_runner(db, config, ScriptedModel(script))
+    await runner.run(session)
+
+    s = SessionStore(db, config).require(session)
+    assert s.status == "completed", s.error
+    grief = next(c for c in CandidateStore(db).list(session) if "sudden-loss" in c.niche)
+    opps = OpportunityStore(db).list(session)
+    assert len(opps) == 1, [o.niche for o in opps]
+    assert opps[0].candidate_id == grief.id
+
+
+@pytest.mark.asyncio
+async def test_invented_opportunity_candidate_id_falls_back_to_the_niche(db, config, session):
+    """A hallucinated id must not cost a dossier whose niche names a real row."""
+    from app.research_data import CandidateStore, OpportunityStore
+    from app.sessions import SessionStore
+
+    script = _script()
+    opp = script["opportunity_synthesis"][0]["opportunities"][0]
+    opp["candidate_id"] = "cand_deadbeef"
+    runner = make_runner(db, config, ScriptedModel(script))
+    await runner.run(session)
+
+    s = SessionStore(db, config).require(session)
+    assert s.status == "completed", s.error
+    grief = next(c for c in CandidateStore(db).list(session) if "sudden-loss" in c.niche)
+    opps = OpportunityStore(db).list(session)
+    assert len(opps) == 1
+    assert opps[0].candidate_id == grief.id
+
+
+@pytest.mark.asyncio
+async def test_backend_owned_fields_are_not_demanded_from_the_model(db, config, session):
+    """The verdict and parent market are the backend's; omitting them is not a defect."""
+    from app.research_data import OpportunityStore
+    from app.sessions import SessionStore
+
+    script = _script()
+    opp = script["opportunity_synthesis"][0]["opportunities"][0]
+    opp.pop("verification_status", None)
+    opp.pop("parent_market", None)
+    runner = make_runner(db, config, ScriptedModel(script))
+    await runner.run(session)
+
+    s = SessionStore(db, config).require(session)
+    assert s.status == "completed", s.error
+    opps = OpportunityStore(db).list(session)
+    assert len(opps) == 1
+    assert opps[0].meta["verification_status"] == "verified"
+    assert opps[0].meta["parent_market"] == "grief journals"
+
+
+def test_reapplying_committed_synthesis_never_duplicates(db, config, session):
+    """Resume re-applies the stored synthesis output — exactly once per row."""
+    from app.research_data import CandidateStore, OpportunityStore
+
+    runner = make_runner(db, config, ScriptedModel(_script()))
+    cand = CandidateStore(db).create(
+        session, niche="sudden-loss grief journals for adult children",
+        marketplace="us",
+    )
+    CandidateStore(db).set_status(session, cand.id, "verified")
+    output = {"opportunities": [{
+        "niche": "guided grief journals for adult children after a sudden loss",
+        "target_reader": "adult children after a sudden loss",
+        "market_gap": "no guided structure for the first year",
+        "marketplaces": ["us"],
+        "confidence": 0.7,
+    }]}
+
+    runner._apply_phase_effects(session, "opportunity_synthesis", output)
+    runner._apply_phase_effects(session, "opportunity_synthesis", output)
+
+    opps = OpportunityStore(db).list(session)
+    assert len(opps) == 1
+    assert opps[0].candidate_id == cand.id
+
+
+@pytest.mark.asyncio
+async def test_unattachable_dossier_is_accounted_for_in_the_report(db, config, session):
+    """An empty portfolio must say why, not just stay blank."""
+    from app.research_data import OpportunityStore
+    from app.sessions import SessionStore
+
+    script = _script()
+    script["opportunity_synthesis"][0]["opportunities"][0]["niche"] = (
+        "quantum knitting patterns for orbiting astronauts"
+    )
+    runner = make_runner(db, config, ScriptedModel(script))
+    await runner.run(session)
+
+    s = SessionStore(db, config).require(session)
+    assert s.status == "completed", s.error
+    assert OpportunityStore(db).list(session) == []
+    _, body, model = _final_report(db, config, session)
+    q = (model or {}).get("quality_statement") or {}
+    assert q.get("synthesis_rejections"), "the drop was not accounted for"
+    assert "could not be attached" in body
+
+
+@pytest.mark.asyncio
 async def test_opportunity_marketplaces_in_the_models_own_words(db, config, session):
     """'Amazon.com' / 'United Kingdom' must not cost the report its FINAL status."""
     from app.research_data import OpportunityStore

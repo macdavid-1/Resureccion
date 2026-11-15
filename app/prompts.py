@@ -17,6 +17,8 @@ import json
 from typing import Any
 
 from app.methodology import (
+    OPPORTUNITY_FIELDS,
+    P9_SYNTHESIS,
     PHASE_ORDER,
     PHASE_TITLES,
     SPECS,
@@ -307,6 +309,32 @@ def build_user_prompt(
 
     # --- phase-specific instruction ----------------------------------------
     parts.append(f"\nTASK ({PHASE_TITLES[phase]}):\n{spec.guidance}")
+
+    # --- opportunity contract + candidate links (synthesis only) ------------
+    # A dossier missing any contract field is DISCARDED by the deterministic
+    # validator, and the contract is not guessable: the phase used to name the
+    # 'opportunities' key and nothing else, so real replies died as "missing
+    # field" and the report's opportunities list stayed empty.
+    if phase == P9_SYNTHESIS:
+        parts.append(
+            "\nOPPORTUNITY CONTRACT (deterministic — every field must be "
+            "present on every object, or the dossier is refused): "
+            + _compact(list(OPPORTUNITY_FIELDS), limit=1200)
+            + "\n- 'candidate_id': copy it VERBATIM from CANDIDATES for the "
+            "verified candidate this opportunity comes from. That id is the "
+            "link the report uses; omit or invent it and the dossier is an "
+            "orphan.\n"
+            "- 'niche': keep the candidate's own wording recognisable even "
+            "when you refine it.\n"
+            "- 'marketplaces': a non-empty list of codes from that candidate "
+            "(e.g. [\"us\"]).\n"
+            "- 'target_reader' and 'market_gap' are the two substance checks: "
+            "specific and non-empty.\n"
+            "- 'verification_status' and 'parent_market' are owned by the "
+            "backend; the engine's verdict always overrides yours.\n"
+            "Emit one opportunity per candidate whose status is 'verified', "
+            "never for any other status."
+        )
 
     # --- evidence digest ----------------------------------------------------
     bounded_evidence = [

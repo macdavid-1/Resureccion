@@ -739,6 +739,10 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
       "the verification engine, or KDP risk screening.")
     for r in (q.get("rejection_reasons") or [])[:8]:
         li(f"{r.get('niche', '')}: {r.get('rationale', '')}")
+    if q.get("synthesis_rejections"):
+        h3("Synthesized dossiers that could not be attached")
+        for r in q["synthesis_rejections"][:8]:
+            li(f"{r.get('niche') or 'unnamed niche'}: {r.get('rationale') or '—'}")
     if q.get("remains_uncertain"):
         h3("What remains uncertain")
         for u in q["remains_uncertain"]:

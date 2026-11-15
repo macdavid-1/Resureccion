@@ -30,9 +30,14 @@ KIND_QUALITY_GATE = "quality_gate"
 KIND_KDP_RISK = "kdp_risk"
 KIND_KEYWORD_INTEGRITY = "keyword_integrity"
 KIND_REPORT_VALIDATION = "report_validation"
+# A dossier the model synthesized but the pipeline could not attach to a
+# verified candidate. Recorded so the report can ACCOUNT for an empty
+# opportunity portfolio instead of leaving the owner with a silent blank.
+KIND_SYNTHESIS = "synthesis"
 ASSESSMENT_KINDS = (
     KIND_FILTER, KIND_VERIFICATION, KIND_QUALITY_GATE,
     KIND_KDP_RISK, KIND_KEYWORD_INTEGRITY, KIND_REPORT_VALIDATION,
+    KIND_SYNTHESIS,
 )
 
 

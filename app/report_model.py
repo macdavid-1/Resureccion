@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.integrity import KIND_FILTER, KIND_VERIFICATION
+from app.integrity import KIND_FILTER, KIND_SYNTHESIS, KIND_VERIFICATION
 from app.marketplace import AMAZON_MARKETPLACES
 from app.methodology import PHASE_ORDER, PHASE_TITLES
 
@@ -1716,6 +1716,21 @@ def _quality_statement(
                 if a.outcome == "fail" and a.subject_id and a.reason:
                     rej_reasons.setdefault(str(a.subject_id), str(a.reason))
 
+    # Dossiers synthesis produced but the pipeline could not attach to a
+    # verified candidate. Recorded deterministically (see
+    # IntegrityAssessmentStore KIND_SYNTHESIS) so an empty opportunity
+    # portfolio is accounted for instead of looking like the model never wrote
+    # one. Without this line the report said "0 opportunities" and nothing else.
+    synthesis_rejections: list[dict[str, Any]] = []
+    if assessments is not None:
+        for a in assessments.list(session_id, kind=KIND_SYNTHESIS, limit=100):
+            if a.outcome != "fail":
+                continue
+            synthesis_rejections.append({
+                "niche": str((a.metrics or {}).get("niche") or ""),
+                "rationale": str(a.reason or ""),
+            })
+
     total_candidates = counts.get("total") or (
         counts.get("discovered", 0) + counts.get("rejected", 0)
         + counts.get("verifying", 0) + counts.get("verified", 0)
@@ -1738,6 +1753,7 @@ def _quality_statement(
             }
             for c in rejected[:10]
         ],
+        "synthesis_rejections": synthesis_rejections[:8],
         "focus_pivots": [
             (
                 f"Round {p.get('round') or '—'}: {int(p.get('rejected', 0) or 0)} "
@@ -2653,6 +2669,16 @@ def render_markdown(model: ReportModel) -> str:
     if q.get("rejection_reasons"):
         for r in q["rejection_reasons"][:8]:
             a(f"- {r['niche']}: {r['rationale']}")
+        a("")
+    if q.get("synthesis_rejections"):
+        a(
+            "**Synthesized dossiers that could not be attached.** These were "
+            "written by opportunity synthesis but the pipeline refused to "
+            "present them, with the reason recorded:"
+        )
+        a("")
+        for r in q["synthesis_rejections"][:8]:
+            a(f"- {r.get('niche') or 'unnamed niche'}: {r.get('rationale') or '—'}")
         a("")
     if q.get("remains_uncertain"):
         a("**What remains uncertain.**")
