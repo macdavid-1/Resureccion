@@ -942,47 +942,111 @@
 
   function splitReportSections(md) { return mdToHtml(md); }
 
-  // ---------- one-click follow-up (adjacent opportunities ledger) ----------
-  // The report's ledger lists demand the run discovered but did not fund.
-  // This button seeds the NEXT run from it through the existing keywords
-  // mode — each report funds a deeper one, no new session plumbing.
+  // ---------- follow-up run (continues the WHOLE previous session) ----------
+  // The new run inherits the previous session's complete record — report,
+  // verified and rejected candidates, measured keywords/categories,
+  // competitors, its own notes and reasoning excerpts and its operational
+  // trace — not just the keywords. The owner may add a brief and/or reference
+  // images, or add nothing at all and simply let it continue.
   async function loadFollowupButton(sid) {
-    let ledger = [];
-    try { ledger = (await api(`/api/sessions/${sid}/adjacent`)).ledger || []; }
-    catch { return; }
     const host = $("#rep-followup");
-    if (!host || !ledger.length) return;
-    host.innerHTML = `<button class="btn small primary" id="rep-followup-btn" title="${ledger.length} adjacent opportunity/ies were discovered but not researched">Start follow-up research</button>`;
-    $("#rep-followup-btn").addEventListener("click", () => startFollowup(sid, ledger));
+    if (!host) return;
+    // The button exists even with an empty adjacency ledger: continuing a run
+    // is about the run's record, not about one section of it.
+    host.innerHTML = `<button class="btn small primary" id="rep-followup-btn">Start follow-up research</button>`;
+    $("#rep-followup-btn").addEventListener("click", () => openFollowupDialog(sid));
   }
 
-  async function startFollowup(sid, ledger) {
-    const pick = ledger
-      .map((r) => String(r.niche || "").trim())
-      .filter(Boolean)
-      .slice(0, 10);
-    if (!pick.length) { toast("Nothing to seed the follow-up run with"); return; }
+  function followupFiles(input) {
+    const files = Array.from(input?.files || []);
+    return files.filter((f) => /^image\//.test(f.type)).slice(0, 4);
+  }
+
+  async function openFollowupDialog(sid) {
+    const root = $("#modal-root");
     const src = state.sessions.find((s) => s.id === sid);
-    const prompt =
-      "Follow-up research seeded from the report \"" + (src?.name || "previous session") +
-      "\". Deeply research these adjacent opportunities, and expand outward into " +
-      "related hidden gold mines with strong demand where competition has not arrived:\n" +
-      pick.map((n) => "- " + n).join("\n");
+    let digest = "its complete record";
+    let threads = [];
     try {
-      const { session } = await api("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          mode: "keywords",
-          prompt,
-          objective: "Follow-up: adjacent opportunities not yet researched",
-          marketplaces: [],
-        }),
+      const preview = await api(`/api/sessions/${sid}/continuation`);
+      if (preview?.digest) digest = preview.digest;
+      threads = preview?.open_threads || [];
+    } catch { /* the dialog still works without the preview */ }
+    root.innerHTML = `
+      <div class="modal-veil">
+        <div class="modal fu-modal">
+          <h3>Start follow-up research</h3>
+          <p>Continues <b>${esc(src?.name || "this session")}</b> with its full
+            record — ${esc(digest)}. Add instructions, attach images, or add
+            nothing and let it continue where it left off.</p>
+          ${threads.length ? `<p class="muted" style="font-size:0.78rem">Open threads it will pick up: ${esc(threads.slice(0, 6).join(" · "))}</p>` : ""}
+          <div class="field">
+            <label for="fu-prompt">New instructions <span class="muted">(optional)</span></label>
+            <textarea id="fu-prompt" rows="4" placeholder="e.g. Go deeper on the grief niche for UK readers and price the top three titles…"></textarea>
+          </div>
+          <div class="field">
+            <span class="field-label">Reference images <span class="muted">(optional)</span></span>
+            <div class="row">
+              <button type="button" id="fu-add-img" class="btn small ghost">+ Add image</button>
+              <span class="muted" style="font-size:0.76rem" id="fu-img-count"></span>
+            </div>
+            <input type="file" id="fu-images" accept="image/png,image/jpeg,image/webp,image/gif" multiple class="hidden">
+          </div>
+          <div class="row fu-actions">
+            <button class="btn ghost" data-a="cancel">Cancel</button>
+            <button class="btn ghost" data-a="bare">Continue without new instructions</button>
+            <button class="btn primary" data-a="start">Start follow-up</button>
+          </div>
+        </div>
+      </div>`;
+    const $m = (sel) => root.querySelector(sel);
+    const files = [];
+    const imgInput = $m("#fu-images");
+    $m("#fu-add-img").addEventListener("click", () => imgInput.click());
+    imgInput.addEventListener("change", () => {
+      files.splice(0, files.length, ...followupFiles(imgInput));
+      $m("#fu-img-count").textContent = files.length ? `${files.length} attached` : "";
+    });
+    const close = () => { root.innerHTML = ""; };
+    root.querySelectorAll("[data-a]").forEach((b) => b.addEventListener("click", async () => {
+      const action = b.dataset.a;
+      if (action === "cancel") { close(); return; }
+      const typed = action === "bare" ? "" : ($m("#fu-prompt").value || "").trim();
+      const imgs = action === "bare" ? [] : files;
+      root.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+      try {
+        await startFollowup(sid, { prompt: typed, images: imgs });
+        close();
+      } catch (e) {
+        toast(e.message);
+        root.querySelectorAll("button").forEach((x) => { x.disabled = false; });
+      }
+    }));
+  }
+
+  async function startFollowup(sid, { prompt = "", images = [] } = {}) {
+    const { session } = await api(`/api/sessions/${sid}/follow-up`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, has_images: images.length > 0 }),
+    });
+    for (const f of images) {
+      const fd = new FormData();
+      fd.append("file", f);
+      const up = await fetch(`/api/sessions/${session.id}/uploads`, {
+        method: "POST", headers: authHeaders(), body: fd,
       });
-      await refreshSessions();
-      await openSession(session.id, "research");
-      await sessionAction("start");
-      toast(`Follow-up research started from ${pick.length} seeded niche(s)`);
-    } catch (e) { toast(e.message); }
+      if (!up.ok) {
+        let detail = up.statusText;
+        try { detail = (await up.json()).detail ?? detail; } catch {}
+        throw new Error(`Reference image upload failed: ${detail}`);
+      }
+    }
+    await refreshSessions();
+    await openSession(session.id, "research");
+    await sessionAction("start");
+    toast(prompt || images.length
+      ? "Follow-up research started with your new input"
+      : "Follow-up research started from the previous run's record");
   }
 
   // Authenticated file download: fetch WITH the header token, then hand the

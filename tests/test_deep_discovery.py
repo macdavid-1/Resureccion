@@ -725,7 +725,8 @@ def test_report_ledger_lists_unfunded_demand():
     )
     md = render_markdown(model)
     assert "Adjacent opportunities not yet researched" in md
-    assert "One-click follow-up" in md
+    assert "Follow-up research" in md
+    assert "inherits this report" in md
     assert "grief journals for veterans" in md
     assert "Headroom ranking" in md
     assert "0.78" in md

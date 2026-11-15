@@ -90,6 +90,21 @@ class ActivityTrace:
             ).fetchall()
         return [self._row(r) for r in rows]
 
+    def tail(self, session_id: str, *, limit: int = 40) -> list[TraceEntry]:
+        """The NEWEST entries, oldest-first.
+
+        `recent()` starts at the beginning of the session, which is right for a
+        live feed and wrong for "what did this run actually do by the end" —
+        a long run would only ever show its first few hours.
+        """
+        limit = max(1, min(limit, 400))
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM activity_trace WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [self._row(r) for r in reversed(rows)]
+
     def count(self, session_id: str) -> int:
         with self.db.read() as conn:
             row = conn.execute(

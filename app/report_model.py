@@ -2563,10 +2563,12 @@ def render_markdown(model: ReportModel) -> str:
         )
         a("")
         a(
-            "**One-click follow-up:** open this session in the dashboard and "
-            "press *Start follow-up research* — it seeds a new run with these "
-            "niches through the existing keywords mode, so each report funds "
-            "the next, deeper one."
+            "**Follow-up research:** open this session in the dashboard and "
+            "press *Start follow-up research* — the next run inherits this "
+            "report's whole record (verified and rejected candidates, measured "
+            "keywords and categories, its notes and trace, and these unfunded "
+            "threads), plus any new brief or images you attach. Leave both "
+            "empty and it simply continues from where this run stopped."
         )
         a("")
         a("| Niche | Origin | Status | Headroom | Evidence ids |")

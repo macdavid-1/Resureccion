@@ -67,6 +67,8 @@ class Session:
     elapsed_seconds: float
     error: str | None
     resume_count: int
+    # The session this run continues (a follow-up). None for a first run.
+    parent_session_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +87,7 @@ class Session:
             "elapsed_seconds": self.elapsed_seconds,
             "error": self.error,
             "resume_count": self.resume_count,
+            "parent_session_id": self.parent_session_id,
         }
 
 
@@ -111,6 +114,11 @@ class SessionError(Exception):
     pass
 
 
+def _row_optional(row: sqlite3.Row, column: str):
+    """A column that an older database may not have until it migrates."""
+    return row[column] if column in set(row.keys()) else None
+
+
 class SessionStore:
     def __init__(self, db: Database, config: Config) -> None:
         self.db = db
@@ -126,6 +134,7 @@ class SessionStore:
         marketplaces: list[str] | None = None,
         has_images: bool = False,
         name: str | None = None,
+        parent_session_id: str | None = None,
     ) -> Session:
         if mode not in (MODE_PROMPT, MODE_KEYWORDS, MODE_AUTO):
             raise SessionError(f"invalid mode {mode!r}")
@@ -151,8 +160,9 @@ class SessionStore:
                 """
                 INSERT INTO research_sessions
                     (id, name, status, mode, prompt, objective, marketplaces,
-                     phase, progress, created_at, updated_at, last_activity_at)
-                VALUES (?, ?, 'draft', ?, ?, ?, ?, 'initializing', 0.0, ?, ?, ?)
+                     phase, progress, created_at, updated_at, last_activity_at,
+                     parent_session_id)
+                VALUES (?, ?, 'draft', ?, ?, ?, ?, 'initializing', 0.0, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -164,6 +174,7 @@ class SessionStore:
                     now,
                     now,
                     now,
+                    parent_session_id,
                 ),
             )
         return self.get(session_id)  # type: ignore[return-value]
@@ -361,6 +372,7 @@ class SessionStore:
             elapsed_seconds=row["elapsed_seconds"],
             error=row["error"],
             resume_count=row["resume_count"],
+            parent_session_id=_row_optional(row, "parent_session_id"),
         )
 
 

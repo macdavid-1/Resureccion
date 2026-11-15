@@ -19,7 +19,7 @@ from pathlib import Path
 
 from app.config import Config, get_config
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS research_sessions (
     last_activity_at TEXT NOT NULL,
     elapsed_seconds REAL NOT NULL DEFAULT 0.0,
     error TEXT,
-    resume_count INTEGER NOT NULL DEFAULT 0
+    resume_count INTEGER NOT NULL DEFAULT 0,
+    parent_session_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS research_jobs (
@@ -521,6 +522,11 @@ class Database:
                 conn.execute("ALTER TABLE export_jobs ADD COLUMN started_at TEXT")
             if cols and "finished_at" not in cols:
                 conn.execute("ALTER TABLE export_jobs ADD COLUMN finished_at TEXT")
+            # v7->v8: follow-up runs record the session they continue, so the
+            # dashboard can show the lineage and the brief stays auditable.
+            scols = {r["name"] for r in conn.execute("PRAGMA table_info(research_sessions)").fetchall()}
+            if scols and "parent_session_id" not in scols:
+                conn.execute("ALTER TABLE research_sessions ADD COLUMN parent_session_id TEXT")
             conn.executescript(_SCHEMA)
             # v4->v5: prune old live-view frames for databases created earlier.
             # (New databases get the table fresh; nothing to migrate.)

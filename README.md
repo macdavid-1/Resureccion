@@ -375,6 +375,17 @@ filter, a gate or a verification verdict:
   (`AMAZON_DELIVERY_ZIP`, default 10001) through Amazon's own "Deliver to"
   dialog — no extra service, no login. The header must confirm the zip; an
   unconfirmed pin is reported in the browser status instead of assumed.
+- **Follow-up research continues the whole run** (`app/continuation.py`,
+  `app/continuation_build.py`) — "Start follow-up research" no longer seeds a
+  new session with a keyword list. It builds the previous run's complete
+  record out of the durable stores (its report, verified and rejected
+  candidates with reasons, measured backend keywords, both category maps,
+  competitors, buyer quotes, its own notes and reasoning excerpts, its
+  operational trace, its limitations and the adjacency it never funded) and
+  makes that the new session's brief, then links the two sessions
+  (`parent_session_id`). The owner can add a brief, attach reference images, or
+  add nothing at all — an empty follow-up simply continues from the recorded
+  open threads, and is told not to re-measure what already exists.
 - **Finalist deep dive** (`app/final_dive.py`) — once the methodology has
   chosen the candidates that will reach the report, each one gets **screened,
   then verified** backend keywords plus its category map for **both** stores

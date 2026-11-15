@@ -220,7 +220,14 @@ def build_user_prompt(
     }
     if images_note:
         brief["reference_images"] = images_note
-    parts.append("SESSION BRIEF: " + _compact({k: v for k, v in brief.items() if v}))
+    # The owner brief can be large on purpose: a follow-up run's brief is the
+    # previous run's whole record (report, candidates, measurements, notes,
+    # trace). The generic 2400-char digest cap would cut most of it away, so
+    # this one section gets the room it needs.
+    parts.append(
+        "SESSION BRIEF: "
+        + _compact({k: v for k, v in brief.items() if v}, limit=16_000)
+    )
 
     # --- niche target (deterministic; what the run owes the owner) ----------
     # Empty when the owner stated no target — nothing is invented here.

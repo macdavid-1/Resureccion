@@ -612,6 +612,13 @@ details.sect > .sect-body { padding: 2px 14px 14px; border-top: 1px solid var(--
 .modal .row { display: flex; gap: 8px; }
 .modal .btn { flex: 1; }
 
+/* follow-up dialog: a form, not a yes/no box */
+.modal.fu-modal { width: min(600px, 100%); max-height: 90vh; overflow-y: auto; }
+.fu-modal .field { margin-bottom: 14px; }
+.fu-modal textarea { width: 100%; min-height: 92px; font-size: 0.86rem; }
+.fu-modal .fu-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.fu-modal .fu-actions .btn { flex: 1 1 150px; white-space: normal; }
+
 /* long content on narrow screens: break, never overflow */
 .report-body, .trace-x, .cand .n, .opp h3, .opp .niche, .kv dd, .rep-title {
   overflow-wrap: break-word;

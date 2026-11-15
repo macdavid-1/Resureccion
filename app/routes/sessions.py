@@ -1,9 +1,12 @@
 """Research session routes — the primary owner-facing API."""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.research_data import ResearchNoteStore
 from app.routes.deps import require_owner_sync
 from app.security import AuthError
 
@@ -285,6 +288,159 @@ async def list_opportunities(session_id: str, request: Request) -> dict:
     return {"opportunities": [o.to_dict() for o in opps]}
 
 
+class FollowUpRequest(BaseModel):
+    """Everything the owner may (but need not) add to a continuation run.
+
+    All three inputs are optional on purpose: "continue where it left off" is a
+    valid request with no new instructions at all. Images are uploaded through
+    the ordinary uploads endpoint right after creation (as a new session does).
+    """
+
+    prompt: str = Field(default="", max_length=8000, description="New instructions (optional)")
+    objective: str = Field(default="", max_length=2000)
+    marketplaces: list[str] = Field(default_factory=list)
+    has_images: bool = False
+
+
+def _adjacent_rows(st: Any, session_id: str) -> list[dict]:
+    for rep in st.reports.list(session_id):
+        try:
+            model = st.reports.read_model_json(rep)
+        except Exception:
+            model = None
+        if isinstance(model, dict) and model.get("adjacent_ledger"):
+            return [r for r in model["adjacent_ledger"] if isinstance(r, dict)][:60]
+    return []
+
+
+@router.get("/{session_id}/continuation")
+async def continuation_preview(session_id: str, request: Request) -> dict:
+    """What the follow-up dialog will carry over (so the owner sees the scope)."""
+    _auth(request)
+    st = request.app.state
+    if st.sessions.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    from app.continuation_build import (
+        brief_digest,
+        build_continuation_brief,
+        load_adjacent_rows,
+    )
+
+    try:
+        brief = build_continuation_brief(
+            session_id,
+            sessions=st.sessions,
+            candidates=st.candidates,
+            opportunities=st.opportunities,
+            verifications=st.verifications,
+            notes=ResearchNoteStore(st.db),
+            browser_evidence=st.browser_evidence,
+            reports=st.reports,
+            trace=st.trace,
+            thoughts=st.thoughts,
+            adjacent_rows=load_adjacent_rows(st.reports, session_id),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"digest": brief_digest(brief), "counts": brief.to_dict()["counts"],
+            "open_threads": brief.open_threads[:20],
+            "marketplaces": brief.marketplaces}
+
+
+@router.post("/{session_id}/follow-up")
+async def start_follow_up(
+    session_id: str, body: FollowUpRequest, request: Request
+) -> dict:
+    """Create the next run FROM this one: full context, optional new input.
+
+    The new session's brief is the parent's whole record (report, verified and
+    rejected candidates, measured keywords/categories/competitors, its notes,
+    reasoning excerpts and operational trace, plus the unfunded adjacency),
+    followed by the owner's new instructions when they gave any. No
+    instructions is a valid request: the run continues from the open threads.
+    """
+    _auth(request)
+    st = request.app.state
+    parent = st.sessions.get(session_id)
+    if parent is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    from app.continuation_build import (
+        brief_digest,
+        build_continuation_brief,
+        load_adjacent_rows,
+    )
+
+    try:
+        brief = build_continuation_brief(
+            session_id,
+            sessions=st.sessions,
+            candidates=st.candidates,
+            opportunities=st.opportunities,
+            verifications=st.verifications,
+            notes=ResearchNoteStore(st.db),
+            browser_evidence=st.browser_evidence,
+            reports=st.reports,
+            trace=st.trace,
+            thoughts=st.thoughts,
+            adjacent_rows=load_adjacent_rows(st.reports, session_id),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    instructions = (body.prompt or "").strip()
+    prompt = brief.render(instructions)
+    objective = (body.objective or "").strip() or (
+        f"Continuation of {parent.name}"
+        + (f": {parent.objective}" if parent.objective else "")
+    )
+    marketplaces = list(body.marketplaces or parent.marketplaces or [])
+    # A continuation is always a `prompt` run: the record IS its brief, and
+    # `auto` forbids prompt text while `keywords` would misdescribe it.
+    try:
+        session = st.sessions.create(
+            mode="prompt",
+            prompt=prompt,
+            objective=objective,
+            marketplaces=marketplaces,
+            has_images=bool(body.has_images),
+            name=f"Follow-up — {parent.name}"[:120],
+            parent_session_id=session_id,
+        )
+        st.agent.initialize(session.id)
+        st.browser.ensure(session.id)
+        st.checkpoints.save(
+            session.id, "continuation:parent",
+            {
+                "parent_session_id": session_id,
+                "instructions": instructions,
+                "record": brief.to_dict(),
+            },
+        )
+        st.trace.record(
+            session.id, "owner",
+            f"Continuing the research from “{parent.name}” with its full record "
+            f"({brief_digest(brief)})",
+        )
+        st.events.append(
+            session.id, level="info", actor="owner", action="follow_up_started",
+            detail={
+                "parent_session_id": session_id,
+                "with_instructions": bool(instructions),
+                "with_images": bool(body.has_images),
+                "carried": brief_digest(brief),
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    data = session.to_dict()
+    agent = st.agent.get(session.id)
+    data["agent"] = agent.to_dict() if agent else None
+    browser = st.browser.get(session.id)
+    data["browser"] = browser.to_dict() if browser else None
+    return {"session": data, "digest": brief_digest(brief)}
+
+
 @router.get("/{session_id}/adjacent")
 async def adjacent_ledger(session_id: str, request: Request) -> dict:
     """The report's "adjacent opportunities not yet researched" ledger.
@@ -298,18 +454,9 @@ async def adjacent_ledger(session_id: str, request: Request) -> dict:
     st = request.app.state
     if st.sessions.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
-    rows: list[dict] = []
-    source_report = None
-    for rep in st.reports.list(session_id):
-        try:
-            model = st.reports.read_model_json(rep)
-        except Exception:
-            model = None
-        if isinstance(model, dict) and model.get("adjacent_ledger"):
-            rows = [r for r in model["adjacent_ledger"] if isinstance(r, dict)]
-            source_report = rep.id
-            break
-    return {"ledger": rows[:60], "report_id": source_report}
+    rows = _adjacent_rows(st, session_id)
+    latest = st.reports.latest(session_id)
+    return {"ledger": rows, "report_id": latest.id if latest else None}
 
 
 @router.get("/{session_id}/verifications")
