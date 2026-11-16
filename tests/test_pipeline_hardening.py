@@ -465,7 +465,8 @@ async def test_unattachable_dossier_is_accounted_for_in_the_report(db, config, s
     script["opportunity_synthesis"][0]["opportunities"][0]["niche"] = (
         "quantum knitting patterns for orbiting astronauts"
     )
-    runner = make_runner(db, config, ScriptedModel(script))
+    scripted = ScriptedModel(script)
+    runner = make_runner(db, config, scripted)
     await runner.run(session)
 
     s = SessionStore(db, config).require(session)
@@ -474,7 +475,12 @@ async def test_unattachable_dossier_is_accounted_for_in_the_report(db, config, s
     _, body, model = _final_report(db, config, session)
     q = (model or {}).get("quality_statement") or {}
     assert q.get("synthesis_rejections"), "the drop was not accounted for"
-    assert "could not be attached" in body
+    # The account must reach the report WRITER: that is the guarantee now
+    # that the model authors the document.
+    rationale = q["synthesis_rejections"][0]["rationale"]
+    assert scripted.report_prompts, "no report-writing call was made"
+    assert any(rationale[:60] in p for p in scripted.report_prompts)
+    assert body.strip()
 
 
 @pytest.mark.asyncio
@@ -532,6 +538,9 @@ async def test_render_failure_still_delivers_a_report(db, config, session, monke
         raise RuntimeError("injected render defect")
 
     monkeypatch.setattr(report_model, "render_markdown", boom)
+    # The generated layout only runs when the model's report call is off or
+    # fails; this test is about that renderer degrading instead of dying.
+    config.report_ai_enabled = False
     runner = make_runner(db, config, ScriptedModel(_script()))
     await runner.run(session)
 
@@ -601,6 +610,8 @@ async def test_a_note_only_figure_never_becomes_analyst_prose(db, config, sessio
     """Notes are memory, not measurements: their numbers are not grounded."""
     from app.sessions import SessionStore
 
+    # Analyst-prose grounding is a property of the fallback renderer.
+    config.report_ai_enabled = False
     runner = make_runner(db, config, NarrativeModel(_script()))
     await runner.run(session)
 

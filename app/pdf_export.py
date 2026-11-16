@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -142,6 +143,7 @@ def _resolve_figures(
     artifacts: ArtifactStore,
     *,
     limit: int = MAX_REPORT_FIGURES,
+    extra: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Resolve the report's evidence screenshots to embeddable file paths.
 
@@ -155,7 +157,9 @@ def _resolve_figures(
     an export.
     """
     appendix = model.get("evidence_appendix") or []
-    if not isinstance(appendix, list) or not appendix:
+    if not isinstance(appendix, list):
+        appendix = []
+    if not appendix and not extra:
         return []
     try:
         root = artifacts.config.artifacts_dir.resolve()
@@ -198,7 +202,179 @@ def _resolve_figures(
             "path": str(resolved),
             "caption": caption or "Research capture",
         })
+
+    # Screenshots the REPORT selected (the model's own picks) are resolved the
+    # same way. They may not be in the evidence appendix at all: the report
+    # chose them because they prove a specific claim, and the figure carries
+    # that claim as its caption.
+    for artifact_id, caption in (extra or {}).items():
+        if len(figures) >= limit:
+            break
+        if not artifact_id or artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        try:
+            art = artifacts.get(session_id, artifact_id)
+        except Exception:
+            continue
+        if art is None or not art.path:
+            continue
+        path = Path(art.path)
+        if path.suffix.lower() not in _FIGURE_SUFFIXES:
+            continue
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root)
+        except Exception:
+            continue
+        if not resolved.is_file():
+            continue
+        figures.append({
+            "artifact_id": artifact_id,
+            "path": str(resolved),
+            "caption": str(caption or "Research capture")[:220],
+        })
     return figures
+
+
+_AI_IMAGE_RE = re.compile(
+    r"!\[([^\]]*)\]\(\s*(?:[^)]*?/artifacts/)([A-Za-z0-9_\-]+)/file\s*\)"
+)
+_AI_HEADING_RE = re.compile(r"^(#{1,4})\s+(.*)$")
+_AI_BULLET_RE = re.compile(r"^[-*]\s+(.*)$")
+_AI_ORDERED_RE = re.compile(r"^\d+[.)]\s+(.*)$")
+_AI_QUOTE_RE = re.compile(r"^>\s?(.*)$")
+_AI_TABLE_SEP_RE = re.compile(r"^\|[\s:|-]+\|$")
+
+
+def ai_figure_artifacts(model: dict[str, Any]) -> dict[str, str]:
+    """Screenshots the model embedded in its report: artifact id -> caption."""
+    ai = model.get("ai_report") if isinstance(model.get("ai_report"), dict) else None
+    if not ai:
+        return {}
+    out: dict[str, str] = {}
+    for m in _AI_IMAGE_RE.finditer(str(ai.get("markdown") or "")):
+        artifact_id = m.group(2)
+        if artifact_id not in out:
+            out[artifact_id] = " ".join((m.group(1) or "").split())[:220]
+    return out
+
+
+def ai_markdown_to_blocks(
+    report: dict[str, Any], model: dict[str, Any]
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """The model-authored report, shaped into the PDF renderer's blocks.
+
+    Text is transferred verbatim (the renderer only strips markdown emphasis).
+    Evidence citations become short `[ev:ID]` markers — a printed page cannot
+    be clicked — and the screenshots the model selected are placed inline,
+    with the caption the model wrote for the claim they prove.
+    """
+    s = model.get("session") or {}
+    title = str(report.get("title") or "Market Intelligence Report")
+    subtitle = str(s.get("name") or "")
+    paths = {
+        f.get("artifact_id"): f.get("path")
+        for f in (model.get("figures") or [])
+        if isinstance(f, dict)
+    }
+    blocks: list[dict[str, Any]] = []
+    table: list[str] = []
+    paragraph: list[str] = []
+    figures = 0
+
+    def flush_table() -> None:
+        nonlocal table
+        if not table:
+            return
+        rows = [r for r in table if not _AI_TABLE_SEP_RE.match(r.strip())]
+        table = []
+        cells = [
+            [c.strip() for c in r.strip().strip("|").split("|")]
+            for r in rows
+        ]
+        if len(cells) >= 1:
+            blocks.append({"t": "table", "head": cells[0], "rows": cells[1:]})
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph
+        text = " ".join(x.strip() for x in paragraph).strip()
+        paragraph = []
+        if text:
+            blocks.append({"t": "p", "x": text})
+
+    def flush_all() -> None:
+        flush_paragraph()
+        flush_table()
+
+    for raw in str(report.get("markdown") or "").split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            flush_paragraph()
+            table.append(stripped)
+            continue
+        flush_table()
+        if not stripped:
+            flush_paragraph()
+            continue
+        heading = _AI_HEADING_RE.match(stripped)
+        if heading:
+            flush_paragraph()
+            text = heading.group(2).strip()
+            blocks.append({"t": "h2" if len(heading.group(1)) <= 2 else "h3", "x": text})
+            continue
+        if re.fullmatch(r"-{3,}", stripped):
+            flush_paragraph()
+            blocks.append({"t": "hr"})
+            continue
+        image = _AI_IMAGE_RE.fullmatch(stripped)
+        if image:
+            flush_paragraph()
+            path = paths.get(image.group(2))
+            if path and figures < MAX_REPORT_FIGURES:
+                figures += 1
+                blocks.append({
+                    "t": "img", "path": path,
+                    "caption": " ".join((image.group(1) or "").split())[:220],
+                })
+            continue
+        bullet = _AI_BULLET_RE.match(stripped)
+        if bullet:
+            flush_paragraph()
+            blocks.append({"t": "li", "x": bullet.group(1).strip()})
+            continue
+        ordered = _AI_ORDERED_RE.match(stripped)
+        if ordered:
+            flush_paragraph()
+            blocks.append({"t": "oli", "x": ordered.group(1).strip()})
+            continue
+        quote = _AI_QUOTE_RE.match(stripped)
+        if quote:
+            flush_paragraph()
+            blocks.append({"t": "quote", "x": quote.group(1).strip()})
+            continue
+        paragraph.append(stripped)
+    flush_all()
+
+    # Citations: keep the id, drop the URL (no clicking on paper), drop any
+    # stray inline image markdown the model placed mid-sentence.
+    for b in blocks:
+        if isinstance(b.get("x"), str):
+            b["x"] = re.sub(r"\[(ev:[^\]]+)\]\([^)]*\)", r"[\1]", b["x"])
+            b["x"] = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", b["x"]).strip()
+    blocks = [b for b in blocks if b.get("t") == "hr" or str(b.get("x", "")).strip() or b.get("t") in ("img", "table")]
+
+    # The audit stamp travels with the printed report: a provisional report
+    # says so and names the gates that did not pass.
+    validation = model.get("validation") or {}
+    if validation.get("mode"):
+        status = "FINAL" if validation.get("passed") else "PROVISIONAL"
+        blocks.append({"t": "hr"})
+        blocks.append({"t": "chip", "x": f"Report status: {status}"})
+        for failure in (validation.get("failures") or [])[:5]:
+            blocks.append({"t": "p", "x": f"— {failure}"})
+    return title, subtitle, blocks
 
 
 # --------------------------------------------------------------------- blocks
@@ -219,6 +395,9 @@ def model_to_blocks(model: dict[str, Any]) -> tuple[str, str, list[dict[str, Any
     Returns (title, subtitle, blocks). Content is transferred verbatim from
     the model into blocks — string values are never altered.
     """
+    ai = model.get("ai_report") if isinstance(model.get("ai_report"), dict) else None
+    if ai and str(ai.get("markdown") or "").strip():
+        return ai_markdown_to_blocks(ai, model)
     ex = model.get("executive_summary", {}) or {}
     s = model.get("session", {}) or {}
     name = str(s.get("name") or "Market Intelligence Report")
@@ -1001,7 +1180,12 @@ def export_pdf(
         )
     # Resolve the report's evidence screenshots to real files BEFORE shaping
     # blocks, so the sidecar receives plain paths and never touches the DB.
-    model = {**model, "figures": _resolve_figures(session_id, model, artifacts)}
+    model = {
+        **model,
+        "figures": _resolve_figures(
+            session_id, model, artifacts, extra=ai_figure_artifacts(model)
+        ),
+    }
     title, subtitle, blocks = model_to_blocks(model)
     out_dir = artifacts.session_dir(session_id)
     out_dir.mkdir(parents=True, exist_ok=True)

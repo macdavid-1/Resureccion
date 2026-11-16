@@ -72,6 +72,48 @@ async def test_successful_call_returns_parsed_json():
 
 
 @pytest.mark.asyncio
+async def test_text_mode_returns_markdown_verbatim_and_asks_for_no_json():
+    """The report is prose: no response_format, no JSON parsing, raw text back."""
+    cfg = _config()
+    seen: dict = {}
+    markdown = "# A finding\n\nThe niche is thin — 1,204 results."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": markdown}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 900},
+        })
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    reply = await client.call(
+        "s1", system="sys", user="usr", text_mode=True, max_tokens=4000,
+        expect_fields=("never", "checked"),
+    )
+    assert "response_format" not in seen["body"]
+    assert seen["body"]["max_tokens"] == 4000
+    assert reply.raw == markdown
+    assert reply.content == {}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_text_mode_empty_reply_is_an_error_not_an_empty_report():
+    cfg = _config()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "   "}}],
+            "usage": {},
+        })
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    with pytest.raises(ModelError):
+        await client.call("s1", system="sys", user="usr", text_mode=True)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_missing_expected_fields_raises_contract_error_no_retry():
     cfg = _config()
     calls = {"n": 0}

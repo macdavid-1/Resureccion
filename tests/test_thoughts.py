@@ -227,7 +227,11 @@ class TestRunnerWiring:
                 # client; this double only plays research-phase calls.
                 from app.finalist_playbook import PLAYBOOK_PROMPT_PREFIX
 
-                if user.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX)):
+                if user.startswith((
+                    "SESSION DATA (verified",
+                    PLAYBOOK_PROMPT_PREFIX,
+                    "RESEARCH DOSSIER",  # report writing, not a research phase
+                )):
                     return await super().call(session_id, system=system, user=user, **k)
                 self.labels.append(k.get("label"))
                 tid = self.thoughts.begin(session_id, label=k.get("label") or "Thinking")

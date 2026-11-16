@@ -63,6 +63,9 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 | `MODEL_VISION_ENABLED` | no | `true` | Attach latest browser screenshot to each iteration |
 | `MODEL_VISION_MAX_BYTES` | no | `400000` | Screenshot size guard for vision input |
 | `MODEL_STREAM` | no | `true` | Stream the model response so the owner watches the chain of thought grow live (session → *Chain of thought*). Purely an enhancement: any endpoint that rejects or ignores `stream` falls back to a plain request automatically, and `false` forces that plain request |
+| `REPORT_AI` | no | `true` | The final report is written by the model from the run's complete record (prompt, phases, reasoning, captures, competitor metadata, rejections, screenshots). `false` uses the generated fallback layout for every report |
+| `REPORT_MAX_TOKENS` | no | `16000` | Completion budget for the report-writing call (min 2000). The report is markdown, not JSON, so it gets its own allowance |
+| `REPORT_CONTEXT_CHARS` | no | `600000` | Prompt budget for the research dossier. Older captures and journey detail are condensed to fit; nothing measured is altered and the condensation is recorded for the model |
 
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw
@@ -71,6 +74,12 @@ HTML, cookies, or credentials.
 Chain-of-thought text is written in exactly one place: the session's
 `thoughts` rows, visible only to the signed-in owner in the app. It never
 enters events, evidence, recordings, exports or reports.
+
+The **report writer** (`app/report_writer.py`) receives those reasoning
+excerpts as interpretation context only — the prompt states they are not
+evidence, they are never quoted, and any figure that appears only in reasoning
+or research notes is removed from the report by the same grounding pass that
+removes invented figures.
 
 ## Container runtime (Docker / docker-compose)
 

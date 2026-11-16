@@ -4424,6 +4424,144 @@ class ResearchRunner:
             research_notes_total=total,
         )
 
+    async def _write_ai_report(
+        self, session_id: str, model: Any, phase_outputs: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The report, written BY THE MODEL from the whole research record.
+
+        One raw-text call over the complete dossier (app.report_writer), with a
+        single corrective retry when the draft quotes figures that were never
+        measured or selects screenshots that were never captured. Returns None
+        on any failure so the caller renders the deterministic report instead —
+        the owner always gets a deliverable.
+        """
+        if not getattr(self.config, "report_ai_enabled", True):
+            return None
+        from app.report_writer import (
+            REPORT_SYSTEM,
+            allowed_for,
+            build_report_context,
+            correction_prompt,
+            normalize_report,
+            screenshot_map,
+            user_prompt,
+        )
+        from app.research_data import VerificationStore
+
+        try:
+            ctx = build_report_context(
+                session_id,
+                sessions=self.sessions,
+                candidates=self.candidates,
+                opportunities=self.opportunities,
+                verifications=VerificationStore(self.db),
+                claims=self.claims,
+                browser_evidence=self.browser_evidence,
+                observations=self.observations,
+                notes=self.notes,
+                thoughts=self.thoughts,
+                trace=self.trace,
+                owner_messages=self.owner_messages,
+                artifacts=self.artifacts,
+                model=model.to_dict() if hasattr(model, "to_dict") else {},
+                phase_outputs=phase_outputs,
+                backlog=self._backlog_items(session_id),
+                context_chars=int(
+                    getattr(self.config, "report_context_chars", 600_000) or 600_000
+                ),
+            )
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="report_context", severity="warning",
+                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+            )
+            return None
+
+        allowed = allowed_for(ctx)
+        shots = screenshot_map(ctx)
+        evidence_index = ctx.get("evidence_index") or {}
+        prompt = user_prompt(ctx)
+        prompt_chars = len(prompt)
+        report = None
+        for attempt in (1, 2):
+            try:
+                reply = await self.model.call(
+                    session_id,
+                    system=REPORT_SYSTEM,
+                    user=prompt,
+                    label="Writing the final market report",
+                    max_tokens=int(getattr(self.config, "report_max_tokens", 16_000)),
+                    text_mode=True,
+                )
+            except _Cancelled:
+                raise
+            except Exception as exc:
+                self.errors.record(
+                    session_id, scope="report_writer", severity="warning",
+                    message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
+                )
+                self.events.append(
+                    session_id, level="warn", actor="agent",
+                    action="report_writer_failed",
+                    detail={"attempt": attempt,
+                            "error": f"{type(exc).__name__}: {exc}"[:300]},
+                )
+                break
+            self._record_model_usage(session_id, reply)
+            draft = normalize_report(
+                str(getattr(reply, "raw", "") or ""),
+                session_id=session_id,
+                allowed=allowed,
+                screenshots=shots,
+                evidence_index=evidence_index,
+            )
+            report = draft
+            if draft is not None and not (draft.removed_numbers or draft.removed_figures):
+                break
+            if attempt == 1:
+                prompt = correction_prompt(
+                    ctx,
+                    draft.removed_numbers if draft else [],
+                    draft.removed_figures if draft else [],
+                )
+        if report is None:
+            self.events.append(
+                session_id, level="warn", actor="agent", action="report_writer_unusable",
+                detail={"note": "the model's report was empty or could not be "
+                                 "grounded; delivering the deterministic report"},
+            )
+            return None
+
+        payload = report.to_dict()
+        payload.update({
+            "generator": "report_writer.v1",
+            "model": str(getattr(self.model, "model_name", "") or ""),
+            "context_chars": prompt_chars,
+            "evidence_records": len(ctx.get("evidence") or []),
+            "screenshots_available": len(shots),
+            "context_notes": list(ctx.get("context_notes") or []),
+        })
+        self.events.append(
+            session_id, level="info", actor="agent", action="report_written_by_model",
+            detail={
+                "words": report.words,
+                "screenshots": len(report.figures),
+                "citations": len(report.evidence_ids),
+                "unknown_figures_removed": len(report.removed_numbers),
+                "unknown_screenshots_dropped": len(report.removed_figures),
+                "unknown_citations_dropped": len(report.removed_evidence),
+                "evidence_records": len(ctx.get("evidence") or []),
+                "context_chars": prompt_chars,
+            },
+        )
+        self.trace.record(
+            session_id, KIND_REPORT,
+            f"Wrote the final report from the full research record "
+            f"({report.words} words, {len(report.figures)} screenshots, "
+            f"{len(report.evidence_ids)} evidence citations)",
+        )
+        return payload
+
     async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
         from app.report_model import build_report_model, render_markdown
         from app.report_validation import ReportValidator
@@ -4497,7 +4635,20 @@ class ResearchRunner:
                 detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
             )
             model = self._minimal_report_model(session_id, run_notes)
+        ai_report: dict[str, Any] | None = None
         if build_error is None:
+            # The model writes the report itself, from everything the run
+            # gathered. The deterministic model above is its dossier and, if
+            # the call fails, the fallback below.
+            ai_report = await self._write_ai_report(session_id, model, phase_outputs)
+        if ai_report:
+            model.ai_report = ai_report
+            body, render_error = str(ai_report.get("markdown") or ""), None
+        else:
+            # Fallback path: the model still supplies the analyst prose and the
+            # per-candidate playbooks so the deterministic report is analytical
+            # rather than a bare table dump.
+            #
             # Analyst prose: the model interprets the verified records above;
             # it never computes a figure. Empty on any failure — the report
             # renders deterministically without it.
@@ -4524,7 +4675,7 @@ class ResearchRunner:
                 )
             if playbooks:
                 model.finalist_playbooks = playbooks
-        body, render_error = self._render_report_body(session_id, model, build_error)
+            body, render_error = self._render_report_body(session_id, model, build_error)
 
         # Adversarial validation of the deliverable: gates + per-opportunity
         # chain-of-custody checks. A failing report is delivered as
@@ -4566,13 +4717,20 @@ class ResearchRunner:
         rep = store.save(
             session_id,
             kind="final",
-            title="Resurrección Market Intelligence Report",
+            title=str((ai_report or {}).get("title") or "Resurrección Market Intelligence Report")[:160],
             body_markdown=body,
             meta={
                 "generated_by": "research_runner",
-                "generator": "report_model.v2",
+                "generator": "report_writer.v1" if ai_report else "report_model.v2",
+                "authored_by": "model" if ai_report else "deterministic_fallback",
                 "validation": validation.to_dict(),
                 "mode": validation.mode,
+                "figures": list((ai_report or {}).get("figures") or []),
+                "evidence_ids": list((ai_report or {}).get("evidence_ids") or []),
+                "words": int((ai_report or {}).get("words") or 0),
+                "dropped_unknown_figures": list(
+                    (ai_report or {}).get("removed_numbers") or []
+                ),
             },
         )
         # Persist the structured model: PDF export and re-rendering both read

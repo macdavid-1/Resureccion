@@ -374,10 +374,31 @@ async def _extract_product(page: Any) -> dict[str, Any]:
         "best_seller_rank": None,
         "category_path": [],
     }
+    # Publication data, formats and every BSR the page prints. The report
+    # reasons about market entry recency and format/price positioning, so these
+    # observations are captured as data instead of being left in prose the
+    # report stage can never see.
+    detail_text = (
+        await _text_of(
+            page,
+            "#detailBullets_feature_div, #productDetails_detailBullets_sections1, "
+            "#productDetails_feature_div, #SalesRank",
+        )
+    ) or ""
+    data.update(parse_product_details(detail_text))
+    data["formats"] = parse_format_prices(
+        (await _text_of(page, "#tmmSwatches, #formats, #mediaTabs_tabSet")) or ""
+    )
+    # Reviews already rendered on the page: the strongest evidence of what
+    # readers like and dislike about the incumbents.
+    try:
+        data["reviews"] = await _extract_review_snippets(page, max_items=4)
+    except Exception:
+        data["reviews"] = []
     # BSR: look in product details sections.
-    bsr_text = (await _text_of(page, "#productDetails_detailBullets_sections1, #detailBullets_feature_div, #SalesRank")) or ""
+    bsr_text = detail_text
     m = re.search(r"#?\s?([\d,]+)\s+in\s+([^\n(]+)", bsr_text)
-    if m:
+    if m and data.get("best_seller_rank") is None:
         data["best_seller_rank"] = _parse_int(m.group(1))
         data["best_seller_category"] = m.group(2).strip()[:120]
     # Category breadcrumbs.
@@ -392,6 +413,143 @@ async def _extract_product(page: Any) -> dict[str, Any]:
         pass
     data["category_path"] = crumbs
     return {k: v for k, v in data.items() if v not in (None, "", [])}
+
+
+# --------------------------------------------------- product detail parsing
+# Amazon renders product details two ways: alternated label/value bullets and
+# a table of rows. Both reduce to "label: value" lines, so one pure parser
+# covers them (and is unit-testable without a browser).
+_DETAIL_LABELS = (
+    "publisher", "publication date", "language", "print length", "pages",
+    "paperback", "hardcover", "board book", "mass market paperback",
+    "spiral-bound", "loose leaf", "pamphlet", "isbn-10", "isbn-13",
+    "item weight", "dimensions", "best sellers rank", "reading age",
+    "lexile measure", "audio", "edition",
+)
+_MONTHS = (
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+)
+_DATE_IN_PARENS_RE = re.compile(
+    r"\(\s*((?:" + "|".join(_MONTHS) + r")\s+\d{1,2},\s+\d{4})\s*\)"
+)
+_DATE_RE = re.compile(
+    r"((?:" + "|".join(_MONTHS) + r")\s+\d{1,2},\s+\d{4})"
+)
+_RANK_RE = re.compile(r"#\s?([\d,]+)\s+in\s+([^#\n]+)")
+_FORMAT_WORDS = (
+    "Kindle Edition", "Kindle", "Paperback", "Hardcover", "Audible Audiobook",
+    "Audiobook", "Board book", "Mass Market Paperback", "Spiral-bound",
+    "Loose Leaf", "Pamphlet",
+)
+
+
+def _clean_detail_lines(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in str(text or "").replace("\u200b", "\n").replace("\u00a0", " ").splitlines():
+        line = " ".join(raw.split()).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def parse_product_details(text: str) -> dict[str, Any]:
+    """Publication date, format/page count, publisher and every BSR printed.
+
+    Pure function: the same logic runs on Amazon's bullet list and on its
+    detail table. Absent labels stay absent — nothing is invented.
+    """
+    lines = _clean_detail_lines(text)
+    values: dict[str, str] = {}
+    for i, line in enumerate(lines):
+        low = line.lower().rstrip(":")
+        label = None
+        inline = ""
+        if ":" in line:
+            head, _, tail = line.partition(":")
+            if head.strip().lower() in _DETAIL_LABELS:
+                label, inline = head.strip().lower(), tail.strip()
+        if label is None and low in _DETAIL_LABELS:
+            label = low
+            if i + 1 < len(lines) and lines[i + 1].lower().rstrip(":") not in _DETAIL_LABELS:
+                inline = lines[i + 1]
+        if label and inline and label not in values:
+            if label == "best sellers rank":
+                # Amazon prints the primary rank and then one line per
+                # category; all of them are real observations.
+                extra: list[str] = []
+                j = i + 1
+                while j < len(lines) and lines[j].lstrip().startswith("#"):
+                    extra.append(lines[j])
+                    j += 1
+                inline = " ".join([inline, *extra])
+            values[label] = inline
+
+    out: dict[str, Any] = {}
+    publisher = values.get("publisher", "")
+    if publisher:
+        out["publisher"] = publisher[:160]
+    published = values.get("publication date", "")
+    if not published and publisher:
+        m = _DATE_IN_PARENS_RE.search(publisher) or _DATE_RE.search(publisher)
+        published = m.group(1) if m else ""
+    if published:
+        out["publication_date"] = published[:40]
+    if values.get("language"):
+        out["language"] = values["language"][:60]
+    for key in ("print length", "paperback", "hardcover", "board book",
+                "mass market paperback", "spiral-bound", "loose leaf", "pamphlet"):
+        if values.get(key):
+            out["print_length"] = values[key][:60]
+            break
+    for key in ("isbn-13", "isbn-10"):
+        if values.get(key):
+            out["isbn"] = values[key][:40]
+            break
+    if values.get("edition"):
+        out["edition"] = values["edition"][:80]
+
+    rank_text = values.get("best sellers rank", "")
+    ranks: list[dict[str, Any]] = []
+    for m in _RANK_RE.finditer(rank_text):
+        rank = _parse_int(m.group(1))
+        category = " ".join(m.group(2).split())[:120]
+        # "(See Top 100 in Books)" is navigation, not part of the category.
+        category = re.sub(
+            r"\(.*?See Top 100.*?\)", "", category, flags=re.IGNORECASE
+        ).strip(" -·")
+        if rank is not None and category and {
+            "rank": rank, "category": category
+        } not in ranks:
+            ranks.append({"rank": rank, "category": category})
+    if ranks:
+        out["best_seller_ranks"] = ranks[:6]
+        out.setdefault("best_seller_rank", ranks[0]["rank"])
+        out.setdefault("best_seller_category", ranks[0]["category"])
+    return out
+
+
+def parse_format_prices(text: str) -> list[dict[str, str]]:
+    """Every format Amazon offers with its price, from the format swatches."""
+    lines = _clean_detail_lines(text)
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for i, line in enumerate(lines):
+        fmt = next((f for f in _FORMAT_WORDS if line.lower() == f.lower()), None)
+        if fmt is None:
+            continue
+        if fmt in seen:
+            continue
+        price = ""
+        for nxt in lines[i + 1 : i + 4]:
+            if next((f for f in _FORMAT_WORDS if nxt.lower() == f.lower()), None):
+                break
+            price = _first_price(nxt) or price
+            if price:
+                break
+        seen.add(fmt)
+        out.append({"format": fmt, "price": price})
+    return out[:8]
 
 
 async def _extract_review_snippets(page: Any, max_items: int = 4) -> list[dict[str, Any]]:

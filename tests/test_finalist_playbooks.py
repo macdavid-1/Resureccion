@@ -705,6 +705,10 @@ async def test_full_run_renders_a_complete_section_for_every_final_candidate(
         make_runner,
     )
 
+    # Playbooks are how the DETERMINISTIC layout carries per-candidate analysis;
+    # when the model writes the whole report they are part of its dossier
+    # instead. This test covers the fallback renderer.
+    config.report_ai_enabled = False
     store = BrowserEvidenceStore(db)
 
     class _StubDive:

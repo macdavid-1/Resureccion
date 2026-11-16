@@ -11,6 +11,8 @@ from app.evidence_capture import (
     _parse_int,
     _parse_rating,
     _stamp,
+    parse_format_prices,
+    parse_product_details,
 )
 from app.marketplace import AMAZON_MARKETPLACES
 
@@ -34,6 +36,68 @@ def test_int_extraction() -> None:
     assert _parse_int("12,345 ratings") == 12345
     assert _parse_int("#42 in Books") == 42
     assert _parse_int("") is None
+
+
+def test_product_details_from_amazons_bullet_list() -> None:
+    """Publication date, page count and EVERY BSR the page prints.
+
+    The report reasons about market-entry recency and rank bands, so these are
+    captured as data instead of being left in page prose the report never sees.
+    """
+    details = parse_product_details(
+        "Publisher\n\u200b\nIndependently published (March 3, 2023)\n\u200b\n"
+        "Language\n\u200b\nEnglish\n\u200b\nPaperback\n\u200b\n210 pages\n\u200b\n"
+        "ISBN-13\n\u200b\n979-8387456336\n\u200b\nBest Sellers Rank\n\u200b\n"
+        "#12,345 in Books (See Top 100 in Books)\n#45 in Grief & Loss\n"
+        "#112 in Self-Help\n"
+    )
+    assert details["publication_date"] == "March 3, 2023"
+    assert details["publisher"].startswith("Independently published")
+    assert details["print_length"] == "210 pages"
+    assert details["language"] == "English"
+    assert details["isbn"] == "979-8387456336"
+    assert details["best_seller_rank"] == 12345
+    assert details["best_seller_category"] == "Books"
+    assert details["best_seller_ranks"] == [
+        {"rank": 12345, "category": "Books"},
+        {"rank": 45, "category": "Grief & Loss"},
+        {"rank": 112, "category": "Self-Help"},
+    ]
+
+
+def test_product_details_from_amazons_table_rows() -> None:
+    details = parse_product_details(
+        "Publisher: Independently published (March 3, 2023)\n"
+        "Publication date: March 3, 2023\n"
+        "Language: English\n"
+        "Paperback: 210 pages\n"
+        "Best Sellers Rank: #9,001 in Books (See Top 100 in Books) #21 in Death & Grief\n"
+    )
+    assert details["publication_date"] == "March 3, 2023"
+    assert details["print_length"] == "210 pages"
+    assert details["best_seller_ranks"] == [
+        {"rank": 9001, "category": "Books"},
+        {"rank": 21, "category": "Death & Grief"},
+    ]
+
+
+def test_product_details_never_invent_missing_fields() -> None:
+    assert parse_product_details("") == {}
+    assert parse_product_details("Publisher: nothing here") == {
+        "publisher": "nothing here"
+    }
+
+
+def test_format_prices_are_captured_per_format() -> None:
+    assert parse_format_prices(
+        "Kindle\n$0.99\nPaperback\n$9.99\nHardcover\n$19.99\nAudible Audiobook\n$0.00"
+    ) == [
+        {"format": "Kindle", "price": "$0.99"},
+        {"format": "Paperback", "price": "$9.99"},
+        {"format": "Hardcover", "price": "$19.99"},
+        {"format": "Audible Audiobook", "price": "$0.00"},
+    ]
+    assert parse_format_prices("no formats rendered") == []
 
 
 def test_stamp_shape() -> None:

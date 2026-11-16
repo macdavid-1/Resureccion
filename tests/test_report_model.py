@@ -18,10 +18,16 @@ from tests.test_research_runner import (
 )
 
 
-async def _run_session(db, config, session_id: str):
-    """Drive a full scripted research run to completion."""
+async def _run_session(db, config, session_id: str, *, ai_report: bool = True):
+    """Drive a full scripted research run to completion.
+
+    `ai_report=False` exercises the DETERMINISTIC renderer this module tests:
+    the normal path has the model write the report (app.report_writer), and the
+    generated layout is the fallback for a failed writing call.
+    """
     from tests.test_research_runner import ScriptedModel
 
+    config.report_ai_enabled = ai_report
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     await runner.run(session_id)
 
@@ -88,7 +94,7 @@ class TestKeywordPlanAndCategories:
     async def test_real_run_renders_new_sections(self, db, config, session):
         """The rendered report carries the keyword plan, category
         recommendations, and the demand-vs-competition verdict."""
-        await _run_session(db, config, session)
+        await _run_session(db, config, session, ai_report=False)
         _, body, model = _final_report(db, config, session)
         o = model["opportunities"][0]
         assert o["keyword_plan"], "keyword plan empty"
@@ -161,7 +167,7 @@ class TestReportModelFromRealRun:
 
     @pytest.mark.asyncio
     async def test_rendered_markdown_has_all_major_sections(self, db, config, session):
-        await _run_session(db, config, session)
+        await _run_session(db, config, session, ai_report=False)
         _, body, _ = _final_report(db, config, session)
 
         for heading in (
@@ -282,7 +288,7 @@ class TestPlainLanguageRecords:
 class TestReportPersistenceAndRerender:
     @pytest.mark.asyncio
     async def test_model_json_is_round_trippable(self, db, config, session):
-        await _run_session(db, config, session)
+        await _run_session(db, config, session, ai_report=False)
         _rep, _body, model = _final_report(db, config, session)
 
         from app.report_model import ReportModel, render_markdown

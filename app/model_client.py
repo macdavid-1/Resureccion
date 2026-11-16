@@ -307,8 +307,15 @@ class ModelClient:
         screenshot_png: bytes | None = None,
         reference_images: list[bytes] | None = None,
         label: str = "Thinking",
+        text_mode: bool = False,
     ) -> ModelReply:
-        """One model call returning strict JSON. Retries transient failures.
+        """One model call. Retries transient failures.
+
+        By default the reply must be strict JSON (`content` carries the parsed
+        object). `text_mode=True` is for deliverables written as prose — the
+        final report is markdown, not JSON, so no response_format is sent, no
+        JSON is parsed, and the model's text is returned verbatim in `raw`
+        with `content` left empty.
 
         When `screenshot_png` is provided (and vision is enabled) it is sent
         as an OpenAI-style image_url content part so vision-capable models
@@ -354,10 +361,11 @@ class ModelClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-            "response_format": {"type": "json_object"},
             "max_tokens": max_tokens or self.config.model_max_tokens,
             "temperature": self.config.model_temperature if temperature is None else temperature,
         }
+        if not text_mode:
+            payload["response_format"] = {"type": "json_object"}
         # Thinking. MiMo-V2.6-Flash is a reasoning model; DeepInfra takes
         # `reasoning_effort` on reasoning-capable models and ignores it on
         # ones that aren't, so this stays safe across model swaps. Omitted
@@ -426,14 +434,18 @@ class ModelClient:
                         except Exception:
                             pass
                     raw = answer
-                content = _extract_json(raw)
+                if text_mode and not raw.strip():
+                    raise ModelError("model returned empty content")
+                content = {} if text_mode else _extract_json(raw)
                 usage = data.get("usage") or {}
                 self.usage.calls += 1
                 self.usage.prompt_tokens += int(usage.get("prompt_tokens") or 0)
                 self.usage.completion_tokens += int(usage.get("completion_tokens") or 0)
                 self.usage.cost_usd += float(usage.get("cost") or 0.0)
                 elapsed = time.monotonic() - started
-                if expect_fields:
+                # Field contracts apply to JSON replies only: a text deliverable
+                # (the report) has no fields to check.
+                if expect_fields and not text_mode:
                     missing = [f for f in expect_fields if f not in content]
                     if missing:
                         # Contract violation: retrying the identical prompt

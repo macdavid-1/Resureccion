@@ -263,7 +263,11 @@ async def test_runner_injects_owner_message_without_interruption(db, config, sid
 
     after = [
         p for p in model.prompts_seen[1:]
-        if not p.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX))
+        if not p.startswith((
+            "SESSION DATA (verified",
+            PLAYBOOK_PROMPT_PREFIX,
+            "RESEARCH DOSSIER",  # post-research report writing
+        ))
     ]
     assert after, "runner kept iterating after the message arrived"
     assert all("focus on grief journals" in p and "OWNER GUIDANCE" in p for p in after)

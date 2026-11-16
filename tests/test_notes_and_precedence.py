@@ -107,6 +107,9 @@ async def test_runner_stores_phase_notes_once_and_never_as_evidence(db, config, 
             ]
             return reply
 
+    # The generated layout is the fallback renderer now that the model writes
+    # the report; this test covers the notes→report guarantee on that path.
+    config.report_ai_enabled = False
     runner = make_runner(db, config, NoteModel(PHASE_OUTPUTS))
     await runner.run(session)
 

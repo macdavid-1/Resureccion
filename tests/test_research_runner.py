@@ -103,6 +103,8 @@ class ScriptedModel:
         self.script = script
         self.calls: list[str] = []
         self.user_prompts: dict[str, list[str]] = {}
+        # Every report-writing prompt: the complete dossier the model received.
+        self.report_prompts: list[str] = []
         self.usage = type("U", (), {"calls": 0, "failed_calls": 0})()
 
     @staticmethod
@@ -145,12 +147,47 @@ class ScriptedModel:
             ]
         return FakeModelReply(content)
 
+    # The report-writing call is part of the run: the model writes the whole
+    # report as markdown (app.report_writer), citing real evidence ids and
+    # choosing the screenshots it wants embedded.
+    REPORT_MARK = "RESEARCH DOSSIER"
+
+    def _report_reply(self, user: str) -> FakeModelReply:
+        import re
+
+        ids = list(dict.fromkeys(re.findall(r'"id":\s*"([0-9a-f]{12,})"', user)))[:3]
+        cites = "".join(f" [ev:{i}]" for i in ids)
+        shots = list(dict.fromkeys(
+            re.findall(r'"evidence_id":\s*"([0-9a-f]{12,})"', user)
+        ))[:1]
+        image = f"\n\n![Search results](shot:{shots[0]})\n" if shots else ""
+        raw = (
+            "# What the research found\n\n"
+            "## The opening\n\n"
+            "The run measured a set of adjacent niches and rejected the crowded "
+            "ones; the survivors share a reader with a specific unmet need."
+            + cites
+            + "\n\n## What competitors are doing\n\n"
+            "The leading listings are broad, lightly positioned and priced low, "
+            "which leaves room for a narrower, better-argued book."
+            + image
+            + "\n## How to win\n\n"
+            "Publish the narrow book the incumbents do not: same reader, deeper "
+            "promise, evidence-backed content.\n"
+        )
+        reply = FakeModelReply({})
+        reply.raw = raw
+        return reply
+
     async def call(self, session_id: str, *, system: str, user: str, **k: Any) -> Any:
         for phase in PHASE_ORDER:
             if SPECS[phase].guidance[:40] in system:
                 self.calls.append(phase)
                 self.user_prompts.setdefault(phase, []).append(user)
                 return self._reply_for(phase, user)
+        if user.startswith(self.REPORT_MARK):
+            self.report_prompts.append(user)
+            return self._report_reply(user)
         raise AssertionError("model called with unknown phase prompt")
 
     async def aclose(self) -> None:
@@ -356,7 +393,11 @@ async def test_vision_screenshot_attached_to_every_research_call(db, config, ses
             # every phase, from measured data, and never receive the screen.
             from app.finalist_playbook import PLAYBOOK_PROMPT_PREFIX
 
-            if not user.startswith(("SESSION DATA (verified", PLAYBOOK_PROMPT_PREFIX)):
+            if not user.startswith((
+                "SESSION DATA (verified",
+                PLAYBOOK_PROMPT_PREFIX,
+                "RESEARCH DOSSIER",  # post-research report writing
+            )):
                 self.shots.append(k.get("screenshot_png"))
             return await super().call(session_id, system=system, user=user, **k)
 
@@ -1116,12 +1157,14 @@ async def test_strategic_pivot_reruns_discovery_on_new_focus(db, config, session
     assert p1_prompts.index(plain[-1]) < p1_prompts.index(pivoted[0])
     assert "sudden-loss grief journals for adult children" in pivoted[0]
 
-    # the final report records the pivot
+    # the final report records the pivot: with a model-written report the
+    # guarantee is that the pivot is IN the dossier the report writer
+    # receives, not that a fixed backend section spells it out
     store = ReportStore(db, config)
     final = [r for r in store.list(session) if r.kind == "final"]
     assert final
-    body = store.read_markdown(final[0])
-    assert "Strategic pivot (round 1)" in body
+    assert model.report_prompts, "no report-writing call was made"
+    assert any("Strategic pivot (round 1)" in p for p in model.report_prompts)
 
 
 @pytest.mark.asyncio

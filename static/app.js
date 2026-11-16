@@ -839,7 +839,17 @@
       btn.addEventListener("click", () => exportAllPdf(btn.dataset.sid, btn)));
   }
 
-  // Minimal, safe markdown → HTML for report bodies.
+  // Only in-app paths, http(s) links and anchors become hrefs: a report is
+  // model-authored text, so `javascript:` and friends never reach the DOM.
+  function safeUrl(u) {
+    const url = String(u || "").trim();
+    return /^(\/(?!\/)|https?:\/\/|#)/i.test(url) ? url : "";
+  }
+
+  // Minimal, safe markdown → HTML for report bodies. Supports the pieces the
+  // report writer actually emits: headings, lists, tables, quotes, links and
+  // INLINE SCREENSHOT EVIDENCE (model-selected captures, served authenticated
+  // by the artifact route) plus [ev:ID] citation chips.
   function mdToHtml(md) {
     const lines = String(md || "").split("\n");
     const out = [];
@@ -847,7 +857,20 @@
     const inline = (t) => esc(t)
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-      .replace(/`([^`]+)`/g, "<code>$1</code>");
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
+        const u = safeUrl(url.replace(/&amp;/g, "&"));
+        return u ? `<img class="rep-inline-img" src="${esc(u)}" alt="${alt}" loading="lazy">` : alt;
+      })
+      .replace(/\[(ev:[^\]]+)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (m, label, url) => {
+        const u = safeUrl(url.replace(/&amp;/g, "&"));
+        const id = label.replace(/^ev:/, "");
+        return u ? `<a class="ev-ref" href="${esc(u)}" target="_blank" rel="noopener" title="Evidence ${esc(id)} — open the captured page behind this claim">evidence</a>` : "";
+      })
+      .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (m, text, url) => {
+        const u = safeUrl(url.replace(/&amp;/g, "&"));
+        return u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${text}</a>` : text;
+      });
     const flushTable = () => {
       if (!tableBuf.length) return;
       const rows = tableBuf.filter((r) => !/^\|[\s:|-]+\|$/.test(r.trim()));
@@ -874,6 +897,15 @@
       const h = /^(#{1,4})\s+(.*)/.exec(line);
       if (h) { flushLists(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
       if (/^---+\s*$/.test(line)) { flushLists(); out.push("<hr>"); continue; }
+      // A screenshot on its own line becomes a figure with its caption — the
+      // claim, the picture and the explanation stay together.
+      const fig = /^!\[([^\]]*)\]\(([^)\s]+)\)\s*$/.exec(line.trim());
+      if (fig) {
+        flushLists();
+        const u = safeUrl(fig[2].replace(/&amp;/g, "&"));
+        if (u) out.push(`<figure class="rep-fig"><a href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" alt="${esc(fig[1] || "Research screenshot")}" loading="lazy"></a>${fig[1] ? `<figcaption>${inline(fig[1])}</figcaption>` : ""}</figure>`);
+        continue;
+      }
       const ul = /^[-*]\s+(.*)/.exec(line);
       if (ul) { if (inOl) { out.push("</ol>"); inOl = false; } if (!inUl) { out.push("<ul>"); inUl = true; } out.push(`<li>${inline(ul[1])}</li>`); continue; }
       const ol = /^\d+[.)]\s+(.*)/.exec(line);
@@ -897,6 +929,20 @@
       const data = await api(`/api/sessions/${sid}/reports/${rid}`);
       const report = data.report ?? {};
       const md = data.body_markdown ?? "";
+      const meta = report.meta || {};
+      const val = meta.validation || {};
+      const failures = Array.isArray(val.failures) ? val.failures : [];
+      const banner = val.mode === "provisional"
+        ? `<div class="rep-banner"><strong>Provisional report</strong> — ${failures.length} validation ${failures.length === 1 ? "gate" : "gates"} did not pass. The findings are still shown, with the shortfall named.${failures.length ? `<ul>${failures.slice(0, 4).map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}</div>`
+        : "";
+      const authorLine = meta.authored_by === "model"
+        ? "Written by the research model from this run's complete research record."
+        : meta.authored_by === "deterministic_fallback"
+          ? "Rendered by the deterministic pipeline: the report-writing model did not return a usable draft, so the measured findings are presented without its analysis."
+          : "";
+      const authored = authorLine
+        ? `<div class="rep-note">${esc(authorLine)}${(meta.figures || []).length ? ` ${esc(String((meta.figures || []).length))} screenshot${(meta.figures || []).length === 1 ? "" : "s"} embedded as evidence.` : ""}</div>`
+        : "";
       const sections = splitReportSections(md);
       body.innerHTML = `
         <div class="spread mt14" style="margin-bottom:10px">
@@ -910,6 +956,7 @@
         </div>
         <div class="panel"><div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">${esc(report.title || title)}</h2>
           <span class="chip ${esc(report.kind)}">${esc(report.kind)}</span></div>
+        ${authored}${banner}
         <div class="section report-body" id="rep-body">${sections}</div></div>`;
       $("#rep-back").addEventListener("click", renderReportsView);
       $("#rep-pdf").addEventListener("click", () => exportPdf(sid, rid));

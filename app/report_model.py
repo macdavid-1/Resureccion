@@ -100,6 +100,13 @@ class ReportModel:
     # beyond the schema.
     research_notes: list[dict[str, Any]] = field(default_factory=list)
     research_notes_total: int = 0
+    # The report the MODEL wrote from the whole research record
+    # (app.report_writer): title, grounded markdown, the screenshots it chose
+    # and the evidence it cited. When present this IS the deliverable — the
+    # deterministic renderer below is only the fallback for a failed model
+    # call. Kept in the model so re-rendering and PDF export reproduce the
+    # same document.
+    ai_report: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +130,7 @@ class ReportModel:
             "finalist_playbooks": self.finalist_playbooks,
             "research_notes": self.research_notes,
             "research_notes_total": self.research_notes_total,
+            "ai_report": self.ai_report,
         }
 
     def to_json(self) -> str:
@@ -144,7 +152,7 @@ class ReportModel:
             "methodology_trace", "focus_pivots", "evidence_appendix",
             "quality_statement", "validation", "narrative",
             "finalist_sections", "finalist_playbooks", "research_notes",
-            "research_notes_total",
+            "research_notes_total", "ai_report",
         ):
             default: Any = (
                 [] if f in list_fields
@@ -2335,7 +2343,16 @@ def safe_render_markdown(model: ReportModel) -> str:
 
 
 def render_markdown(model: ReportModel) -> str:
-    """Render the structured model into the publication-ready report."""
+    """The publication-ready report.
+
+    When the model wrote the report (app.report_writer), that IS the report: the
+    backend does not wrap it in a template, reorder it or append generated
+    sections. The deterministic layout below exists only for sessions whose
+    report-writing call failed, so the owner still receives a real deliverable.
+    """
+    ai = model.ai_report if isinstance(model.ai_report, dict) else {}
+    if str(ai.get("markdown") or "").strip():
+        return str(ai["markdown"])
     ex = model.executive_summary
     s = model.session
     lines: list[str] = []

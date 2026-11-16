@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -251,6 +251,76 @@ async def get_artifact_file(session_id: str, artifact_id: str, request: Request)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="artifact file missing")
     return FileResponse(path, media_type=art.content_type)
+
+
+def _evidence_page(ev: Any) -> str:
+    """A small, self-contained page for one evidence record.
+
+    Report citations link here: the owner clicks a claim and sees the actual
+    captured page data (and the screenshot, when one was taken), so every
+    statement in the report is auditable without reading a JSON API.
+    """
+    import html as _html
+
+    h = _html.escape
+    data = ev.data or {}
+    scalars = []
+    blocks = []
+    for key, value in data.items():
+        label = str(key).replace("_", " ").strip().capitalize()
+        if isinstance(value, (dict, list)):
+            blocks.append((label, value))
+        elif value not in (None, ""):
+            scalars.append((label, str(value)))
+    shot = ""
+    if ev.screenshot_artifact_id:
+        src = f"/api/sessions/{h(ev.session_id)}/artifacts/{h(ev.screenshot_artifact_id)}/file"
+        shot = (
+            f'<figure><img src="{src}" alt="captured screenshot">'
+            "<figcaption>Capture taken by the research browser</figcaption></figure>"
+        )
+    rows = "".join(
+        f'<div class="row"><dt>{h(k)}</dt><dd>{h(v)}</dd></div>' for k, v in scalars
+    )
+    blocks_html = "".join(
+        f'<h2>{h(k)}</h2><pre>{h(json.dumps(v, indent=1, ensure_ascii=False, default=str))}</pre>'
+        for k, v in blocks
+    )
+    url = h(ev.url or "")
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evidence · {h(ev.title or ev.kind)}</title>
+<style>
+body{{margin:0;background:#0d0f12;color:#e8e6e1;font:15px/1.6 ui-sans-serif,system-ui,sans-serif}}
+main{{max-width:860px;margin:0 auto;padding:28px 18px 60px}}
+h1{{font-size:20px;line-height:1.3;margin:0 0 6px}}h2{{font-size:14px;letter-spacing:.08em;text-transform:uppercase;color:#9aa0a6;margin:26px 0 8px}}
+.meta{{color:#9aa0a6;font-size:13px;margin-bottom:18px}}.meta a{{color:#c9a227;word-break:break-all}}
+dl{{margin:0;border-top:1px solid #24262b}}.row{{display:grid;grid-template-columns:180px 1fr;gap:12px;padding:9px 0;border-bottom:1px solid #24262b}}
+dt{{color:#9aa0a6}}dd{{margin:0;word-break:break-word}}
+pre{{background:#14171b;border:1px solid #24262b;border-radius:8px;padding:12px;overflow:auto;font-size:12.5px;max-height:60vh}}
+figure{{margin:0 0 18px}}img{{width:100%;border-radius:10px;border:1px solid #24262b;display:block}}
+figcaption{{color:#9aa0a6;font-size:12.5px;padding-top:6px}}
+.badge{{display:inline-block;border:1px solid #33373d;border-radius:999px;padding:1px 9px;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:#c9a227;margin-right:6px}}
+</style></head><body><main>
+<div class="meta"><span class="badge">{h(ev.kind)}</span><span class="badge">{h(ev.marketplace or "—")}</span>{h(ev.captured_at or "")}</div>
+<h1>{h(ev.title or "Captured evidence")}</h1>
+<div class="meta">{f'<a href="{url}" target="_blank" rel="noopener">{url}</a>' if url else ''}</div>
+{shot}
+<dl>{rows}</dl>
+{blocks_html}
+</main></body></html>"""
+
+
+@router.get("/sessions/{session_id}/evidence/{evidence_id}", response_class=HTMLResponse)
+async def get_evidence_detail(session_id: str, evidence_id: str, request: Request) -> Any:
+    """The capture behind a report citation, rendered for a human reader."""
+    _auth(request)
+    st = _st(request)
+    _session_or_404(request, session_id)
+    ev = st.browser_evidence.get(evidence_id)
+    if ev is None or ev.session_id != session_id:
+        raise HTTPException(status_code=404, detail="evidence not found")
+    return HTMLResponse(_evidence_page(ev))
 
 
 # ------------------------------------------------------------------ reports

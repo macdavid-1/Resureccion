@@ -288,6 +288,37 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
   reach the owner-facing report; invalid candidates are rejected along the
   way with reasons recorded in the event log.
 
+## Report writing (`app/report_writer.py`)
+
+The report is **written by the model**, not assembled from a template. Once a
+run finishes, the backend assembles the complete research dossier — the owner's
+brief, every phase's analysis, the actions taken, the model's own reasoning,
+the browser captures with their measured prices/BSRs/reviews/publication data,
+the candidate ledger with rejection reasons, the verification verdicts, the
+measured finalist deep dives and every captured screenshot — and the model
+decides what matters, how to organise it and what to say. Each mode is framed
+differently (answering a brief, addressing supplied keywords, or explaining an
+autonomous discovery).
+
+Guardrails stay deterministic:
+
+- every figure in the delivered markdown must appear in the dossier — unknown
+  figures are removed and one corrective retry is attempted before the
+  generated fallback report is used;
+- every `[ev:ID]` citation must name a real evidence record and resolves to
+  `/api/sessions/{id}/evidence/{evidence_id}`, a page showing the capture;
+- every `![caption](shot:EVIDENCE_ID)` must name a captured screenshot and
+  resolves to the authenticated artifact URL, so images render inline in the
+  report viewer and in the PDF export;
+- no claim can cite a figure that exists only in the model's reasoning or its
+  run notes.
+
+A failed or unusable report-writing call never costs the deliverable: the
+session is reported with the deterministic layout instead, and the report's
+metadata says which path produced it.
+
+
+
 ## Research integrity layer (Stage 4)
 
 Research output is only as good as its evidence. A deterministic integrity
