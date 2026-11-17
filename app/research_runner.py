@@ -85,6 +85,7 @@ from app.model_client import (
 from app.owner_messages import OwnerMessageStore
 from app.prompts import build_system_prompt, build_user_prompt
 from app.quality_gates import QualityGateRunner
+from app.record_edits import RECORD_ACTIONS, RecordEditError, RecordEditor
 from app.recovery import CheckpointStore, ErrorStateStore
 from app.redact import redact
 from app.reports import ReportStore
@@ -97,6 +98,7 @@ from app.research_data import (
     ResearchNoteStore,
     VerificationStore,
 )
+from app.search_totals import competition_text, results_captured, search_total
 from app.sessions import SessionStore
 from app.thresholds import get_thresholds
 from app.timeutil import iso_now
@@ -451,6 +453,18 @@ class ResearchRunner:
         self._ref_images: dict[str, list[bytes]] = {}
         # Consecutive failed model iterations (see _MODEL_FAILURE_LIMIT).
         self._consecutive_model_failures = 0
+        # The model's write access to its own records (candidates,
+        # opportunities, evidence corrections, claims) — see app.record_edits.
+        self.records = RecordEditor(
+            candidates=self.candidates,
+            opportunities=self.opportunities,
+            claims=self.claims,
+            browser_evidence=self.browser_evidence,
+        )
+        # Compact results of the actions/re-edits this iteration, replayed into
+        # the next prompt: the model must know whether its click, scroll or
+        # ledger edit actually worked before it decides what to do next.
+        self._recent_action_results: dict[str, list[dict[str, Any]]] = {}
 
     # ------------------------------------------------- owner message channel
     def _take_owner_messages(self, session_id: str) -> None:
@@ -1128,6 +1142,9 @@ class ResearchRunner:
                     ) if has_images else ""
                 ),
                 screenshot_attached=screenshot_png is not None,
+                # What the model's LAST requested actions actually did (ok,
+                # summary or refusal) — closed-loop feedback, bounded.
+                recent_actions=list(self._recent_action_results.get(session_id) or []),
                 depth_note=self._depth_note(session_started),
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
@@ -1310,7 +1327,8 @@ class ResearchRunner:
             # --- execute requested browser actions ------------------------
             actions = reply.content.get("actions") or []
             if isinstance(actions, list) and actions:
-                for a in actions[:6]:
+                self._recent_action_results[session_id] = []
+                for a in actions[:10]:
                     if not isinstance(a, dict):
                         continue
                     if self._pause_requested:
@@ -1343,20 +1361,32 @@ class ResearchRunner:
                                     "mode": session.mode, "iteration": iteration},
                         )
                         continue
+                    # Record edits (candidate/opportunity/evidence/claim
+                    # corrections) are applied through the stores, not the
+                    # browser: same journaling, no page involved.
+                    if action_name in RECORD_ACTIONS:
+                        self._apply_record_edit(
+                            session_id, action_name, dict(a.get("args") or {}), phase
+                        )
+                        continue
                     task_key = f"action:{action_name}:{iteration}"
                     timings.start(task_key, TaskType.PAGE_NAVIGATION)
                     try:
-                        await self.executor.execute(
+                        result = await self.executor.execute(
                             session_id=session_id,
                             action=action_name,
                             args=dict(a.get("args") or {}),
                         )
                         timings.finish(task_key, outcome="ok")
+                        self._note_action_result(session_id, action_name, result)
                     except AuthPauseRequired:
                         timings.abandon(task_key, outcome="auth_pause")
                         raise
                     except (ActionError, BrowserManagerError) as exc:
                         timings.finish(task_key, outcome="failed")
+                        self._note_action_result(
+                            session_id, action_name, None, error=str(exc)
+                        )
                         self.errors.record(
                             session_id, scope=f"action:{action_name}", severity="warning",
                             message=str(exc), recoverable=True,
@@ -3577,19 +3607,97 @@ class ResearchRunner:
         getter = getattr(self.executor.collector, "last_screenshot", None)
         return getter if isinstance(getter, (bytes, type(None))) else None
 
+    # ------------------------------------------------------- action feedback
+    def _note_action_result(
+        self, session_id: str, action: str, result: Any, *, error: str | None = None
+    ) -> None:
+        """Keep a compact, bounded record of what the model's actions DID.
+
+        The next prompt replays it, so the model can see that a click matched
+        nothing, that a scroll moved the page, or that a search measured
+        30,000 results — instead of re-requesting blind actions. Bounded to the
+        last few results: it is feedback, not a transcript.
+        """
+        entry: dict[str, Any] = {
+            "action": action,
+            "ok": bool(getattr(result, "ok", False)) if result is not None else False,
+        }
+        if result is not None:
+            entry["summary"] = str(getattr(result, "summary", "") or "")[:300]
+            if getattr(result, "error", None):
+                entry["error"] = str(result.error)[:300]
+        elif error:
+            entry["error"] = str(error)[:300]
+        bucket = self._recent_action_results.setdefault(session_id, [])
+        bucket.append(entry)
+        del bucket[:-8]
+
+    def _apply_record_edit(
+        self, session_id: str, action: str, args: dict[str, Any], phase: str
+    ) -> None:
+        """Apply one of the model's record edits, journaling success or refusal."""
+        try:
+            summary = self.records.apply(session_id, action, args)
+        except RecordEditError as exc:
+            reason = str(exc)
+            self.events.append(
+                session_id, level="warn", actor="agent",
+                action="record_edit_rejected",
+                detail={"edit": action, "phase": phase, "reason": reason[:600]},
+            )
+            self._note_action_result(session_id, action, None, error=reason)
+            return
+        self.events.append(
+            session_id, level="info", actor="agent",
+            action="record_edited",
+            detail={"edit": action, "phase": phase, "summary": summary.get("summary", "")[:400]},
+        )
+        try:
+            self.trace.record(
+                session_id, KIND_CANDIDATE,
+                str(summary.get("summary") or f"{action} applied"),
+            )
+        except Exception:
+            pass  # the edit itself is durable; the feed line is additive
+        entry = {
+            "action": action,
+            "ok": True,
+            "summary": str(summary.get("summary") or "")[:300],
+        }
+        bucket = self._recent_action_results.setdefault(session_id, [])
+        bucket.append(entry)
+        del bucket[:-8]
+
     def _evidence_digest(self, session_id: str) -> list[dict[str, Any]]:
-        """Compact, model-safe digest of recent browser evidence."""
+        """Compact, model-safe digest of recent browser evidence.
+
+        Search rows carry a derived ``competition`` sentence: when the model
+        regains context here (rather than from the screenshot) it must read
+        Amazon's OVERALL total, never the handful of rows the snapshot
+        captured. ``result_count`` is normalised to that total too, because
+        older rows published the row count under that name.
+        """
         items: list[dict[str, Any]] = []
         for e in self.browser_evidence.list(
             session_id, limit=self.rc.max_evidence_digest_items
         ):
+            data = e.data
+            if e.kind == "search_results" and isinstance(data, dict):
+                total = search_total(data)
+                data = {
+                    **data,
+                    "result_count": total,
+                    "total_results": total,
+                    "results_captured": results_captured(e.data),
+                    "competition": competition_text(e.data),
+                }
             items.append({
                 "id": e.id,
                 "kind": e.kind,
                 "marketplace": e.marketplace,
                 "title": e.title[:120],
                 "url": e.url[:160],
-                "data": e.data,
+                "data": data,
                 "captured_at": e.captured_at,
             })
         return items

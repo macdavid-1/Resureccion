@@ -59,8 +59,9 @@ def test_the_brief_carries_thoughts_actions_and_measurements() -> None:
     assert "Grief journals" in text and "95 min" in text
     # conclusions
     assert "WHAT IT RECOMMENDED" in text and "confidence 0.82" in text
-    # measurement + the numbers themselves
-    assert "BACKEND KEYWORDS IT MEASURED" in text and "2000 results" in text
+    # measurement + the numbers themselves (Amazon's OVERALL total, not the
+    # number of rows a first page happened to show)
+    assert "BACKEND KEYWORDS IT MEASURED" in text and "2,000 total results" in text
     assert "119" in text
     assert "STORE CATEGORIES IT MAPPED" in text and "Death & Dying" in text
     # how it thought and what it did

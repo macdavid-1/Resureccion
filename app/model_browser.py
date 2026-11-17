@@ -1,23 +1,22 @@
 """The research model's own Playwright verbs — at human pace.
 
 The model is not handed a mock or a shortcut: it drives the SAME persistent
-Camoufox browser the rest of the app uses, through a small vocabulary it picks
-itself (navigate, click, type, press, scroll). When it sees the shipping-country
-notice in a screenshot it can therefore click "Dismiss" the way a person would,
-and when a page needs a mouse it never had before, it has one.
+Camoufox browser the rest of the app uses, with the whole working vocabulary of
+a person at a keyboard and mouse — navigate anywhere, click, type, press keys,
+scroll, hover, pick from a select, run JavaScript, wait for something, walk
+history back and forward, reload. When it sees the shipping-country notice in a
+screenshot it can click "Dismiss" the way a person would; when the answer needs
+a scroll, an autocomplete suggestion or the KDSpy panel's own controls, it has
+them.
 
-Two rules keep that surface useful instead of destructive:
-
-- **Human cadence.** The pointer travels to the element in jittered steps,
-  presses, and releases with a pause; typing is per-character; scrolling is
-  stepped; navigation settles. Amazon fingerprints input cadence as much as it
-  fingerprints the UA, so machine-gun actions would defeat the engine choice.
-  ``BROWSER_ACTION_PACE=off`` makes every pause zero — for tests and for an
-  owner who explicitly wants the old, fast behaviour.
-- **Network scope.** Clicking is unrestricted (the DOM is the model's to
-  drive), but navigation is deny-by-default: Amazon marketplaces plus the
-  external research allow-list. "Full Playwright access" is access to the page,
-  never to arbitrary hosts.
+There is deliberately **no host allow-list and no action allow-list here**:
+research is the model's job and the orchestrator does not get to predict where
+the next useful page is. The only rule is **human cadence** — the pointer
+travels in jittered steps and pauses, typing is per-character, scrolling is
+stepped, navigation settles. Amazon fingerprints input cadence as much as it
+fingerprints the UA, so machine-gun actions would defeat the engine choice.
+``BROWSER_ACTION_PACE=off`` makes every pause zero — for tests and for an owner
+who explicitly wants the old, fast behaviour.
 
 Pure helpers (``looks_like_selector``, ``host_allowed``) are testable without a
 browser; the async verbs run against the real engine in tests.
@@ -194,12 +193,19 @@ async def scroll(page: Any, direction: str = "down", amount: int = 1) -> str:
     return "down" if down else "up"
 
 
-async def navigate(page: Any, url: str, *, allowed_hosts: Iterable[str]) -> str:
-    """Go to a URL, then let the page settle before the model looks at it."""
+async def navigate(
+    page: Any, url: str, *, allowed_hosts: Iterable[str] | None = None
+) -> str:
+    """Go to a URL, then let the page settle before the model looks at it.
+
+    ``allowed_hosts=None`` means what it says: no host restriction. The model
+    researches; deciding in advance which hosts hold the answer is exactly the
+    restriction that made it stop at the first page.
+    """
     url = (url or "").strip()
     if not url:
         raise BrowserActionError("navigate requires a url")
-    if not host_allowed(url, allowed_hosts):
+    if allowed_hosts is not None and not host_allowed(url, allowed_hosts):
         raise BrowserActionError(f"navigation host not allow-listed: {url[:120]}")
     await _pause(300, 800)
     try:
@@ -212,6 +218,117 @@ async def navigate(page: Any, url: str, *, allowed_hosts: Iterable[str]) -> str:
         pass  # a slow third-party asset is not a failed navigation
     await _pause(900, 1800)
     return str(getattr(page, "url", "") or url)
+
+
+# ------------------------------------------------------- more page verbs
+async def hover(page: Any, target: str) -> str:
+    """Move the real pointer onto an element (menus, tooltips, carousels)."""
+    locator = await resolve(page, target)
+    try:
+        await locator.scroll_into_view_if_needed(timeout=4000)
+    except Exception:
+        pass
+    box = None
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        box = None
+    if box:
+        await _move_pointer(page, box)
+    else:  # no box: the locator's own hover still moves a pointer
+        await locator.hover(timeout=6000)
+    await _pause(180, 460)
+    return str(target).strip()
+
+
+async def select_option(page: Any, target: str, value: str) -> str:
+    """Choose a value in a <select> (sort order, department, marketplace…)."""
+    locator = await resolve(page, target)
+    raw = str(value or "")
+    try:
+        await locator.select_option(raw, timeout=6000)
+    except Exception:
+        # Fall back to a label match before reporting failure.
+        try:
+            await locator.select_option(label=raw, timeout=6000)
+        except Exception as exc:
+            raise BrowserActionError(
+                f"could not select {raw!r} in {target!r}: {exc}"
+            ) from exc
+    await _pause(220, 520)
+    return f"{str(target).strip()} = {raw}"
+
+
+async def evaluate(page: Any, js: str, *args: Any) -> Any:
+    """Run JavaScript in the page and return its value.
+
+    This is the same power a person has with the devtools console. It is the
+    honest fallback for anything the verb list does not cover (reading a
+    count, dismissing a custom overlay, expanding "show more").
+    """
+    code = str(js or "").strip()
+    if not code:
+        raise BrowserActionError("evaluate requires 'js' (a JS expression or function)")
+    try:
+        return await page.evaluate(code, *args) if args else await page.evaluate(code)
+    except Exception as exc:
+        raise BrowserActionError(f"page JavaScript failed: {exc}") from exc
+
+
+async def wait_for(
+    page: Any, target: str = "", seconds: float | None = None
+) -> str:
+    """Wait for an element/text to appear, or simply for time to pass."""
+    if seconds is not None:
+        try:
+            delay = max(0.0, min(float(seconds), 30.0))
+        except (TypeError, ValueError):
+            delay = 1.0
+        await asyncio.sleep(delay)
+        return f"waited {delay:g}s"
+    want = str(target or "").strip()
+    if not want:
+        raise BrowserActionError("wait_for needs a target (selector/text) or 'seconds'")
+    try:
+        if looks_like_selector(want):
+            await page.wait_for_selector(want, timeout=15000)
+        else:
+            await page.get_by_text(want, exact=False).first.wait_for(timeout=15000)
+    except Exception as exc:
+        raise BrowserActionError(f"{want!r} never appeared: {exc}") from exc
+    return want
+
+
+async def go_back(page: Any) -> str:
+    """Browser history back (the page the model came from)."""
+    await _pause(200, 500)
+    try:
+        await page.go_back(wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        raise BrowserActionError(f"cannot go back: {exc}") from exc
+    await _pause(500, 1100)
+    return str(getattr(page, "url", "") or "back")
+
+
+async def go_forward(page: Any) -> str:
+    await _pause(200, 500)
+    try:
+        await page.go_forward(wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        raise BrowserActionError(f"cannot go forward: {exc}") from exc
+    await _pause(500, 1100)
+    return str(getattr(page, "url", "") or "forward")
+
+
+async def reload(page: Any) -> str:
+    """Reload the current page (captures refreshed counts after a notice)."""
+    await _pause(200, 500)
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        raise BrowserActionError(f"cannot reload: {exc}") from exc
+    await _pause(700, 1500)
+    return str(getattr(page, "url", "") or "reloaded")
 
 
 # ------------------------------------------------------------------ hosts

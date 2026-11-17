@@ -526,6 +526,95 @@ class CandidateStore:
             )
         return self.get(session_id, cand_id)  # type: ignore[return-value]
 
+    def update_fields(
+        self,
+        session_id: str,
+        cand_id: str,
+        *,
+        niche: str | None = None,
+        marketplace: str | None = None,
+        rationale: str | None = None,
+        score: float | None = None,
+        status: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> Candidate:
+        """Edit a research record's own fields (any subset; `meta` merges).
+
+        A candidate is not write-once: after reading more evidence the model
+        may narrow the niche, correct the marketplace, re-word the rationale,
+        re-score it or change its status. Passing no field returns the row
+        unchanged. `meta` shallow-merges so chain/parent/whitespace bookkeeping
+        survives the edit.
+        """
+        cand = self.require(session_id, cand_id)
+        sets: list[str] = []
+        params: list[Any] = []
+        if niche is not None:
+            clean = " ".join(str(niche).split())
+            if not clean:
+                raise ValueError("candidate niche cannot be empty")
+            sets.append("niche = ?")
+            params.append(clean[:200])
+        if marketplace is not None:
+            sets.append("marketplace = ?")
+            params.append(str(marketplace).strip()[:60])
+        if rationale is not None:
+            sets.append("rationale = ?")
+            params.append(str(rationale).strip()[:4000])
+        if score is not None:
+            sets.append("score = ?")
+            params.append(float(score))
+        if status is not None:
+            if status not in CANDIDATE_STATUSES:
+                raise ValueError(f"invalid candidate status {status!r}")
+            sets.append("status = ?")
+            params.append(status)
+        if meta is not None:
+            sets.append("meta = ?")
+            params.append(json.dumps({**cand.meta, **meta}))
+        if not sets:
+            return cand
+        sets.append("updated_at = ?")
+        params.append(iso_now())
+        params.extend([session_id, cand_id])
+        with self.db.tx() as conn:
+            conn.execute(
+                f"UPDATE candidates SET {', '.join(sets)} WHERE session_id = ? AND id = ?",
+                params,
+            )
+        return self.get(session_id, cand_id)  # type: ignore[return-value]
+
+    def delete(self, session_id: str, cand_id: str) -> dict[str, int]:
+        """Remove a candidate AND the rows that hang off it, atomically.
+
+        Verifications and opportunities reference the candidate through real
+        foreign keys, so they go with it; claims keep their own rows but lose
+        the candidate link (a claim is about evidence, not about this line of
+        research). Returns what was removed so the run's trace can say it.
+        """
+        self.require(session_id, cand_id)
+        with self.db.tx() as conn:
+            verifications = conn.execute(
+                "DELETE FROM verifications WHERE session_id = ? AND candidate_id = ?",
+                (session_id, cand_id),
+            ).rowcount
+            opportunities = conn.execute(
+                "DELETE FROM opportunities WHERE session_id = ? AND candidate_id = ?",
+                (session_id, cand_id),
+            ).rowcount
+            conn.execute(
+                "UPDATE claims SET candidate_id = NULL WHERE session_id = ? AND candidate_id = ?",
+                (session_id, cand_id),
+            )
+            conn.execute(
+                "DELETE FROM candidates WHERE session_id = ? AND id = ?",
+                (session_id, cand_id),
+            )
+        return {
+            "verifications": max(0, int(verifications)),
+            "opportunities": max(0, int(opportunities)),
+        }
+
     def _row(self, row: sqlite3.Row) -> Candidate:
         return Candidate(
             id=row["id"],
@@ -695,6 +784,78 @@ class OpportunityStore:
                 (session_id,),
             ).fetchone()
         return int(row["n"])
+
+    def update_fields(
+        self,
+        session_id: str,
+        opp_id: str,
+        *,
+        title: str | None = None,
+        niche: str | None = None,
+        marketplace: str | None = None,
+        angle: str | None = None,
+        keywords: list[str] | None = None,
+        projected_demand: float | None = None,
+        projected_competition: float | None = None,
+        confidence: float | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> Opportunity:
+        """Edit an opportunity's own fields (any subset; `meta` merges)."""
+        opp = self.get(session_id, opp_id)
+        if opp is None:
+            raise ValueError(f"opportunity {opp_id} not found in session {session_id}")
+        sets: list[str] = []
+        params: list[Any] = []
+        if title is not None:
+            clean = " ".join(str(title).split())
+            if not clean:
+                raise ValueError("opportunity title cannot be empty")
+            sets.append("title = ?")
+            params.append(clean[:200])
+        if niche is not None:
+            sets.append("niche = ?")
+            params.append(str(niche).strip()[:200])
+        if marketplace is not None:
+            sets.append("marketplace = ?")
+            params.append(str(marketplace).strip()[:60])
+        if angle is not None:
+            sets.append("angle = ?")
+            params.append(str(angle).strip()[:1000])
+        if keywords is not None:
+            clean_kw = [str(k).strip()[:80] for k in keywords if str(k).strip()]
+            sets.append("keywords = ?")
+            params.append(json.dumps(clean_kw[:40]))
+        if projected_demand is not None:
+            sets.append("projected_demand = ?")
+            params.append(float(projected_demand))
+        if projected_competition is not None:
+            sets.append("projected_competition = ?")
+            params.append(float(projected_competition))
+        if confidence is not None:
+            sets.append("confidence = ?")
+            params.append(float(confidence))
+        if meta is not None:
+            sets.append("meta = ?")
+            params.append(json.dumps({**opp.meta, **meta}))
+        if not sets:
+            return opp
+        params.extend([session_id, opp_id])
+        with self.db.tx() as conn:
+            conn.execute(
+                f"UPDATE opportunities SET {', '.join(sets)} WHERE session_id = ? AND id = ?",
+                params,
+            )
+        return self.get(session_id, opp_id)  # type: ignore[return-value]
+
+    def delete(self, session_id: str, opp_id: str) -> bool:
+        if self.get(session_id, opp_id) is None:
+            return False
+        with self.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM opportunities WHERE session_id = ? AND id = ?",
+                (session_id, opp_id),
+            )
+        return True
 
     def _row(self, row: sqlite3.Row) -> Opportunity:
         return Opportunity(

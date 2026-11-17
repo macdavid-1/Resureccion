@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.record_edits import RECORD_ACTIONS
+
 # --------------------------------------------------------------------------- #
 # Phases
 # --------------------------------------------------------------------------- #
@@ -239,6 +241,26 @@ EXTERNAL_ACTIONS: tuple[str, ...] = (
     "goodreads_check",   # independent want-to-read / rating evidence
 )
 
+# The model's own browser surface — available in EVERY phase (a researcher
+# that can only look where the orchestrator predicted cannot chase what it
+# finds). These are real Playwright operations on a real, persistent page:
+# any URL, any element, typing, keys, scrolling, hovering, selects, arbitrary
+# JavaScript, waits, history and reloads. 'browser' is the generic escape
+# hatch for the same operations by name.
+BROWSER_ACTIONS: tuple[str, ...] = (
+    "navigate", "click", "type", "press", "scroll", "hover",
+    "select_option", "evaluate", "wait_for", "go_back", "go_forward",
+    "reload", "screenshot", "browser",
+)
+
+# The model's write access to its own records (see app.record_edits):
+# correct/remove a candidate, an opportunity, a capture or a claim. Also
+# available in every phase — the evidence that contradicts a row can surface
+# at any point in the methodology.
+# One home for "what a record edit is" (app.record_edits), so the runner's
+# dispatch and the phase whitelists can never drift apart.
+RECORD_EDIT_ACTIONS: tuple[str, ...] = RECORD_ACTIONS
+
 # Which phases may request them (the model-facing whitelist). P1's use is
 # additionally gated at runtime to autonomous (auto) runs AFTER Amazon-side
 # anchors exist — unanchored forum noise may never set a run's direction.
@@ -259,7 +281,8 @@ SPECS: dict[str, PhaseSpec] = {
             "search_marketplace", "open_category", "autocomplete",
             "bestsellers", "new_releases", "related_products",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -297,7 +320,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "open_category",
             "related_products", "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "niches",  # list of {niche, parent_market, chain, evidence_ids, demand_hints}
@@ -326,9 +350,10 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("discovered", "rejected"),
         allowed_actions=(
-            "search_marketplace", "open_product", "related_products",
+            "search_marketplace",             "open_product", "related_products",
             "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "competitive_maps",  # list of {niche, competitors[], saturation, pricing, patterns}
@@ -358,7 +383,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "open_product", "read_reviews", "capture_evidence",
             "record_observation", "wait", "forum_search", "goodreads_check",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
@@ -389,7 +415,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "autocomplete", "kdspy_data",
             "open_product", "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -426,7 +453,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "capture_evidence", "record_observation", "wait", "forum_search",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
@@ -450,7 +478,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "autocomplete",
             "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "cross_market_checks",  # list of {niche, marketplace, verdict, notes}
@@ -478,7 +507,8 @@ SPECS: dict[str, PhaseSpec] = {
         allowed_actions=(
             "search_marketplace", "open_product", "read_reviews",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
-            "navigate", "click", "type", "press", "scroll",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
         ),
         output_contract=(
             "verdicts",  # list of {niche, verdict: pass|downgrade|reject, contradictions[], reasons}
@@ -506,7 +536,11 @@ SPECS: dict[str, PhaseSpec] = {
         min_evidence=0,
         consumes=("verified",),
         produces=("verified",),
-        allowed_actions=("record_observation", "wait"),
+        allowed_actions=(
+            "record_observation", "wait",
+            *BROWSER_ACTIONS,
+            *RECORD_EDIT_ACTIONS,
+        ),
         output_contract=(
             "opportunities",  # full opportunity objects (see OPPORTUNITY_FIELDS)
         ),

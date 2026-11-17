@@ -31,6 +31,7 @@ from app.browser_manager import (
 from app.browser_store import BrowserEvidence, BrowserEvidenceStore
 from app.marketplace import Marketplace, marketplace_from_url
 from app.redact import redact, scrub_url
+from app.search_totals import parse_results_total
 
 ASIN_RE = re.compile(r"\b(B0[0-9A-Z]{8}|[0-9]{9}(?:X|[0-9]))\b")
 PRICE_RE = re.compile(r"(?:US\s?)?[$€£¥₹]\s?\d[\d,]*(?:\.\d{2})?")
@@ -88,13 +89,18 @@ class EvidenceCollector:
 
         Two different numbers live here and they mean different things:
 
-        - ``result_count``  how many results this capture actually pulled
-          (capped by ``max_items``) — never a market-size claim.
-        - ``total_results`` the TOTAL Amazon itself printed on the page
-          ("1-16 of over 4,000 results for …") — the real competition
-          figure. It is only present when that line was visible, which is
-          why the shipping-country overlay is dismissed first
-          (app.browser_manager.dismiss_amazon_overlays).
+        - ``result_count``  the TOTAL Amazon itself printed on the page
+          ("1-16 of over 30,000 results for …") — the real competition
+          figure, in every storefront language and separator style. It is
+          ``None`` when no printed total could be read: a first page's row
+          count is NEVER published under this key (that conflation made the
+          model report 16 results for a 30,000-result market).
+        - ``results_captured``  how many result rows this capture pulled
+          (capped by ``max_items``) — a snapshot size, never market size.
+
+        ``total_results``/``results_text`` mirror the total for the report
+        and for older readers; the shipping-country overlay is dismissed
+        first because it covers the printed total.
         """
         # The overlay pops AFTER load and covers the printed total; dismiss
         # it right before reading so `total_results` is captured even when
@@ -112,7 +118,8 @@ class EvidenceCollector:
         items = await _extract_search_items(page, max_items)
         data: dict[str, Any] = {
             "query": query,
-            "result_count": len(items),
+            "result_count": None,          # Amazon's overall total; None = unknown
+            "results_captured": len(items),  # rows in THIS snapshot only
             "results": items,
             "results_count_clear": not covered,
         }
@@ -123,7 +130,19 @@ class EvidenceCollector:
                 "dismiss it (click \"Dismiss\") and capture again"
             )
         else:
-            data.update(await _extract_results_summary(page))
+            summary = await _extract_results_summary(page)
+            data.update(summary)
+            total = summary.get("total_results")
+            if isinstance(total, int):
+                data["result_count"] = total
+            else:
+                data["results_count_note"] = (
+                    "Amazon printed no overall result total on this page "
+                    f"({len(items)} rows were captured). The captured row count "
+                    "is NOT market size: never quote it as competition. Scroll "
+                    "the results (or open page 2) and capture again to read the "
+                    "printed total."
+                )
         return [await self._persist(
             page,
             session_id=session_id,
@@ -271,30 +290,17 @@ class EvidenceCollector:
 
 
 # ------------------------------------------------------------- DOM extraction
-# Amazon's own "1-16 of over 4,000 results for <query>" line. It is the
-# competition measurement the whole low-competition analysis rests on, so it
-# is read straight from the page text and stored verbatim alongside the
-# parsed number.
-_RESULTS_SUMMARY_RE = re.compile(
-    r"((?:\d[\d,]*\s*[-\u2013]\s*\d[\d,]*\s+)?)of\s+"
-    r"(over\s+|about\s+|more\s+than\s+)?([\d,]+)?\s*results",
-    re.IGNORECASE,
+# Amazon's own "1-16 of over 30,000 results for <query>" line — the competition
+# measurement the whole low-competition analysis rests on. It is read from the
+# results info bar first (that is where Amazon prints it) and from the page
+# text only as a fallback, then parsed by app.search_totals (every storefront
+# language, every thousands-separator style).
+_RESULTS_INFO_SELECTORS: tuple[str, ...] = (
+    "[data-component-type='s-result-info-bar']",
+    "#s-result-info-bar",
+    "div.s-desktop-toolbar",
+    "[data-csa-c-content-id='aps/result-header']",
 )
-# Layout variant without the "of": "over 7,000,000 results". It still has
-# to carry a number, so an unnumbered "results" never becomes a count.
-_RESULTS_BARE_RE = re.compile(
-    r"(over\s+|about\s+)?(\d[\d,]*)\s+results", re.IGNORECASE
-)
-
-
-def _parse_total(approx_word: str, digits: str) -> tuple[bool, int | None]:
-    total: int | None = None
-    if digits:
-        try:
-            total = int(digits.replace(",", ""))
-        except ValueError:
-            total = None
-    return bool(approx_word), total
 
 
 async def _extract_results_summary(page: Any) -> dict[str, Any]:
@@ -304,30 +310,26 @@ async def _extract_results_summary(page: Any) -> dict[str, Any]:
     absence, never as a zero ("no results" and "count not visible" are
     different facts).
     """
+    summary: dict[str, Any] = {}
+    for selector in _RESULTS_INFO_SELECTORS:
+        try:
+            el = await page.query_selector(selector)
+        except Exception:
+            el = None
+        if el is None:
+            continue
+        try:
+            text = await el.inner_text()
+        except Exception:
+            continue
+        summary = parse_results_total(text or "")
+        if summary:
+            return summary
     try:
         text = await page.inner_text("body")
     except Exception:
-        return {}
-    text = (text or "").replace("\u00a0", " ")
-    m = _RESULTS_SUMMARY_RE.search(text) or _RESULTS_BARE_RE.search(text)
-    if not m:
-        return {}
-    raw = " ".join(m.group(0).split())
-    groups = m.groups()
-    if len(groups) == 3:  # the "… of … results" form
-        approx, total = _parse_total(groups[1] or "", groups[2] or "")
-    else:                 # the bare "… results" form
-        approx, total = _parse_total(groups[0] or "", groups[1] or "")
-    out: dict[str, Any] = {"results_text": raw}
-    if total is not None:
-        out["total_results"] = total
-        out["total_results_are_approximate"] = approx
-    else:
-        # "of over results" — Amazon printed the word without the figure
-        # (region-dependent rendering). Keep the fact that it was OVER
-        # something without inventing the number.
-        out["total_results_are_approximate"] = True if approx else None
-    return out
+        return summary
+    return parse_results_total(text or "") or summary
 
 
 async def _extract_search_items(page: Any, max_items: int) -> list[dict[str, Any]]:

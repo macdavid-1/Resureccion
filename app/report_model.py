@@ -37,6 +37,7 @@ from typing import Any
 from app.integrity import KIND_FILTER, KIND_SYNTHESIS, KIND_VERIFICATION
 from app.marketplace import AMAZON_MARKETPLACES
 from app.methodology import PHASE_ORDER, PHASE_TITLES
+from app.search_totals import results_captured, search_total
 
 SCHEMA_VERSION = 2
 
@@ -708,10 +709,11 @@ def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[di
     """Rank opportunity keywords against MEASURED Amazon search evidence.
 
     Keywords the research actually searched (matching search_results
-    evidence) carry their captured result count and the median review count
-    of the top results (the entry barrier), and rank first — lightest
-    barrier first. Keywords never searched follow, honestly marked, so an
-    unmeasured keyword is never presented as validated.
+    evidence) carry Amazon's PRINTED total (the competition figure), how many
+    rows that snapshot captured, and the median review count of the top
+    results (the entry barrier), and rank first — lightest barrier first.
+    Keywords never searched follow, honestly marked, so an unmeasured keyword
+    is never presented as validated.
     """
     exact: dict[str, dict[str, Any]] = {}
     partial: list[tuple[str, dict[str, Any]]] = []
@@ -741,17 +743,18 @@ def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[di
             results = list(d.get("results") or [])[:10]
             reviews = [int(r.get("review_count") or 0) for r in results
                        if r.get("review_count") is not None]
-            total = d.get("total_results")
+            # Amazon's printed total IS competition; the number of rows this
+            # snapshot pulled is a separate fact and is never substituted.
+            total = search_total(d)
             plan.append({
                 "keyword": k,
                 "measured": True,
-                "result_count": int(d.get("result_count") or 0),
-                # Amazon's own printed total — the real competition figure
-                # (captured count above is only how many rows were pulled).
-                "total_results": total if isinstance(total, int) else None,
+                "result_count": total,
+                "total_results": total,
                 "total_results_are_approximate": d.get(
                     "total_results_are_approximate"
                 ),
+                "results_captured": results_captured(d),
                 "results_text": str(d.get("results_text") or ""),
                 "top10_review_median": _median_int(reviews),
                 "marketplace": str(_ev_field(match, "marketplace") or ""),
@@ -760,7 +763,8 @@ def _keyword_plan(keywords: list[str], ev_rows: list[dict[str, Any]]) -> list[di
         else:
             plan.append({
                 "keyword": k, "measured": False, "result_count": None,
-                "total_results": None, "top10_review_median": None,
+                "total_results": None, "results_captured": 0,
+                "top10_review_median": None,
                 "marketplace": "", "evidence_id": "",
             })
     measured = [p for p in plan if p["measured"]]
@@ -2941,11 +2945,11 @@ def _render_opportunity(
                     total_txt = f"{approx}{total:,}"
                 else:
                     total_txt = (
-                        f"{e.get('result_count', 0)} captured"
+                        f"{e.get('results_captured', 0)} captured"
                         " (Amazon total not printed)"
                     )
                 a(f"| {kw_rank} | {kw} | {total_txt} "
-                  f"| {_competition_of(total if isinstance(total, int) else None, e.get('result_count'))} "
+                  f"| {_competition_of(total if isinstance(total, int) else None)} "
                   f"| {med if med is not None else '—'} "
                   f"| {e.get('marketplace') or '—'} |")
             else:

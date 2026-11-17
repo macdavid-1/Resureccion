@@ -352,6 +352,69 @@ class ClaimStore:
             )
         return self.get(session_id, claim_id)  # type: ignore[return-value]
 
+    def update_fields(
+        self,
+        session_id: str,
+        claim_id: str,
+        *,
+        statement: str | None = None,
+        kind: str | None = None,
+        interpretation: str | None = None,
+        evidence_ids: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> Claim:
+        """Edit a claim's wording/kind/evidence links (any subset).
+
+        A claim the model can no longer support should be corrected rather than
+        left standing: it is the unit the quality gates and the report read.
+        `meta` shallow-merges.
+        """
+        claim = self.get(session_id, claim_id)
+        if claim is None:
+            raise ClaimError(f"claim {claim_id} not found in session {session_id}")
+        sets: list[str] = []
+        params: list[Any] = []
+        if statement is not None:
+            clean = " ".join(str(statement).split())
+            if not clean:
+                raise ClaimError("claim statement cannot be empty")
+            sets.append("statement = ?")
+            params.append(clean[:2000])
+        if kind is not None:
+            if kind not in CLAIM_KINDS:
+                raise ClaimError(f"invalid claim kind {kind!r}")
+            sets.append("kind = ?")
+            params.append(kind)
+        if interpretation is not None:
+            sets.append("interpretation = ?")
+            params.append(str(interpretation).strip()[:2000])
+        if evidence_ids is not None:
+            clean_ids = [str(e) for e in evidence_ids if str(e).strip()]
+            sets.append("evidence_ids = ?")
+            params.append(json.dumps(clean_ids))
+        if meta is not None:
+            sets.append("meta = ?")
+            params.append(json.dumps({**claim.meta, **meta}))
+        if not sets:
+            return claim
+        params.extend([session_id, claim_id])
+        with self.db.tx() as conn:
+            conn.execute(
+                f"UPDATE claims SET {', '.join(sets)} WHERE session_id = ? AND id = ?",
+                params,
+            )
+        return self.get(session_id, claim_id)  # type: ignore[return-value]
+
+    def delete(self, session_id: str, claim_id: str) -> bool:
+        if self.get(session_id, claim_id) is None:
+            return False
+        with self.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM claims WHERE session_id = ? AND id = ?",
+                (session_id, claim_id),
+            )
+        return True
+
     def count(self, session_id: str, *, status: str | None = None) -> int:
         q = "SELECT COUNT(*) AS n FROM claims WHERE session_id = ?"
         params: list[Any] = [session_id]

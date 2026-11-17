@@ -1,9 +1,16 @@
-"""Whitelisted browser-action executor for the research agent.
+"""The research agent's browser-action executor.
 
-The model can only REQUEST actions; this module decides what actually runs.
-Every action is one of the methodology-approved verbs, executed against the
-real persistent Chromium through BrowserManager and EvidenceCollector. Raw
-pages are never stored — only structured, redacted evidence.
+The model REQUESTS actions and this module runs them against the real
+persistent Camoufox browser through BrowserManager and EvidenceCollector.
+There is no host allow-list and no per-page restriction: ``navigate`` goes
+anywhere, ``evaluate`` runs real page JavaScript, and click/type/press/scroll/
+hover/select/history/reload behave like a person at the keyboard. What stays
+deterministic is the EVIDENCE: raw pages are never stored — only structured,
+redacted records with stable ids.
+
+The methodology phases (app.methodology) list the verbs each phase may use;
+both the browser surface and the record-edit surface are present in every
+phase, so a researcher is never told "you may look, but not there".
 
 Auth safety: after any navigation the page is classified (sign-in wall,
 CAPTCHA, OTP challenge) using AmazonAuthManager's DOM heuristics. Sign-in is
@@ -17,6 +24,7 @@ Every executed action is journaled to the event log with redacted detail.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -37,6 +45,7 @@ from app.marketplace import (
     marketplace_from_url,
 )
 from app.redact import redact, scrub_url
+from app.search_totals import competition_text
 
 # Search-path templates per marketplace for Amazon search URLs.
 _SEARCH_PATH = "/s?k={query}"
@@ -338,21 +347,18 @@ class ActionExecutor:
                 screenshot=bool(args.get("screenshot", True)),
             )
             data = captured[0].record.data if captured else {}
-            result_count = int(data.get("result_count") or 0)
             evidence_ids = [c.record.id for c in captured]
-            # Amazon's OWN total is the competition figure; the captured
-            # count is only how many rows this capture pulled.
-            total = data.get("total_results")
-            if isinstance(total, int):
-                approx = "over " if data.get("total_results_are_approximate") else ""
-                count_txt = f"{result_count} shown, Amazon reports {approx}{total:,} total results"
-            else:
-                count_txt = f"{result_count} results"
+            # Amazon's OWN printed total is the competition figure; the
+            # number of rows this capture pulled is reported separately and
+            # is never called "results" on its own.
             suffix = f" ({department} department)" if department != "all" else ""
             return ActionResult(
                 action="search_marketplace", ok=True, marketplace=mkt.code,
                 url=scrub_url(page.url), evidence_ids=evidence_ids,
-                summary=f"searched {query!r} on {mkt.code}{suffix}: {count_txt}",
+                summary=(
+                    f"searched {query!r} on {mkt.code}{suffix}: "
+                    f"{competition_text(data)}"
+                ),
             )
         finally:
             await self.browser.close_page(page)
@@ -524,15 +530,26 @@ class ActionExecutor:
             await self.browser.close_page(page)
 
     async def _do_kdspy_data(self, session_id: str, args: dict[str, Any]) -> ActionResult:
-        """Read KDSpy panel data on the CURRENT Amazon page context.
+        """Read KDSpy panel data on an Amazon page.
 
-        Requires the KDSpy extension loaded and rendered. Navigates to the
-        target (default: search page for 'query') then reads the panel.
+        Requires the KDSpy extension loaded and rendered. Opens the target —
+        a search for 'query', a product by 'asin', or any 'url' — then reads
+        whatever the extension rendered there. KDSpy's own injected controls
+        are also clickable by the model like any other page element.
         """
         mkt = self._marketplace_for(args)
         query = str(args.get("query") or "").strip()
-        path = _SEARCH_PATH.format(query=quote_plus(query)) if query else "/"
-        page = await self.browser.open_marketplace(mkt, path)
+        asin = str(args.get("asin") or "").strip()
+        url = str(args.get("url") or "").strip()
+        if url.startswith("http"):
+            page = await self.browser.new_page()
+            page = await self.browser.navigate(page, url)
+        else:
+            if asin:
+                path = f"/dp/{asin}"
+            else:
+                path = _SEARCH_PATH.format(query=quote_plus(query)) if query else "/"
+            page = await self.browser.open_marketplace(mkt, path)
         try:
             captured = await self.collector.capture_kdspy_panel(
                 page, session_id=session_id, marketplace=mkt,
@@ -772,14 +789,6 @@ class ActionExecutor:
         self._working[session_id] = page
         return page
 
-    def _allowed_nav_hosts(self) -> set[str]:
-        """Hosts the model may navigate to: the marketplaces it researches
-        plus the external research allow-list. Everything else is refused —
-        the model gets full access to the PAGE, never to the network."""
-        hosts = {m.domain for m in AMAZON_MARKETPLACES.values()}
-        hosts |= set(EXTERNAL_DOMAIN_ALLOWLIST)
-        return {h.lstrip(".") for h in hosts if h}
-
     async def _after_model_action(
         self, session_id: str, page: Any, summary: str, action: str
     ) -> ActionResult:
@@ -814,12 +823,10 @@ class ActionExecutor:
         return await self._after_model_action(session_id, page, summary, action)
 
     async def _do_navigate(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Go anywhere. No host allow-list: the model decides where evidence is."""
         url = str(args.get("url") or "").strip()
         return await self._model_verb(
-            session_id, "navigate",
-            lambda page: model_browser.navigate(
-                page, url, allowed_hosts=self._allowed_nav_hosts()
-            ),
+            session_id, "navigate", lambda page: model_browser.navigate(page, url)
         )
 
     async def _do_click(self, session_id: str, args: dict[str, Any]) -> ActionResult:
@@ -855,6 +862,99 @@ class ActionExecutor:
         return await self._model_verb(
             session_id, "scroll",
             lambda page: model_browser.scroll(page, direction, amount),
+        )
+
+    async def _do_hover(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        target = str(args.get("target") or args.get("selector") or "")
+        return await self._model_verb(
+            session_id, "hover", lambda page: model_browser.hover(page, target)
+        )
+
+    async def _do_select_option(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        target = str(args.get("target") or args.get("selector") or "")
+        value = str(args.get("value") or args.get("label") or "")
+        return await self._model_verb(
+            session_id, "select_option",
+            lambda page: model_browser.select_option(page, target, value),
+        )
+
+    async def _do_evaluate(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Run arbitrary JavaScript in the page and return its value.
+
+        The honest escape hatch: reading a printed count, expanding a section,
+        dismissing a custom overlay — anything the verb list does not spell out
+        is still one console line away, exactly as it would be for the owner.
+        """
+        js = str(args.get("js") or args.get("script") or args.get("expression") or "")
+        extra = args.get("args") if isinstance(args.get("args"), list) else []
+        page = await self._working_page(session_id)
+        try:
+            value = await model_browser.evaluate(page, js, *extra)
+        except model_browser.BrowserActionError as exc:
+            raise ActionError(str(exc)) from exc
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            rendered = str(value)
+        return await self._after_model_action(
+            session_id, page, f"JS returned: {rendered[:1200]}", "evaluate"
+        )
+
+    async def _do_wait_for(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        target = str(args.get("target") or args.get("selector") or args.get("text") or "")
+        seconds = args.get("seconds")
+        return await self._model_verb(
+            session_id, "wait_for",
+            lambda page: model_browser.wait_for(
+                page, target, float(seconds) if seconds is not None else None
+            ),
+        )
+
+    async def _do_go_back(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        return await self._model_verb(
+            session_id, "go_back", lambda page: model_browser.go_back(page)
+        )
+
+    async def _do_go_forward(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        return await self._model_verb(
+            session_id, "go_forward", lambda page: model_browser.go_forward(page)
+        )
+
+    async def _do_reload(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        return await self._model_verb(
+            session_id, "reload", lambda page: model_browser.reload(page)
+        )
+
+    async def _do_screenshot(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Refresh the visual ground truth attached to the next model call."""
+        page = await self._working_page(session_id)
+        return await self._after_model_action(
+            session_id, page,
+            f"refreshed the screenshot of {scrub_url(str(getattr(page, 'url', '') or ''))}",
+            "screenshot",
+        )
+
+    async def _do_browser(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """One generic escape hatch for the same verbs, by name.
+
+        ``{"action": "browser", "args": {"op": "scroll", "direction": "down"}}``
+        keeps working even for a verb added to this executor later, and lets a
+        model that thinks in Playwright terms name the operation directly.
+        """
+        op = str(
+            args.get("op") or args.get("operation") or args.get("verb") or ""
+        ).strip().lower()
+        if not op or op == "browser":
+            raise ActionError(
+                "browser requires 'op' — one of: navigate, click, type, press, "
+                "scroll, hover, select_option, evaluate, wait_for, go_back, "
+                "go_forward, reload, screenshot"
+            )
+        handler = getattr(self, f"_do_{op}", None)
+        if handler is None:
+            raise ActionError(f"unknown browser op {op!r}")
+        return await handler(
+            session_id, {k: v for k, v in args.items() if k not in ("op", "operation", "verb")}
         )
 
     # ------------------------------------------------------------------ helpers

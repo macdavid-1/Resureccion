@@ -156,7 +156,9 @@ class _SearchPage:
         return []
 
 
-async def _capture_search(monkeypatch, *, covered: bool) -> dict:
+async def _capture_search(
+    monkeypatch, *, covered: bool, body: str = '1-16 of over 958 results for "x"',
+) -> dict:
     from app import evidence_capture
 
     async def fake_present(_page):
@@ -175,7 +177,7 @@ async def _capture_search(monkeypatch, *, covered: bool) -> dict:
 
     monkeypatch.setattr(collector, "_persist", fake_persist)
     out = await collector.capture_search_results(
-        _SearchPage('1-16 of over 958 results for "x"'),
+        _SearchPage(body),
         session_id="s1", marketplace=AMAZON_MARKETPLACES["us"],
         query="x", screenshot=False,
     )
@@ -189,6 +191,7 @@ async def test_search_count_is_unclear_while_the_notice_covers_it(monkeypatch) -
     UNCLEAR instead of quoting whatever the page printed underneath it."""
     data = await _capture_search(monkeypatch, covered=True)
     assert data["results_count_clear"] is False
+    assert data["result_count"] is None, "a covered page must not yield a total"
     assert "total_results" not in data, "a covered page must not yield a total"
     assert "958" not in str(data), "the covered count leaked into the evidence"
     assert "Dismiss" in data["results_count_note"]
@@ -199,6 +202,30 @@ async def test_search_count_is_trusted_once_the_notice_is_gone(monkeypatch) -> N
     data = await _capture_search(monkeypatch, covered=False)
     assert data["results_count_clear"] is True
     assert data["total_results"] == 958
+
+
+@pytest.mark.asyncio
+async def test_search_evidence_publishes_the_overall_total(monkeypatch) -> None:
+    """'result_count' IS Amazon's overall total; the rows pulled are separate.
+
+    This is the regression that made the model read 16 for a 30,000-result
+    market whenever it regained context from the evidence instead of the
+    screenshot."""
+    data = await _capture_search(
+        monkeypatch, covered=False, body='Showing 1-16 of over 30,000 results for "x"',
+    )
+    assert data["result_count"] == 30000
+    assert data["total_results"] == 30000
+    assert data["results_captured"] == 0
+    assert data["total_results_are_approximate"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_evidence_without_a_printed_total_never_guesses(monkeypatch) -> None:
+    data = await _capture_search(monkeypatch, covered=False, body='Showing 1-16 of results for "x"')
+    assert data["result_count"] is None
+    assert "total_results" not in data
+    assert "NOT market size" in data["results_count_note"]
 
 
 def test_collector_requires_real_page_for_kdspy() -> None:

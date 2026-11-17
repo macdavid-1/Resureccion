@@ -422,6 +422,53 @@ class BrowserEvidenceStore:
             ).fetchone()
         return int(row["n"])
 
+    def update(
+        self,
+        session_id: str,
+        evidence_id: str,
+        *,
+        title: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> BrowserEvidence | None:
+        """Correct a capture (e.g. a result total read through an overlay).
+
+        `data` shallow-merges into the stored payload, so a correction can set
+        the fields it knows about without discarding the rows the capture
+        pulled. Returns None when the row is not in this session.
+        """
+        row = self.get(evidence_id)
+        if row is None or row.session_id != session_id:
+            return None
+        sets: list[str] = []
+        params: list[Any] = []
+        if title is not None:
+            sets.append("title = ?")
+            params.append(str(title).strip()[:300])
+        if data is not None:
+            sets.append("data = ?")
+            params.append(json.dumps({**(row.data or {}), **data}))
+        if not sets:
+            return row
+        params.extend([session_id, evidence_id])
+        with self.db.tx() as conn:
+            conn.execute(
+                f"UPDATE browser_evidence SET {', '.join(sets)} WHERE session_id = ? AND id = ?",
+                params,
+            )
+        return self.get(evidence_id)
+
+    def delete(self, session_id: str, evidence_id: str) -> bool:
+        """Remove a capture the model judged wrong (correctable state)."""
+        row = self.get(evidence_id)
+        if row is None or row.session_id != session_id:
+            return False
+        with self.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM browser_evidence WHERE session_id = ? AND id = ?",
+                (session_id, evidence_id),
+            )
+        return True
+
     def distinct_sources(self, session_id: str, *, limit: int = 5000) -> int:
         """Number of DISTINCT sources captured (kind + marketplace + label).
 

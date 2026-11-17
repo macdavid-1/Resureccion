@@ -127,11 +127,14 @@ class ContinuationBrief:
         # ---- what it measured -------------------------------------------
         if self.keywords:
             parts.append(
-                "\nBACKEND KEYWORDS IT MEASURED (Amazon result totals at the time — "
-                "do not re-measure these unless you have a reason)"
+                "\nBACKEND KEYWORDS IT MEASURED (Amazon's own OVERALL totals at the "
+                "time — not the first page's row count; do not re-measure these "
+                "unless you have a reason)"
             )
             for k in self.keywords[:KEYWORD_LIMIT]:
-                line = f"- {k.get('keyword')}: {k.get('total_results', 'not printed')} results"
+                total = k.get("total_results")
+                label = f"{total:,}" if isinstance(total, int) else "not printed"
+                line = f"- {k.get('keyword')}: {label} total results"
                 if k.get("competition"):
                     line += f", competition {k['competition']}"
                 if k.get("top10_review_median") is not None:

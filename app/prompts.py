@@ -126,11 +126,15 @@ def build_system_prompt(phase: str) -> str:
         "confirm anything that matters with a real page capture (search result "
         "totals, product pages, reviews), and call any figure you repeat an "
         "estimate.\n"
-        "- Competition is measured, not guessed: Amazon prints its own total "
-        "on every search page (\"1-16 of over N results\"), captured in the "
-        "evidence once the shipping-country notice is dismissed. Quote that "
-        "number when you judge competition, and prefer searches in the "
-        "relevant department ('books' or 'kindle').\n"
+        "- Competition is measured, not guessed: Amazon prints its own OVERALL "
+        "total on every search page (\"1-16 of over 30,000 results\") and the "
+        "capture stores it as 'result_count' / 'total_results' once the "
+        "shipping-country notice is dismissed. Quote THAT number when you judge "
+        "competition, and prefer searches in the relevant department ('books' "
+        "or 'kindle'). 'results_captured' is only how many rows the snapshot "
+        "pulled — it is never market size. A capture whose 'result_count' is "
+        "null has NO usable competition figure: scroll the results (or open "
+        "page 2) and capture again instead of assuming the row count.\n"
         "- The search-result total is UNCLEAR while the shipping-country "
         "notice (\"We're showing you items that ship to …\") is on the page: "
         "it covers the printed count, so a number read through it is a guess. "
@@ -140,11 +144,31 @@ def build_system_prompt(phase: str) -> str:
         "you SEE the notice in a screenshot, dismiss it yourself, before you "
         "read or judge anything on that page: {\"action\": \"click\", \"args\": "
         "{\"target\": \"Dismiss\"}} — and again every time it reappears.\n"
-        "- You drive the browser yourself: 'navigate' (url), 'click' (target), "
-        "'type' (target, text), 'press' (key) and 'scroll' are real Playwright "
-        "actions on a real page, deliberately paced like a person — a page "
-        "that needs a mouse gets one. Click by visible label (\"Dismiss\") or "
-        "by CSS selector when the label is ambiguous.\n"
+        "- You drive a REAL browser with no restricted list of places or verbs: "
+        "'navigate' (any url), 'click' (target), 'type' (target, text), "
+        "'press' (key), 'scroll' (direction, amount), 'hover', "
+        "'select_option' (target, value), 'evaluate' (js — real page "
+        "JavaScript), 'wait_for' (target or seconds), 'go_back', 'go_forward', "
+        "'reload' and 'screenshot'. 'browser' runs any of those by name "
+        "({\"op\": \"scroll\", \"direction\": \"down\"}). Click by visible label "
+        "(\"Dismiss\") or by CSS selector when the label is ambiguous.\n"
+        "- SCROLL whenever what you need may be below the fold — more results, "
+        "review text, the printed result total, a competitor's detail rows, "
+        "KDSpy's panel — and scroll again before you conclude a page \"has "
+        "nothing\". Type into Amazon's own search box and read its "
+        "autocomplete suggestions as they appear; click KDSpy's injected "
+        "controls to open it on a search page. Use 'evaluate' when a number, "
+        "panel or hidden section is on the page but no verb reaches it.\n"
+        "- Your own records are editable mid-run: 'add_candidate' (niche, "
+        "marketplace, rationale, score) for a niche you actually found while "
+        "browsing, 'update_candidate' "
+        "(candidate_id or niche, plus any of niche, marketplace, rationale, "
+        "score, status), 'delete_candidate', 'update_opportunity' / "
+        "'delete_opportunity' (opportunity_id or title), 'update_evidence' "
+        "(evidence_id + data patch, or total_results to correct a "
+        "competition figure), 'delete_evidence', 'update_claim' / "
+        "'delete_claim'. Correct a row the evidence contradicts instead of "
+        "leaving a known-wrong record for the report.\n"
         "- If evidence is missing, request more actions; do not guess.\n"
         "- Amazon sign-in is optional. When a page hits a sign-in wall the "
         "action fails and YOU decide: skip that source (e.g. review mining) "
@@ -208,6 +232,7 @@ def build_user_prompt(
     headroom_priority: list[str] | None = None,
     adjacency_note: str = "",
     target_note: str = "",
+    recent_actions: list[dict[str, Any]] | None = None,
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -346,6 +371,23 @@ def build_user_prompt(
         "\nEVIDENCE SO FAR (structured, redacted; ids are stable — reference them): "
         + (_compact(bounded_evidence) if bounded_evidence else "[] (none yet — gather some)")
     )
+
+    # --- what the last requested actions actually did -----------------------
+    # Closed loop: the model must see that a click matched nothing, that a
+    # scroll moved, or that its ledger edit was refused, instead of repeating
+    # blind actions or assuming an edit landed.
+    if recent_actions:
+        lines = []
+        for a in recent_actions[-8:]:
+            head = f"- {a.get('action')}: {'ok' if a.get('ok') else 'FAILED'}"
+            detail = str(a.get("summary") or "").strip()
+            if a.get("error"):
+                detail = (detail + " — " if detail else "") + str(a["error"])
+            lines.append(head + (f" — {detail[:400]}" if detail else ""))
+        parts.append(
+            "\nWHAT YOUR LAST ACTIONS DID (the orchestrator's report, not a "
+            "suggestion):\n" + "\n".join(lines)
+        )
 
     # --- candidates digest --------------------------------------------------
     bounded_candidates = [

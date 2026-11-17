@@ -37,6 +37,7 @@ from typing import Any
 
 from app.db import Database
 from app.redact import redact
+from app.search_totals import results_captured, search_total
 from app.timeutil import iso_now, parse_iso, utcnow
 
 # Memory kinds (stable strings — they are the namespace of the table).
@@ -356,10 +357,13 @@ def harvest_session(
                     query,
                     {
                         "query": query,
-                        "result_count": data.get("result_count"),
                         # Amazon's own printed total — the real competition
-                        # figure, present only when the line was visible.
-                        "total_results": data.get("total_results"),
+                        # figure. Never the first page's row count: a capture
+                        # of 16 rows from a 30,000-result market must not be
+                        # remembered (or replayed to a later run) as "16".
+                        "result_count": search_total(data),
+                        "total_results": search_total(data),
+                        "results_captured": results_captured(data),
                         "total_results_are_approximate": data.get(
                             "total_results_are_approximate"
                         ),

@@ -219,6 +219,15 @@ class _FakeLocator:
     async def fill(self, _value: str) -> None:
         self.page.filled.append(_value)
 
+    async def hover(self, timeout: int = 0) -> None:
+        self.page.hovered.append("locator")
+
+    async def select_option(self, value: Any = None, **kw: Any) -> None:
+        self.page.selected.append(str(value if value is not None else kw.get("label")))
+
+    async def wait_for(self, timeout: int = 0) -> None:
+        self.page.waited.append("locator")
+
 
 class _FakeMouse:
     def __init__(self, page: _VerbPage) -> None:
@@ -260,8 +269,29 @@ class _VerbPage:
         self.pressed: list[str] = []
         self.filled: list[str] = []
         self.goto_urls: list[str] = []
+        self.hovered: list[str] = []
+        self.selected: list[str] = []
+        self.waited: list[str] = []
+        self.js: list[str] = []
+        self.history: list[str] = []
         self.mouse = _FakeMouse(self)
         self.keyboard = _FakeKeyboard(self)
+
+    async def evaluate(self, js: str, *args: Any) -> Any:
+        self.js.append(js)
+        return {"printed_total": 30000, "rows": 16}
+
+    async def wait_for_selector(self, selector: str, timeout: int = 0) -> None:
+        self.waited.append(selector)
+
+    async def go_back(self, wait_until: str = "", timeout: int = 0) -> None:
+        self.history.append("back")
+
+    async def go_forward(self, wait_until: str = "", timeout: int = 0) -> None:
+        self.history.append("forward")
+
+    async def reload(self, wait_until: str = "", timeout: int = 0) -> None:
+        self.history.append("reload")
 
     def is_closed(self) -> bool:
         return False
@@ -305,9 +335,10 @@ async def test_dismiss_overlay_is_gone_the_model_clicks_it_itself(wired, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_model_navigation_is_allowlisted_and_paced(wired, monkeypatch):
-    """The model navigates real pages, but only within the research hosts —
-    'full Playwright access' is access to the page, not to the network."""
+async def test_model_navigation_is_unrestricted_and_paced(wired, monkeypatch):
+    """The model navigates anywhere it judges useful — Amazon, a competitor's
+    own site, a forum. There is no host allow-list; the researcher decides
+    where the evidence is (pacing is still applied)."""
     monkeypatch.setenv("BROWSER_ACTION_PACE", "off")
     executor, *_ = wired
     page = _VerbPage()
@@ -320,14 +351,73 @@ async def test_model_navigation_is_allowlisted_and_paced(wired, monkeypatch):
     assert ok.ok, ok.error
     assert page.goto_urls == ["https://www.amazon.co.uk/s?k=grief+journals"]
 
-    refused = await executor.execute(
+    elsewhere = await executor.execute(
         session_id="s1", action="navigate", args={"url": "https://example.com/x"},
     )
-    assert not refused.ok and "allow-listed" in (refused.error or "")
+    assert elsewhere.ok, elsewhere.error
+    assert page.goto_urls[-1] == "https://example.com/x"
 
 
 async def _async(page: Any) -> Any:
     return page
+
+
+@pytest.mark.asyncio
+async def test_full_playwright_surface_is_reachable(wired, monkeypatch):
+    """Every verb a person has is available to the model — including the ones
+    that used to be missing (scroll, hover, select, JS, history, reload) and
+    the generic 'browser' escape hatch."""
+    monkeypatch.setenv("BROWSER_ACTION_PACE", "off")
+    executor, *_ = wired
+    page = _VerbPage()
+    executor.browser.new_page = lambda: _async(page)  # type: ignore[assignment]
+
+    scrolled = await executor.execute(
+        session_id="s1", action="scroll", args={"direction": "down", "amount": 2}
+    )
+    assert scrolled.ok and page.wheels, "a scroll request never moved the page"
+
+    hovered = await executor.execute(
+        session_id="s1", action="hover", args={"target": "Dismiss"}
+    )
+    assert hovered.ok, hovered.error
+
+    selected = await executor.execute(
+        session_id="s1", action="select_option",
+        args={"target": "#sort", "value": "price-asc-rank"},
+    )
+    assert selected.ok and page.selected == ["price-asc-rank"], selected.error
+
+    ran = await executor.execute(
+        session_id="s1", action="evaluate",
+        args={"js": "() => document.body.innerText.match(/of ([\\d,]+) results/)[1]"},
+    )
+    assert ran.ok, ran.error
+    assert "30000" in ran.summary, "the JS value never reached the model"
+
+    back = await executor.execute(session_id="s1", action="go_back", args={})
+    assert back.ok and "back" in page.history
+    forward = await executor.execute(session_id="s1", action="go_forward", args={})
+    assert forward.ok and "forward" in page.history
+    reloaded = await executor.execute(session_id="s1", action="reload", args={})
+    assert reloaded.ok and "reload" in page.history
+
+    refreshed = await executor.execute(session_id="s1", action="screenshot", args={})
+    assert refreshed.ok, refreshed.error
+
+    # The generic escape hatch runs the same verbs by name.
+    generic = await executor.execute(
+        session_id="s1", action="browser",
+        args={"op": "scroll", "direction": "up"},
+    )
+    assert generic.ok, generic.error
+    assert len(page.wheels) >= 2
+
+    waited = await executor.execute(
+        session_id="s1", action="wait_for", args={"target": "#s-result-info-bar"}
+    )
+    assert waited.ok, waited.error
+    assert page.waited
 
 
 @pytest.mark.asyncio
