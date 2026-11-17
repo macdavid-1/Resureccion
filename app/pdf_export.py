@@ -44,6 +44,20 @@ _jitless_ok: bool | None = None  # probe once per process
 # that made the renderer die from SIGABRT on the VPS.
 _RENDER_LOCK = threading.Lock()
 
+# Ceilings that guarantee the owner never watches an endless spinner. A
+# 6×9in report renders in about a second on a healthy host (the sidecar's own
+# budget is 90s); these exist for the pathological case — content that makes
+# the renderer stop making progress, or a render still wedged from an earlier
+# attempt. A queued export gives up with a reason instead of waiting forever,
+# and a single render is stopped and reported.
+_RENDER_QUEUE_TIMEOUT = 60
+_RENDER_TIMEOUT = 120
+
+# The export route's own ceiling (queue + up to two attempts + margin). The
+# HTTP response is always produced by this deadline, whatever the renderer
+# does, so the request can never hang.
+EXPORT_DEADLINE_SECONDS = _RENDER_QUEUE_TIMEOUT + 2 * _RENDER_TIMEOUT + 20
+
 
 def logo_file() -> Path | None:
     """The installed app logo (static/logo.png), or None when it is absent.
@@ -1117,13 +1131,22 @@ def _render_to_tmp(job: dict[str, Any]) -> Path:
     try:
         # Serialized: never two renderers at once (peak-memory guard), and a
         # renderer killed by a transient memory squeeze gets ONE retry before
-        # the failure is reported to the owner.
-        with _RENDER_LOCK:
+        # the failure is reported to the owner. Waiting for the lock is BOUNDED:
+        # a render wedged from an earlier attempt must not queue every later
+        # export behind it forever.
+        if not _RENDER_LOCK.acquire(timeout=_RENDER_QUEUE_TIMEOUT):
+            raise PdfExportError(
+                "PDF export is busy: another render has been running for more "
+                f"than {_RENDER_QUEUE_TIMEOUT}s and has not finished. Try again "
+                "shortly; if it never clears, restart the app (pm2 restart "
+                "resurreccion) to reset the renderer."
+            )
+        try:
             run_kwargs: dict[str, Any] = {
                 "input": json.dumps(job, ensure_ascii=False).encode("utf-8"),
                 "capture_output": True,
                 # Combined multi-report PDFs are larger than single ones.
-                "timeout": 300,
+                "timeout": _RENDER_TIMEOUT,
             }
             # check=False explicit: the caller inspects returncode and
             # reports the failure itself — a CalledProcessError would hide it.
@@ -1131,6 +1154,8 @@ def _render_to_tmp(job: dict[str, Any]) -> Path:
             if proc.returncode < 0:
                 time.sleep(1.5)
                 proc = subprocess.run(_renderer_cmd(), check=False, **run_kwargs)
+        finally:
+            _RENDER_LOCK.release()
         if proc.returncode < 0:
             name = _signal_name(proc.returncode)
             detail = (
@@ -1154,6 +1179,16 @@ def _render_to_tmp(job: dict[str, Any]) -> Path:
     except PdfExportError:
         pdf_tmp.unlink(missing_ok=True)
         raise
+    except subprocess.TimeoutExpired as exc:
+        # The renderer was stopped, not abandoned: the caller gets a reason AND
+        # the lock is already released, so the next export can run.
+        pdf_tmp.unlink(missing_ok=True)
+        raise PdfExportError(
+            f"PDF render did not finish within {_RENDER_TIMEOUT}s and was "
+            f"stopped. {_node_self_check()}. Retry when the browser is idle; if "
+            "it happens on every report, the host is too slow or short on "
+            "memory for the renderer."
+        ) from exc
     except Exception as exc:
         pdf_tmp.unlink(missing_ok=True)
         raise PdfExportError(f"PDF export failed: {exc}") from exc
@@ -1270,7 +1305,12 @@ def export_reports(
     labels: list[str] = []
     first_resolved: dict[str, Any] = {}
     for i, m in enumerate(models):
-        resolved = {**m, "figures": _resolve_figures(session_id, m, artifacts)}
+        resolved = {
+            **m,
+            "figures": _resolve_figures(
+                session_id, m, artifacts, extra=ai_figure_artifacts(m)
+            ),
+        }
         _, session_name, r_blocks = model_to_blocks(resolved)
         label = session_name or f"Report {i + 1}"
         labels.append(label)

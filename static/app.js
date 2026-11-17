@@ -1096,13 +1096,58 @@
       : "Follow-up research started from the previous run's record");
   }
 
+  // The server bounds its own PDF work (EXPORT_DEADLINE_SECONDS = 320s); this
+  // sits just above it, so the owner gets the SERVER's reason rather than a
+  // generic client abort. Together they mean an export can never leave a
+  // spinner running forever.
+  const EXPORT_TIMEOUT_MS = 335000;
+  const DOWNLOAD_TIMEOUT_MS = 120000;
+
+  // Run `make(signal)` with a hard deadline. An aborted request becomes a
+  // clear message instead of a promise that never settles.
+  async function withTimeout(make, ms, message) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      return await make(ctrl.signal);
+    } catch (e) {
+      if (ctrl.signal.aborted) throw new Error(message);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // A working spinner: the label counts seconds, so a long export is visibly
+  // alive. Returns the restore function the caller runs in `finally`.
+  function busyButton(btn, label) {
+    const original = btn.textContent;
+    btn.disabled = true;
+    const started = Date.now();
+    const paint = () => {
+      const secs = Math.round((Date.now() - started) / 1000);
+      btn.innerHTML = `<span class="spinner"></span> ${label}${secs >= 3 ? ` ${secs}s` : ""}`;
+    };
+    paint();
+    const timer = setInterval(paint, 1000);
+    return () => {
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = original;
+    };
+  }
+
   // Authenticated file download: fetch WITH the header token, then hand the
   // browser a blob URL. A plain <a href> download depends on the HttpOnly
   // cookie being present AND on the browser honouring `download` for a
   // programmatic click — on a phone that silently does nothing, which is how
   // "export" can report success while no file ever arrives.
-  async function downloadArtifact(url, filename) {
-    const res = await fetch(url, { headers: authHeaders() });
+  async function downloadArtifact(url, filename, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
+    const res = await withTimeout(
+      (signal) => fetch(url, { headers: authHeaders(), signal }),
+      timeoutMs,
+      "The file download timed out — check your connection and try again.",
+    );
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail ?? detail; } catch {}
@@ -1122,14 +1167,18 @@
     // Default: every report of this session in ONE combined PDF. Ticking
     // "separate" opts into one PDF per report.
     const separate = btn.closest(".spread")?.querySelector(".rep-pdf-separate")?.checked === true;
-    const label = btn.textContent;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Rendering…';
+    const done = busyButton(btn, "Rendering…");
     try {
-      const res = await api(`/api/sessions/${sid}/reports/export-pdf`, {
-        method: "POST",
-        body: JSON.stringify({ separate }),
-      });
+      const res = await withTimeout(
+        (signal) => api(`/api/sessions/${sid}/reports/export-pdf`, {
+          method: "POST",
+          body: JSON.stringify({ separate }),
+          signal,
+        }),
+        EXPORT_TIMEOUT_MS,
+        "The export timed out before the server finished. Try again — if it "
+          + "keeps failing, download the report as markdown instead.",
+      );
       for (const p of res.pdfs || []) {
         await downloadArtifact(
           `/api/sessions/${sid}/artifacts/${p.pdf.id}/file`,
@@ -1142,18 +1191,23 @@
     } catch (e) {
       toast(e.message);
     } finally {
-      btn.disabled = false;
-      btn.textContent = label;
+      done();
     }
   }
 
   async function exportPdf(sid, rid) {
     const btn = $("#rep-pdf");
-    const label = btn.textContent;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Rendering…';
+    const done = busyButton(btn, "Rendering…");
     try {
-      const res = await api(`/api/sessions/${sid}/reports/${rid}/export-pdf`, { method: "POST" });
+      const res = await withTimeout(
+        (signal) => api(`/api/sessions/${sid}/reports/${rid}/export-pdf`, {
+          method: "POST",
+          signal,
+        }),
+        EXPORT_TIMEOUT_MS,
+        "The export timed out before the server finished. Try again — if it "
+          + "keeps failing, download the report as markdown instead.",
+      );
       await downloadArtifact(
         `/api/sessions/${sid}/artifacts/${res.pdf.id}/file`,
         res.pdf.path ? res.pdf.path.split("/").pop() : "report.pdf",
@@ -1162,8 +1216,7 @@
     } catch (e) {
       toast(e.message);
     } finally {
-      btn.disabled = false;
-      btn.textContent = label;
+      done();
     }
   }
 

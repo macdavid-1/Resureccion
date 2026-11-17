@@ -39,6 +39,16 @@ const INK = "#111318";
 const INK_2 = "#4b5162";
 const LINE = "#d8dce8";
 
+// A 6in page holds a handful of readable columns. Past this, the computed
+// column widths collapse toward zero and PDFKit's line breaker stops making
+// progress: a wide table (100+ columns) froze an export for minutes. The
+// overflow is folded into the last column as text instead.
+const MAX_TABLE_COLS = 8;
+// Whole-document ceiling. A render that runs past this is not going to finish
+// (pathological content, or a document far too large for one PDF); failing
+// with a reason beats a spinner that never stops.
+const RENDER_BUDGET_MS = 90000;
+
 const SERIF = "Times-Roman";
 const SERIF_BOLD = "Times-Bold";
 const SERIF_ITAL = "Times-Italic";
@@ -194,8 +204,20 @@ class Renderer {
     this.y += 21;
   }
 
+  /** At most MAX_TABLE_COLS cells: extra cells are folded into the last one. */
+  fitColumns(cells) {
+    const out = cells.slice(0, MAX_TABLE_COLS - 1);
+    const rest = cells.slice(MAX_TABLE_COLS - 1);
+    if (rest.length === 1) out.push(rest[0]);
+    else if (rest.length > 1) out.push(rest.join(" · "));
+    return out;
+  }
+
   table(head, rows) {
     const d = this.doc;
+    if (!head.length) return;
+    head = this.fitColumns(head);
+    rows = rows.map((r) => this.fitColumns(r));
     const cols = head.length;
     if (!cols) return;
     const totalW = PAGE_W - 2 * MARGIN;
@@ -212,7 +234,10 @@ class Renderer {
     const sum = weights.reduce((a, b) => a + b, 0) || 1;
     const widths = weights.map((w) => Math.max(40, (w / sum) * totalW));
     const scale = totalW / widths.reduce((a, b) => a + b, 0);
-    const W = widths.map((w) => w * scale);
+    // Every column keeps a usable width: a width at or below zero makes the
+    // line breaker loop instead of wrapping.
+    const minW = Math.min(60, totalW / (cols * 2));
+    const W = widths.map((w) => Math.max(minW, Math.min(w * scale, totalW)));
 
     const rowH = (cells) => {
       let h = 12;
@@ -332,9 +357,13 @@ class Renderer {
 
   run(blocks) {
     this.cover();
+    const deadline = Date.now() + RENDER_BUDGET_MS;
     let orderedIdx = 0;
     for (const b of blocks || []) {
       if (!b || !b.t) continue;
+      if (Date.now() > deadline) {
+        fail(4, `render exceeded its ${Math.round(RENDER_BUDGET_MS / 1000)}s budget — the report is too large for a single PDF`);
+      }
       orderedIdx = b.t === "oli" ? orderedIdx + 1 : 0;
       switch (b.t) {
         case "h1": this.heading(plain(b.x), 1); break;

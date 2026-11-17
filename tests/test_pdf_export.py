@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -275,6 +276,109 @@ class TestRealRender:
         data = Path(json.loads(json.dumps(result["pdf"]))["path"]).read_bytes()
         pages = len(re.findall(rb"/Type\s*/Page[^s]", data))
         assert pages > 10, f"long report only produced {pages} pages"
+
+
+class TestNoHang:
+    """The export must always finish: bad content, a stuck renderer and a busy
+    renderer all end in a PDF or a clear reason — never an endless spinner."""
+
+    @pytest.mark.skipif(not node_available(), reason="node/pdfkit sidecar unavailable")
+    def test_absurdly_wide_table_renders_quickly(self, db, config, session):
+        """A table with many columns used to spin the renderer for minutes
+        (zero-width columns stop PDFKit's line breaker); columns are capped and
+        folded now, so the export still completes."""
+        from app.artifacts import ArtifactStore
+
+        cols = 150
+        model = _minimal_model()
+        model["ai_report"] = {
+            "markdown": (
+                "| " + " | ".join(f"col{i}" for i in range(cols)) + " |\n"
+                + "|" + "---|" * cols + "\n"
+                + "| " + " | ".join(f"value {i}" for i in range(cols)) + " |"
+            ),
+            "figures": [], "evidence_ids": [], "words": 20, "removed_numbers": [],
+        }
+        started = time.time()
+        result = export_pdf(
+            db, config, session, model=model, artifacts=ArtifactStore(db, config)
+        )
+        assert result["bytes"] > 1500
+        assert time.time() - started < 20, "a wide table made the renderer spin"
+
+    def test_a_wedged_render_does_not_queue_later_exports_forever(
+        self, db, config, session, monkeypatch
+    ):
+        """Waiting for the render lock is bounded: a render still stuck from an
+        earlier attempt yields a reason instead of a request that never ends."""
+        import app.pdf_export as pex
+        from app.artifacts import ArtifactStore
+
+        monkeypatch.setattr(pex, "_RENDER_QUEUE_TIMEOUT", 0.05)
+        assert pex._RENDER_LOCK.acquire(timeout=1)  # simulate the wedged render
+        try:
+            started = time.time()
+            with pytest.raises(PdfExportError, match="busy"):
+                export_pdf(db, config, session, model=_minimal_model(),
+                           artifacts=ArtifactStore(db, config))
+            assert time.time() - started < 5
+        finally:
+            pex._RENDER_LOCK.release()
+
+    def test_a_hung_renderer_is_stopped_and_reported(
+        self, db, config, session, monkeypatch
+    ):
+        """A renderer that never returns is stopped, reported, and its lock is
+        released so the next export can run."""
+        import subprocess as sp
+
+        import app.pdf_export as pex
+        from app.artifacts import ArtifactStore
+
+        monkeypatch.setattr(pex, "_RENDER_TIMEOUT", 0.2)
+
+        def never_returns(cmd, **kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout") or 0)
+
+        monkeypatch.setattr(pex.subprocess, "run", never_returns)
+        started = time.time()
+        with pytest.raises(PdfExportError, match="did not finish"):
+            export_pdf(db, config, session, model=_minimal_model(),
+                       artifacts=ArtifactStore(db, config))
+        assert time.time() - started < 10
+        assert pex._RENDER_LOCK.acquire(blocking=False), "render lock was leaked"
+        pex._RENDER_LOCK.release()
+        assert not [p for p in ArtifactStore(db, config).session_dir(session)
+                    .glob(".pdf-*.tmp")]
+
+    def test_export_endpoint_always_answers_when_the_render_stalls(
+        self, client, monkeypatch
+    ):
+        """The route has its own deadline: a stalled render becomes a 503 with
+        a reason instead of a request that hangs forever."""
+        import app.pdf_export as pex
+
+        st = client.app.state
+        s = st.sessions.create(mode="prompt", prompt="deadline probe", objective="o")
+        rep = st.reports.save(
+            s.id, kind="final", title="Deadline probe", body_markdown="# probe"
+        )
+        st.reports.save_model_json(
+            s.id, report=rep, model_json=json.dumps({"session": {"id": s.id}})
+        )
+        monkeypatch.setattr(pex, "EXPORT_DEADLINE_SECONDS", 0.05)
+
+        def stalls(*args, **kwargs):
+            time.sleep(2)
+
+        monkeypatch.setattr(pex, "export_pdf", stalls)
+        res = client.post("/api/auth/login", json={"username": "owner", "password": "hunter2"})
+        h = {"X-Auth-Token": res.json()["token"]}
+        started = time.time()
+        res = client.post(f"/api/sessions/{s.id}/reports/{rep.id}/export-pdf", headers=h)
+        assert res.status_code == 503
+        assert "took longer" in res.json()["detail"]
+        assert time.time() - started < 2
 
 
 class TestFailureSafety:

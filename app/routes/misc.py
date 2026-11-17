@@ -1,6 +1,7 @@
 """Routes for events, uploads, artifacts, reports, exports."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -54,6 +55,22 @@ def _st(request: Request) -> Any:
 def _session_or_404(request: Request, session_id: str) -> None:
     if _st(request).sessions.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
+
+
+def _log_export_failure(st: Any, session_id: str, action: str, reason: Any) -> None:
+    """Record WHY an export did not produce a PDF, in the session's own trace.
+
+    The owner only ever sees this through the UI, so a failed export must be
+    as auditable as a successful one: the reason (renderer refused, timed out,
+    busy) lands next to the research it belongs to.
+    """
+    try:
+        st.events.append(
+            session_id, level="warn", actor="system", action=action,
+            detail={"reason": str(reason)[:400]},
+        )
+    except Exception:
+        pass  # never let bookkeeping replace the real error
 
 
 def _report_model(request: Request, session_id: str, rep: Any) -> dict[str, Any]:
@@ -435,19 +452,38 @@ async def export_report_pdf(session_id: str, report_id: str, request: Request) -
     rep = st.reports.get(session_id, report_id)
     if rep is None:
         raise HTTPException(status_code=404, detail="report not found")
-    model = _report_model(request, session_id, rep)
-    from app.pdf_export import PdfExportError, export_pdf
+    # The model may have to be rebuilt from durable state; that is heavy
+    # synchronous work, so it runs in the worker thread too — a slow rebuild
+    # must never freeze the event loop (and every other tab with it).
+    model = await run_in_threadpool(_report_model, request, session_id, rep)
+    from app.pdf_export import EXPORT_DEADLINE_SECONDS, PdfExportError, export_pdf
 
     try:
         # Rendered in a worker thread: PDFKit blocks for seconds on a large
         # report, and doing that on the event loop froze the whole app —
-        # frames, SSE and every other request stalled for the duration.
-        result = await run_in_threadpool(
-            export_pdf,
-            st.db, st.config, session_id,
-            model=model, artifacts=st.artifacts,
+        # frames, SSE and every other request stalled for the duration. The
+        # deadline means the request ALWAYS answers: a renderer that will not
+        # finish is reported, never waited on forever.
+        result = await asyncio.wait_for(
+            run_in_threadpool(
+                export_pdf,
+                st.db, st.config, session_id,
+                model=model, artifacts=st.artifacts,
+            ),
+            timeout=EXPORT_DEADLINE_SECONDS,
         )
+    except asyncio.TimeoutError as exc:
+        _log_export_failure(st, session_id, "report_pdf_export_timeout", EXPORT_DEADLINE_SECONDS)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"PDF export took longer than {EXPORT_DEADLINE_SECONDS}s and was "
+                "reported as failed so it could not hang the app. Retry when "
+                "nothing else is running on the server."
+            ),
+        ) from exc
     except PdfExportError as exc:
+        _log_export_failure(st, session_id, "report_pdf_export_failed", str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     st.events.append(
         session_id, level="info", actor="system", action="report_pdf_exported",
@@ -477,7 +513,7 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
     models = []
     for r in reports:
         try:
-            models.append(_report_model(request, session_id, r))
+            models.append(await run_in_threadpool(_report_model, request, session_id, r))
         except HTTPException as exc:
             if exc.status_code == 404:
                 continue  # nothing to render from this report
@@ -485,15 +521,29 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
         chosen.append(r)
     if not chosen:
         raise HTTPException(status_code=404, detail="no reports with a stored model")
-    from app.pdf_export import PdfExportError, export_reports
+    from app.pdf_export import EXPORT_DEADLINE_SECONDS, PdfExportError, export_reports
 
     try:
-        result = await run_in_threadpool(
-            export_reports,
-            st.db, st.config, session_id,
-            models=models, artifacts=st.artifacts, separate=body.separate,
+        result = await asyncio.wait_for(
+            run_in_threadpool(
+                export_reports,
+                st.db, st.config, session_id,
+                models=models, artifacts=st.artifacts, separate=body.separate,
+            ),
+            timeout=EXPORT_DEADLINE_SECONDS,
         )
+    except asyncio.TimeoutError as exc:
+        _log_export_failure(st, session_id, "reports_pdf_export_timeout", EXPORT_DEADLINE_SECONDS)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"PDF export took longer than {EXPORT_DEADLINE_SECONDS}s and was "
+                "reported as failed so it could not hang the app. Retry when "
+                "nothing else is running on the server."
+            ),
+        ) from exc
     except PdfExportError as exc:
+        _log_export_failure(st, session_id, "reports_pdf_export_failed", str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     st.events.append(
         session_id, level="info", actor="system", action="reports_pdf_exported",
