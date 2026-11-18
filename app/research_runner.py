@@ -43,7 +43,6 @@ from app.final_dive import (
     FinalCandidateDive,
     order_for_marketplace,
 )
-from app.frontier import AutocompleteFrontier, seeds_for_session
 from app.integrity import KIND_SYNTHESIS, IntegrityAssessmentStore
 from app.kdp_risk import record_keyword_screening, screen_keywords
 from app.market_memory import MarketMemoryStore, harvest_session
@@ -84,6 +83,7 @@ from app.model_client import (
     _extract_json,
 )
 from app.owner_messages import OwnerMessageStore
+from app.product_rules import screen_niche
 from app.prompts import build_system_prompt, build_user_prompt
 from app.quality_gates import QualityGateRunner
 from app.record_edits import RECORD_ACTIONS, RecordEditError, RecordEditor
@@ -832,11 +832,13 @@ class ResearchRunner:
                 marketplace_text([m.code for m in marketplaces], marketplace_mode),
             )
 
-            # 0.5 Deterministic discovery preflight — the census (what the
-            # market actually looks like) and the autocomplete frontier (what
-            # buyers actually type), gathered BEFORE the model opines so
-            # Phase 1 reasons over measurements instead of its imagination.
-            # Durable: a resumed session reuses it and never re-walks.
+            # 0.5 Deterministic discovery preflight — the census of what the
+            # market actually looks like (charts, browse-node categories),
+            # gathered BEFORE the model opines so Phase 1 reasons over
+            # measurements instead of its imagination. It generates no
+            # keywords: phrases come from the model's own searches,
+            # autocomplete calls and KDSpy reads. Durable: a resumed session
+            # reuses it and never re-walks.
             await self._discovery_preflight(session_id, session, marketplaces)
             # Initialization is done (plan + preflight): research is now
             # doing model-visible work — the durable job row follows.
@@ -1126,7 +1128,7 @@ class ResearchRunner:
                 pass
         iteration = start_iteration
         # Deterministic deep-discovery inputs for this phase's prompts
-        # (census, frontier, market memory, headroom ordering, adjacency).
+        # (census map, market memory, headroom ordering, adjacency).
         discovery = self._discovery_digest(session_id, prior_outputs)
         # Owner reference images: prepared once per run, attached to every
         # model call so an image-only or image-steered brief stays visible
@@ -1220,7 +1222,6 @@ class ResearchRunner:
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
                 census_digest=discovery.get("census") or None,
-                frontier_terms=discovery.get("frontier") or None,
                 market_memory=discovery.get("memory") or None,
                 headroom_priority=discovery.get("priority") or None,
                 adjacency_note=discovery.get("adjacency") or "",
@@ -1869,6 +1870,13 @@ class ResearchRunner:
                         n["candidate_id"] = sibling.id
                         existing_niche_ids[key] = sibling.id
                         continue
+                    if self._hard_rule_block(
+                        session_id, str(n["niche"]), "niching"
+                    ):
+                        # Refused before it can be researched: it is not a
+                        # candidate and it does not count as output.
+                        n["candidate_id"] = ""
+                        continue
                     c = self.candidates.create(
                         session_id,
                         niche=str(n["niche"])[:200],
@@ -2287,20 +2295,26 @@ class ResearchRunner:
         mult = max(1, int(getattr(self.config, "depth_evidence_multiplier", 1) or 1))
         return int(min_evidence) * mult
 
-    # ---------------------------------- census + autocomplete frontier
+    # --------------------------------------------------------- census
     async def _discovery_preflight(
         self, session_id: str, session: Any, marketplaces: list[Marketplace]
     ) -> None:
-        """Deterministic preflight: walk the market (census), then mine what
-        buyers type (autocomplete frontier). Runs BEFORE Phase 1 so discovery
-        reasons over measurements, and runs ONCE per session — the durable
-        checkpoint makes a resumed session reuse it instead of re-walking.
+        """Deterministic preflight: walk the market's charts and browse nodes.
 
-        A CONTINUATION skips it. Its census, keyword totals and demand
-        language are already in the record this session inherited, and
-        unrolling a fresh broad-market walk before the model has decided
-        anything is precisely the "start a new research from scratch"
-        behaviour a follow-up must not have.
+        Runs BEFORE Phase 1 so discovery reasons over a measured map, and runs
+        ONCE per session — the durable checkpoint makes a resumed session
+        reuse it instead of re-walking.
+
+        It measures CATEGORIES ONLY. It deliberately does not generate
+        keywords, niches or demand phrases: keyword and phrase discovery is
+        the model's work, done live through Amazon's search box (autocomplete),
+        KDSpy's panel and its own searches. Nothing in this preflight decides
+        what the run will research.
+
+        A CONTINUATION skips it. Its census and keyword totals are already in
+        the record this session inherited, and unrolling a fresh broad-market
+        walk before the model has decided anything is precisely the "start a
+        new research from scratch" behaviour a follow-up must not have.
         """
         if getattr(session, "parent_session_id", None):
             self.checkpoints.save(
@@ -2329,42 +2343,32 @@ class ResearchRunner:
             return
         cfg = self.config
         census_out: dict[str, Any] = {}
-        frontier_out: dict[str, Any] = {}
         # A pause or cancel stops the walk via `should_stop` — a PARTIALLY
         # measured map must never be recorded as `done`, or a resumed session
-        # would treat it as the full map and never re-walk. Each half that
-        # finished cleanly is cached on its own checkpoint, so an interrupt
-        # during the frontier still reuses the finished census (and vice
-        # versa) instead of paying for the whole walk twice.
+        # would treat it as the full map and never re-walk.
         try:
             ccp = self.checkpoints.get_safe(session_id, "discovery_preflight_census")
             if ccp is not None and not (ccp.payload or {}).get("error"):
                 census_out = dict(ccp.payload or {})
         except Exception:
             census_out = {}
-        try:
-            fcp = self.checkpoints.get_safe(session_id, "discovery_preflight_frontier")
-            if fcp is not None and not (fcp.payload or {}).get("error"):
-                frontier_out = dict(fcp.payload or {})
-        except Exception:
-            frontier_out = {}
 
         interrupted = self._cancelled or self._pause_requested
         will_census = bool(cfg.census_enabled) and not census_out and not interrupted
-        will_frontier = bool(cfg.frontier_enabled) and not frontier_out and not interrupted
-        if will_census or will_frontier:
+        if will_census:
             # Owner visibility: this can take a few minutes on a 2-core box,
             # so it must never look like a hung session.
             self.agent.transition(session_id, "exploring", substate="discovery_preflight")
             self.events.append(
                 session_id, level="info", actor="system",
                 action="discovery_preflight_started",
-                detail={"census": bool(cfg.census_enabled), "frontier": bool(cfg.frontier_enabled)},
+                detail={"census": bool(cfg.census_enabled)},
             )
             self.trace.record(
                 session_id, KIND_DISCOVERY,
-                "Gathering the measured map first: category census + autocomplete "
-                "demand-language frontier (deterministic backend work, no model)",
+                "Measuring the store map first: bestseller charts and browse-node "
+                "categories (deterministic backend work, no model) — keyword "
+                "research itself is the model's, done live",
             )
 
         if will_census:
@@ -2400,47 +2404,6 @@ class ResearchRunner:
                     message=str(exc)[:300], recoverable=True,
                 )
 
-        if will_frontier:
-            try:
-                seeds = seeds_for_session(
-                    session.prompt or "",
-                    session.objective or "",
-                    census_categories=census_out.get("category_names") or [],
-                )
-                frontier = AutocompleteFrontier(
-                    self.browser,
-                    self.executor.collector.evidence_store,
-                    self.events,
-                    max_queries=cfg.frontier_max_queries,
-                    max_depth=cfg.frontier_max_depth,
-                    time_budget_seconds=cfg.frontier_time_budget_seconds,
-                    should_stop=lambda: self._cancelled or self._pause_requested,
-                )
-                fres = await frontier.run(
-                    session_id=session_id,
-                    marketplaces=marketplaces,
-                    seeds=seeds,
-                )
-                frontier_out = fres.to_dict()
-                dropped = sum(fres.rejected.values())
-                self.trace.record(
-                    session_id, KIND_DISCOVERY,
-                    f"Autocomplete frontier: {len(fres.terms)} demand-language "
-                    f"phrase(s) kept from {fres.queries_run} suggestion query(ies), "
-                    f"{dropped} screened out (roots, noise, drift) "
-                    f"({fres.stopped_reason})",
-                )
-                if not (self._cancelled or self._pause_requested) and "error" not in frontier_out:
-                    self.checkpoints.save(
-                        session_id, "discovery_preflight_frontier", frontier_out
-                    )
-            except Exception as exc:
-                frontier_out = {"error": str(exc)[:200]}
-                self.errors.record(
-                    session_id, scope="frontier", severity="warning",
-                    message=str(exc)[:300], recoverable=True,
-                )
-
         # Durable, atomic: on resume the preflight is REUSED, never repeated.
         # `done` is set only when the walk was NOT interrupted — a paused or
         # cancelled run leaves it False so the resumed session re-walks the
@@ -2452,7 +2415,6 @@ class ResearchRunner:
             {
                 "done": not stopped,
                 "census": census_out,
-                "frontier": frontier_out,
                 "at": iso_now(),
             },
         )
@@ -2467,29 +2429,16 @@ class ResearchRunner:
             c for c in (census.get("categories") or []) if isinstance(c, dict)
         ][:30]
 
-    def _frontier_terms(self, session_id: str) -> list[str]:
-        try:
-            cp = self.checkpoints.get_safe(session_id, "discovery_preflight")
-            frontier = (cp.payload or {}).get("frontier") or {} if cp else {}
-        except Exception:
-            return []
-        return [
-            str(t) for t in (frontier.get("terms") or [])
-            if isinstance(t, str) and t.strip()
-        ][:60]
-
     def _discovery_digest(self, session_id: str, prior_outputs: dict[str, Any]) -> dict[str, Any]:
         """Everything deterministic the model should see this phase: the
-        census map, the demand language, cross-session memory, the headroom
-        ordering and the latest adjacency round. Empty sections are omitted
-        so a lean run's prompts stay lean."""
+        census map, cross-session memory, the headroom ordering and the latest
+        adjacency round. Empty sections are omitted so a lean run's prompts
+        stay lean. No keywords are generated here: they come from the model's
+        own live searches, autocomplete and KDSpy reads."""
         out: dict[str, Any] = {}
         census = self._census_categories(session_id)
         if census:
             out["census"] = census
-        terms = self._frontier_terms(session_id)
-        if terms:
-            out["frontier"] = terms
         memory = self._memory_digest(session_id)
         if memory:
             out["memory"] = memory
@@ -2653,7 +2602,6 @@ class ResearchRunner:
             neighbors = gather_neighbors(
                 candidates=[c for c in cands if c.status != "rejected"],
                 evidence_records=rows,
-                frontier_terms=self._frontier_terms(session_id),
                 exclude_niches=known,
                 limit=24,
             )
@@ -2720,6 +2668,8 @@ class ResearchRunner:
                         ][:8],
                         "chain": [nb.parent_niche, nb.term],
                     })
+                    if self._hard_rule_block(session_id, nb.term, "adjacency"):
+                        continue
                     self.candidates.create(
                         session_id,
                         niche=nb.term[:200],
@@ -2936,6 +2886,8 @@ class ResearchRunner:
                 reason="candidate_capacity",
             )
         for f in fresh[: self.rc.max_candidates]:
+            if self._hard_rule_block(session_id, f["niche"], phase):
+                continue
             meta: dict[str, Any] = {
                 "via": phase,
                 "analysis_field": f["field"],
@@ -4106,6 +4058,29 @@ class ResearchRunner:
     def _marketplace_mode(self, session_id: str) -> str:
         cp = self.checkpoints.get(session_id, "marketplace_plan")
         return str(cp.payload.get("mode")) if cp else "auto"
+
+    def _hard_rule_block(self, session_id: str, niche: str, where: str) -> str:
+        """Refuse a niche that breaks a project hard rule. Returns "" if fine.
+
+        Journals/logbooks and generic markets never become candidates: the
+        check runs at every creation site (phase niches, adjacency promotions,
+        backfill from analyses) so no research time is spent on a book the
+        owner may not write. The refusal is recorded where the owner can see
+        it, and the model meets the reason in its next prompt.
+        """
+        reason = screen_niche(niche)
+        if not reason:
+            return ""
+        self.events.append(
+            session_id, level="warn", actor="system",
+            action="niche_refused_by_hard_rule",
+            detail={"niche": niche[:200], "where": where, "reason": reason[:300]},
+        )
+        self.trace.record(
+            session_id, KIND_CANDIDATE,
+            f"Refused {niche[:110]!r}: {reason[:160]}",
+        )
+        return reason
 
     def _find_candidate_by_niche(
         self, session_id: str, niche: str, *, verified_only: bool = False

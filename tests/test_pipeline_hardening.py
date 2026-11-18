@@ -343,7 +343,7 @@ async def test_shortened_opportunity_niche_still_reaches_its_candidate(db, confi
 
     script = _script()
     script["opportunity_synthesis"][0]["opportunities"][0]["niche"] = (
-        "sudden-loss grief journals"
+        "sudden-loss grief memoirs"
     )
     runner = make_runner(db, config, ScriptedModel(script))
     await runner.run(session)
@@ -426,7 +426,7 @@ async def test_backend_owned_fields_are_not_demanded_from_the_model(db, config, 
     opps = OpportunityStore(db).list(session)
     assert len(opps) == 1
     assert opps[0].meta["verification_status"] == "verified"
-    assert opps[0].meta["parent_market"] == "grief journals"
+    assert opps[0].meta["parent_market"] == "grief memoirs"
 
 
 def test_reapplying_committed_synthesis_never_duplicates(db, config, session):

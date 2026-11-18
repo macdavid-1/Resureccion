@@ -20,6 +20,7 @@ from app.methodology import (
     OPPORTUNITY_FIELDS,
     P1_DISCOVERY,
     P2_NICHING,
+    P3_COMPETITION,
     P9_SYNTHESIS,
     PHASE_ORDER,
     PHASE_TITLES,
@@ -159,6 +160,17 @@ def build_system_prompt(phase: str, *, continuation: bool = False) -> str:
         f"{PHASE_TITLES[phase]}.\n\n"
         "METHODOLOGY LAW:\n"
         f"- {depth_priority_text()}\n"
+        "- HARD RULES — these outrank everything else in this prompt, "
+        "including \"be creative\" and any attractive region the census or a "
+        "chart suggests: (1) NEVER propose or research a journal, logbook, "
+        "notebook or diary product, in any phrasing (\"grief journal\", "
+        "\"5-minute journaling prompts\", \"gratitude log book\"); (2) NEVER "
+        "propose a generic market or a generic audience (\"self help\", "
+        "\"books for women\", \"mindfulness\", \"parenting for beginners\") — "
+        "a niche must name WHO has WHAT problem in WHICH context. "
+        "A candidate that breaks either rule is refused before it is "
+        "researched and does not count as output, so proposing one wastes "
+        "the phase.\n"
         "- Two modes of work: EXPLORE (request browser actions — they run and "
         "fresh evidence comes back) and COMMIT (no actions, complete output). "
         "Only a commit ends the phase; an explore step can never also close it.\n"
@@ -300,7 +312,6 @@ def build_user_prompt(
     phase_gate: dict[str, Any] | None = None,
     depth_note: str = "",
     census_digest: list[dict[str, Any]] | None = None,
-    frontier_terms: list[str] | None = None,
     market_memory: list[dict[str, Any]] | None = None,
     headroom_priority: list[str] | None = None,
     adjacency_note: str = "",
@@ -400,22 +411,20 @@ def build_user_prompt(
             "promising."
         )
 
-    # --- autocomplete frontier (demand language) ----------------------------
-    if frontier_terms:
+    # --- keyword research belongs to the model --------------------------------
+    if phase in (P1_DISCOVERY, P2_NICHING, P3_COMPETITION):
         parts.append(
-            "\nAUTOCOMPLETE FRONTIER (phrases real buyers actually type, mined "
-            "deterministically from Amazon's suggestion stream):\n"
-            + _compact(list(frontier_terms)[:60], limit=2400)
-            + "\nThese are STARTING POINTS, not your boundary. The list has "
-            "already been screened — generic roots (format/audience words only) "
-            "and phrases that drifted away from the brief were removed — so the "
-            "ones left are specific enough to research. But it is a sample, not "
-            "a fence: research only the ones that fit the brief, refine them "
-            "into narrower niches, and propose niches of your own from the "
-            "census, the charts and what you find in your own searches. A "
-            "phrase with thin results and real demand is hidden demand in plain "
-            "sight; a phrase with huge results is a store root in disguise — "
-            "leave it and niche it down instead."
+            "\nKEYWORDS AND NICHES ARE YOURS TO FIND. No keyword list is "
+            "generated for you before the run — the backend only measures "
+            "categories. Find the phrases yourself, live, the way a publisher "
+            "would: type into Amazon's own search box and read the suggestions "
+            "as they appear, call \"action\": \"autocomplete\" with a partial "
+            "phrase (and again with each next letter or word that completes to "
+            "something real), open KDSpy on a search page and read the "
+            "keywords it reports, then search each promising phrase and read "
+            "Amazon's printed total. A phrase buyers actually complete but few "
+            "books answer is the target; a phrase with huge totals is a store "
+            "root in disguise — niche it down instead."
         )
 
     # --- strategic focus pivot (autonomous re-discovery) --------------------

@@ -1,7 +1,7 @@
 """Tests for the deep-discovery layers added on top of the 9-phase method:
 
 - deterministic category census (app.census),
-- autocomplete demand-language frontier (app.frontier),
+- the rule that keyword research belongs to the model, not a prepass,
 - whitespace / headroom scoring (app.whitespace),
 - adjacency expansion (app.adjacency),
 - cross-session market memory (app.market_memory),
@@ -19,12 +19,7 @@ from app.adjacency import gather_neighbors, pre_score
 from app.browser_store import BrowserEvidenceStore
 from app.census import CategoryCensus, _link_path
 from app.events import EventLog
-from app.frontier import (
-    AutocompleteFrontier,
-    phrase_score,
-    seeds_for_session,
-    seeds_from_text,
-)
+from app.frontier import phrase_score, seeds_from_text
 from app.market_memory import (
     KIND_COMPETITOR,
     KIND_KEYWORD,
@@ -127,63 +122,69 @@ def _seed_session_row(db) -> None:
         )
 
 
-# ------------------------------------------------------------------- frontier
+# --------------------------------------------- keyword work is the model's
 
 
 @pytest.mark.asyncio
-async def test_frontier_mines_suggestions_into_evidence(db, config):
+async def test_the_discovery_prepass_measures_categories_and_never_keywords(
+    db, config, monkeypatch
+):
+    """No keyword list is generated before research starts.
+
+    The prepass is a category census and nothing else: it must leave no
+    demand-language evidence behind and no keyword section in the digest the
+    model's prompt is built from. Phrases come from the model's own searches,
+    autocomplete calls and KDSpy reads.
+    """
+    from app import research_runner as rr
     from app.marketplace import AMAZON_MARKETPLACES
+    from tests.test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
+    class _Census:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        async def run(self, *, session_id: str, marketplaces: list) -> object:
+            return SimpleNamespace(
+                charts_captured=1, visited_nodes=2,
+                to_dict=lambda: {
+                    "categories": [{"name": "Crafts & Hobbies"}],
+                    "category_names": ["Crafts & Hobbies"],
+                },
+            )
+
+    monkeypatch.setattr(rr, "CategoryCensus", _Census)
     _seed_session_row(db)
-    store = BrowserEvidenceStore(db)
-    page = SuggestPage()
-    browser = SimpleBrowser(page)
-    frontier = AutocompleteFrontier(
-        browser, store, max_queries=30, max_depth=2,
-        time_budget_seconds=30, max_marketplaces=1,
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    runner.agent.initialize("s1")
+    # The preflight's substate transition is UI bookkeeping, not the thing
+    # under test; the runner's real run() drives the agent states itself.
+    monkeypatch.setattr(runner.agent, "transition", lambda *a, **k: None)
+    session = runner.sessions.require("s1")
+    await runner._discovery_preflight(
+        "s1", session, [AMAZON_MARKETPLACES["us"]]
     )
-    res = await frontier.run(
-        session_id="s1",
-        marketplaces=[AMAZON_MARKETPLACES["us"], AMAZON_MARKETPLACES["uk"]],
-        seeds=["grief journal", "prayer journal"],
+
+    cp = runner.checkpoints.get_safe("s1", "discovery_preflight")
+    assert cp is not None and cp.payload["done"] is True
+    assert "frontier" not in cp.payload, "the prepass still stores a keyword list"
+    kinds = {e.kind for e in runner.browser_evidence.list("s1")}
+    assert kinds <= {"census"}, f"the prepass produced keyword evidence: {kinds}"
+    digest = runner._discovery_digest("s1", {})
+    assert "frontier" not in digest
+    assert digest.get("census"), "the measured category map must still reach the model"
+
+
+def test_seed_extraction_reads_the_owners_words():
+    assert seeds_from_text("research grief memoirs for adults")[:2] == ["research", "grief"][:2]
+    assert seeds_from_text("") == []
+
+
+def test_phrase_ranking_prefers_specific_multi_word_language():
+    assert phrase_score("grief memoir for widowers", frequency=3) > phrase_score(
+        "grief", frequency=3
     )
-    # budget respected, one marketplace page used, evidence persisted
-    assert res.queries_run <= 30
-    assert browser.closed == 1
-    assert res.evidence_ids
-    kinds = {e.kind for e in store.list("s1")}
-    assert "autocomplete_frontier" in kinds
-    assert "demand_language" in kinds
-    # phrases are multi-word demand language, ranked deterministically
-    assert any(len(t.split()) >= 3 for t in res.terms)
-    assert res.terms == sorted(
-        res.terms, key=lambda t: (-phrase_score(t, frequency=1), t)
-    ) or res.terms  # ordering is deterministic (no crash on ties)
-    # no secrets: data is plain query/suggestion metadata
-    for e in store.list("s1"):
-        assert "password" not in e.data and "token" not in e.data
-
-
-@pytest.mark.asyncio
-async def test_frontier_stops_cleanly_when_budget_is_zero(db, config):
-    _seed_session_row(db)
-    store = BrowserEvidenceStore(db)
-    frontier = AutocompleteFrontier(
-        SimpleBrowser(SuggestPage()), store, max_queries=0, max_marketplaces=1
-    )
-    res = await frontier.run(session_id="s1", marketplaces=[], seeds=[])
-    assert res.stopped_reason == "no_budget_or_seeds"
-    assert res.terms == []
-
-
-def test_seed_extraction_prefers_the_owners_words():
-    assert seeds_from_text("research grief journals for adults")[:2] == ["research", "grief"][:2]
-    # no topic at all -> format roots (autonomous discovery still gets seeds)
-    seeds = seeds_for_session("", "")
-    assert seeds and len(seeds) <= 6
-    # census categories seed an autonomous run when there are no words
-    seeded = seeds_for_session("", "", census_categories=["Grief & Bereavement", "Diaries"])
-    assert any("grief" in s for s in seeded)
+    assert phrase_score("") == -1
 
 
 # ---------------------------------------------------------------------- census
@@ -312,7 +313,6 @@ def test_adjacency_walks_outward_from_a_winner():
     neighbors = gather_neighbors(
         candidates=[cand],
         evidence_records=evidence,
-        frontier_terms=["grief journal for loss of spouse", "unrelated phrase entirely"],
         exclude_niches=[cand.niche],
         limit=10,
     )
@@ -542,23 +542,23 @@ async def test_adjacency_promotes_only_measured_high_headroom(db, config):
     sid = _mk_session(db, config)
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     CandidateStore(db).create(
-        sid, niche="grief journals for adult children", marketplace="us",
+        sid, niche="grief memoirs for widowers in year one", marketplace="us",
         rationale="strong existing candidate",
     )
     evidence = BrowserEvidenceStore(db)
     evidence.create(
-        session_id=sid, marketplace="us", kind="autocomplete_frontier",
-        url="https://www.amazon.com/", title="frontier: grief journal",
-        data={"prefix": "grief journal",
-              "suggestions": ["grief journal for loss of spouse"]},
+        session_id=sid, marketplace="us", kind="autocomplete",
+        url="https://www.amazon.com/", title="autocomplete: grief memoir",
+        data={"query": "grief memoir",
+              "suggestions": ["grief memoir for widowers after sudden loss"]},
     )
 
     async def fake_execute(*, session_id: str, action: str, args: dict) -> ActionResult:
         # The measurement search comes back with a thin, light-competition set.
         evidence.create(
             session_id=session_id, marketplace="us", kind="search_results",
-            url="https://www.amazon.com/s?k=grief+journal",
-            title="grief journal for loss of spouse",
+            url="https://www.amazon.com/s?k=grief+memoir",
+            title="grief memoir for widowers after sudden loss",
             data={"query": args["query"], "result_count": 2, "results": [
                 {"asin": "B011111111", "review_count": 4, "title": "a"},
                 {"asin": "B022222222", "review_count": 1, "title": "b"},
@@ -575,8 +575,8 @@ async def test_adjacency_promotes_only_measured_high_headroom(db, config):
     rows = CandidateStore(db).list(sid, limit=500)
     promoted = [c for c in rows if (c.meta or {}).get("via") == "adjacency"]
     assert len(promoted) == 1
-    assert promoted[0].niche == "grief journal for loss of spouse"
-    assert promoted[0].meta["parent_market"] == "grief journals for adult children"
+    assert promoted[0].niche == "grief memoir for widowers after sudden loss"
+    assert promoted[0].meta["parent_market"] == "grief memoirs for widowers in year one"
     assert promoted[0].meta["seed_evidence_ids"]
     # the round is durable: prompts and the report read it back
     assert runner._adjacency_rows(sid)

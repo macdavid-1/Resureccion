@@ -49,7 +49,10 @@ def test_filter_keeps_the_specific_ones_and_counts_the_rest() -> None:
     assert rejected == {"too_generic": 1, "off_niche": 1, "too_broad": 1}
 
 
-def test_the_frontier_prompt_says_the_list_is_a_starting_point() -> None:
+def test_the_discovery_prompt_tells_the_model_to_mine_amazon_itself() -> None:
+    """No keyword list is handed over: the prompt says where the phrases come
+    from (Amazon's search box, its suggestions, KDSpy) and what a phrase has to
+    survive before it is worth researching."""
     from app.methodology import PhaseTiming
     from app.prompts import build_user_prompt
 
@@ -57,18 +60,20 @@ def test_the_frontier_prompt_says_the_list_is_a_starting_point() -> None:
         phase="opportunity_discovery",
         mode="prompt",
         objective="",
-        prompt_text="grief journals for adult children",
+        prompt_text="grief memoirs for adult children",
         marketplaces=["us"],
         marketplace_mode="explicit",
         evidence_digest=[],
         candidates_digest=[],
         prior_phase_outputs=None,
         timing=PhaseTiming(phase="opportunity_discovery", started_at="now"),
-        frontier_terms=["grief journal for adult children"],
     )
-    assert "STARTING POINTS, not your boundary" in text
-    assert "sample, not a fence" in text
-    assert "propose niches of your own" in text
+    assert "KEYWORDS AND NICHES ARE YOURS TO FIND" in text
+    assert "Amazon's own search box" in text
+    assert "KDSpy" in text
+    assert "AUTOCOMPLETE FRONTIER" not in text, (
+        "the backend used to hand over a generated keyword list; it must not"
+    )
 
 
 # --------------------------------------------------- measurement accept/reject

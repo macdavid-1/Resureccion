@@ -374,10 +374,16 @@ filter, a gate or a verification verdict:
   hanging off them, harvesting rank/price/rating/review counts per node. You
   cannot discover a category you never visited; this makes the system visit
   them, and hands the model a measured map instead of its imagination.
-- **Autocomplete frontier** (`app/frontier.py`) — seed → append a–z →
-  deepen, against Amazon's real suggestion endpoint (one page load per
-  marketplace, no login). Completions are literally what buyers type: a
-  long-tail phrase with thin results is hidden demand in plain sight.
+- **Keyword work belongs to the model** — the backend generates no keyword
+  list before research starts. Phrases come from the model typing into
+  Amazon's own search box and reading the suggestions live (or the
+  `autocomplete` action calling the same completion stream), from KDSpy's
+  keyword panel on a search page, and from its own searches' printed totals.
+  `app/frontier.py` keeps only the completion call and the root/drift
+  screening those phrases pass through.
+- **Hard rules** (`app/product_rules.py`) — no journal/logbook/notebook/diary
+  product, and no generic market ("self help", "books for women"). Enforced at
+  candidate creation, in the deterministic filter, and in the prompt.
 - **Whitespace score** (`app/whitespace.py`) — one deterministic
   `demand ÷ competition` number per candidate, computed only from captured
   evidence. It orders the candidate digest (highest headroom gets the next
@@ -386,7 +392,7 @@ filter, a gate or a verification verdict:
   *unmeasured*, never as a fake zero.
 - **Adjacency expansion** (`app/adjacency.py`) — after competition and
   demand work, walk outward from every strong candidate (its autocomplete
-  completions, shared frontier terms, census siblings), measure the most
+  completions, census siblings), measure the most
   promising neighbours with real searches, and promote only what clears
   `ADJACENCY_MIN_WHITESPACE`. Discovery re-entry triggered by SUCCESS rather
   than by total failure, as a step inside the existing phases — P1→P9, the

@@ -295,42 +295,42 @@ def session(db, config) -> str:
 
 PHASE_OUTPUTS: dict[str, list[dict[str, Any]]] = {
     "opportunity_discovery": [{"signals": [
-        {"topic": "grief journals", "audience": "adult children", "marketplace": "us", "source": "search"},
-        {"topic": "prayer journals", "audience": "new believers", "marketplace": "us", "source": "category"},
+        {"topic": "grief memoirs", "audience": "adult children", "marketplace": "us", "source": "search"},
+        {"topic": "prayer devotionals", "audience": "new believers", "marketplace": "us", "source": "category"},
     ], "observations": ["search results show low review depth"]}],
     "aggressive_niching": [{"niches": [
-        {"niche": "sudden-loss grief journals for adult children", "parent_market": "grief journals",
+        {"niche": "sudden-loss grief memoirs for adult children", "parent_market": "grief memoirs",
          "chain": ["grief", "sudden loss"], "demand_hints": "autocomplete shows sustained variants",
          "marketplace": "us"},
-        {"niche": "90-day prayer journals for new believers", "parent_market": "prayer journals",
+        {"niche": "90-day prayer devotionals for new believers", "parent_market": "prayer devotionals",
          "chain": ["prayer"], "demand_hints": "multiple mid-list sellers", "marketplace": "us"},
-        {"niche": "guided divorce recovery journals for men in year one", "parent_market": "divorce recovery",
+        {"niche": "guided divorce recovery handbooks for men in year one", "parent_market": "divorce recovery",
          "chain": ["divorce", "men"], "demand_hints": "rising search variants", "marketplace": "us"},
     ]}],
     "competitive_landscape": [{"competitive_maps": [
-        {"niche": "sudden-loss grief journals", "competitors": ["A", "B", "C"], "saturation": "low",
+        {"niche": "sudden-loss grief memoirs", "competitors": ["A", "B", "C"], "saturation": "low",
          "pricing": "9.99", "patterns": "generic prompts"},
     ]}],
     "consumer_intelligence": [{"consumer_maps": [
-        {"niche": "sudden-loss grief journals", "praises": ["gentle tone"], "complaints": ["no structure"],
+        {"niche": "sudden-loss grief memoirs", "praises": ["gentle tone"], "complaints": ["no structure"],
          "unmet": ["legal checklist"], "design_opportunities": ["estate section"]},
     ]}],
     "demand_validation": [{"demand_assessments": [
-        {"niche": "sudden-loss grief journals", "verdict": "sustained demand", "signals": ["review velocity"],
+        {"niche": "sudden-loss grief memoirs", "verdict": "sustained demand", "signals": ["review velocity"],
          "risks": []},
     ]}],
     "opportunity_gap": [{"gap_analyses": [
-        {"niche": "sudden-loss grief journals", "exists": "generic journals", "sells": "yes",
+        {"niche": "sudden-loss grief memoirs", "exists": "generic memoirs", "sells": "yes",
          "readers_want": "structure", "competitors_fail": "no estate guidance",
          "better": "estate checklist", "why_choose": "only guided option"},
     ]}],
     "cross_market_validation": [{"cross_market_checks": [
-        {"niche": "sudden-loss grief journals", "marketplace": "uk", "verdict": "present", "notes": "fewer titles"},
+        {"niche": "sudden-loss grief memoirs", "marketplace": "uk", "verdict": "present", "notes": "fewer titles"},
     ]}],
     "adversarial_verification": [{"verdicts": []}],
     "opportunity_synthesis": [{"opportunities": [{
-        "niche": "sudden-loss grief journals for adult children",
-        "parent_market": "grief journals",
+        "niche": "sudden-loss grief memoirs for adult children",
+        "parent_market": "grief memoirs",
         "target_reader": "adult children who lost a parent suddenly",
         "reader_problem": "overwhelm",
         "marketplaces": ["us"],
@@ -340,9 +340,9 @@ PHASE_OUTPUTS: dict[str, list[dict[str, Any]]] = {
         "market_gap": "estate guidance",
         "differentiation": "estate checklist",
         "risks": ["narrow"],
-        "keywords": ["grief journal"],
+        "keywords": ["grief memoir"],
         "title_concepts": ["Suddenly Gone"],
-        "positioning": "the organized grief journal",
+        "positioning": "the organized grief memoir",
         "confidence": 0.7,
         "verification_status": "pass",
     }]}],
@@ -570,12 +570,16 @@ def test_string_niches_still_create_candidates(db, config, session):
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     runner._apply_phase_effects(
         session, "aggressive_niching",
-        {"niches": ["swimmer journals", "triathlete logbooks",
-                    {"niche": "dict niche", "marketplace": "us"}, "  "]},
+        {"niches": ["swimmer strength programs", "triathlete race-day playbooks",
+                    {"niche": "coastal marathon training plans", "marketplace": "us"}, "  "]},
     )
     cands = runner.candidates.list(session)
     niches = sorted(c.niche for c in cands)
-    assert niches == ["dict niche", "swimmer journals", "triathlete logbooks"]
+    assert niches == [
+        "coastal marathon training plans",
+        "swimmer strength programs",
+        "triathlete race-day playbooks",
+    ]
 
 
 def test_verdict_with_unknown_id_falls_back_to_its_niche(db, config, session):
@@ -1155,7 +1159,7 @@ async def test_strategic_pivot_reruns_discovery_on_new_focus(db, config, session
     pivoted = [u for u in p1_prompts if "STRATEGIC PIVOT" in u]
     assert plain and pivoted
     assert p1_prompts.index(plain[-1]) < p1_prompts.index(pivoted[0])
-    assert "sudden-loss grief journals for adult children" in pivoted[0]
+    assert "sudden-loss grief memoirs for adult children" in pivoted[0]
 
     # the final report records the pivot: with a model-written report the
     # guarantee is that the pivot is IN the dossier the report writer

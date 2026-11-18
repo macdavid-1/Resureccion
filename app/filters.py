@@ -7,6 +7,9 @@ any filter is rejected WITH its reason recorded as a durable integrity
 assessment — rejection is never silent and never vibes-based.
 
 Filters (per the owner's specification):
+    excluded_niche               the niche breaks a hard rule (journal/logbook
+                                 product, or a generic market rather than a
+                                 niche) — see app.product_rules
     insufficient_evidence        too few evidence pieces touch the candidate
     duplicate_opportunity        near-duplicate of an existing candidate
     overly_broad_market          niche fails specificity requirements
@@ -32,10 +35,12 @@ from typing import Any
 
 from app.claims import CLAIM_UNSUPPORTED
 from app.integrity import KIND_FILTER, IntegrityAssessmentStore
+from app.product_rules import screen_niche
 from app.thresholds import EvidenceThresholds
 
 # Filters that reject outright vs. downgrade to "needs more research".
 HARD_FILTERS = (
+    "excluded_niche",
     "duplicate_opportunity",
     "overly_broad_market",
     "weak_demand",
@@ -137,6 +142,7 @@ class CandidateFilterEngine:
         `claims` are the candidate's Claim objects."""
         results: list[FilterResult] = []
 
+        results.append(self._filter_excluded_niche(candidate))
         results.append(self._filter_insufficient_evidence(evidence_records))
         results.append(self._filter_duplicate(candidate, existing_niches))
         results.append(self._filter_overly_broad(candidate))
@@ -251,6 +257,26 @@ class CandidateFilterEngine:
                 else f"near-duplicate of existing candidate niche {dup!r} (similarity >= 0.7)"
             ),
             metrics={"niche": niche, "duplicate_of": dup or ""},
+        )
+
+    def _filter_excluded_niche(self, candidate: Any) -> FilterResult:
+        """The owner's hard rules, applied to a candidate that slipped through.
+
+        A journal/logbook product or a generic market is rejected outright: no
+        amount of demand evidence makes it a book this research may recommend.
+        """
+        niche = str(getattr(candidate, "niche", ""))
+        reason = screen_niche(niche)
+        ok = not reason
+        return FilterResult(
+            name="excluded_niche",
+            passed=ok,
+            outcome="pass" if ok else "reject",
+            reason=(
+                f"niche {niche!r} passes the hard rules (specific, not a "
+                "journal/logbook)" if ok else reason
+            ),
+            metrics={"niche": niche, "hard_rule": reason},
         )
 
     def _filter_overly_broad(self, candidate: Any) -> FilterResult:

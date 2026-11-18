@@ -25,6 +25,7 @@ from typing import Any
 
 from app.browser_store import BrowserEvidenceStore
 from app.claims import ClaimError, ClaimStore
+from app.product_rules import screen_niche
 from app.research_data import CandidateStore, OpportunityStore
 
 # Actions the model may request to edit its own ledgers. Kept here (not in
@@ -117,6 +118,11 @@ class RecordEditor:
         niche = " ".join(str(args.get("niche") or "").split())
         if not niche:
             raise RecordEditError("add_candidate needs a niche")
+        blocked = screen_niche(niche)
+        if blocked:
+            # Hard rules outrank the model's own judgement: refused here so the
+            # model learns why in the action's error, not an hour later.
+            raise RecordEditError(blocked)
         needle = niche.lower()
         for existing in self.candidates.list(session_id, limit=500):
             if " ".join(str(existing.niche).lower().split()) == needle:

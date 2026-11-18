@@ -329,7 +329,7 @@ class TestCandidateFilters:
         """A candidate with NO data at all must be downgraded (needs research),
         not convicted by hard filters on an empty record."""
         cand = CandidateStore(db).create(
-            session_id, niche="sudden-loss grief journals for adult children")
+            session_id, niche="sudden-loss grief memoirs for adult children")
         rep = self._engine(db).evaluate(
             session_id, cand, evidence_records=[], claims=[], existing_niches=[]
         )
@@ -351,7 +351,7 @@ class TestCandidateFilters:
 
         cand = CandidateStore(db).create(
             session_id,
-            niche="sudden-loss grief journals for adult children settling estates")
+            niche="sudden-loss grief memoirs for adult children settling estates")
         # Rich evidence: >= 6 distinct ASINs with review counts across 2+ URLs,
         # plus >= 8 reviews across >= 3 distinct products.
         ev = []
@@ -395,7 +395,7 @@ class TestCandidateFilters:
         saturation claim) both stay green here — this is the joint gap."""
         cand = CandidateStore(db).create(
             session_id,
-            niche="sudden-loss grief journals for adult children settling estates")
+            niche="sudden-loss grief memoirs for adult children settling estates")
         ev = [{
             "id": f"evm{i}", "kind": "product_page", "marketplace": "us",
             "title": f"incumbent {i}",
@@ -453,7 +453,7 @@ class TestCandidateFilters:
         totals must not carry a thin candidate to the report."""
         cand = CandidateStore(db).create(
             session_id,
-            niche="sudden-loss grief journals for adult children settling estates")
+            niche="sudden-loss grief memoirs for adult children settling estates")
         ev = _evidence(3)
         claims = _supported_claims(db, session_id, cand.id, ["ev1", "ev2"])
         rep = self._engine(db).evaluate(

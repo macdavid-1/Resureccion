@@ -139,15 +139,10 @@ class Config:
         self.model_calls_per_hour = max(1, _int_env("MODEL_CALLS_PER_HOUR", 45))
 
         # --- deep-discovery layers (deterministic, model-free) ----------------
-        # Autocomplete frontier: seed -> append letters -> recursive
-        # completion mining on Amazon's real suggestion endpoint. The demand
-        # LANGUAGE buyers actually type, gathered as ordinary evidence.
-        self.frontier_enabled = _flag("FRONTIER_ENABLED", True)
-        self.frontier_max_queries = max(0, _int_env("FRONTIER_MAX_QUERIES", 240))
-        self.frontier_max_depth = max(1, min(_int_env("FRONTIER_MAX_DEPTH", 2), 4))
-        self.frontier_time_budget_seconds = max(
-            30, _int_env("FRONTIER_TIME_BUDGET_SECONDS", 420)
-        )
+        # Keyword and phrase discovery is NOT one of these layers: it belongs
+        # to the model (Amazon's search box, its completion API through the
+        # `autocomplete` action, and KDSpy's panel). What the backend measures
+        # on its own is the store map.
         # Category census: a deterministic walk of the browse-node tree and
         # the bestseller/new-release charts BEFORE the model opines, so
         # discovery reasons over a measured census instead of guessing where

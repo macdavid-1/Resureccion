@@ -77,9 +77,13 @@ class TestCandidates:
     def test_adding_a_niche_it_already_has_points_at_the_existing_row(
         self, db, session, editor
     ) -> None:
-        existing = CandidateStore(db).create(session, niche="grief journals")
+        existing = CandidateStore(db).create(
+            session, niche="sudden-loss grief memoirs"
+        )
         with pytest.raises(RecordEditError, match=existing.id):
-            editor.apply(session, "add_candidate", {"niche": "Grief  Journals"})
+            editor.apply(
+                session, "add_candidate", {"niche": "Sudden-Loss  Grief Memoirs"}
+            )
 
     def test_candidate_id_is_the_safe_target(self, db, session, editor) -> None:
         cands = CandidateStore(db)

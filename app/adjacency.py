@@ -3,8 +3,8 @@
 A strong niche used to be the end of discovery: the run researched it and
 stopped looking OUTWARD. Adjacency expansion is discovery re-entry triggered
 by SUCCESS instead of total failure — from each strong candidate the system
-walks the surrounding demand language (its autocomplete completions, the
-frontier terms that share its head words, its census/category siblings),
+walks the surrounding demand language (its own autocomplete completions and
+its census/category siblings),
 measures the most promising neighbours with real searches, and promotes the
 high-headroom ones to ordinary candidates mid-run.
 
@@ -27,7 +27,7 @@ from typing import Any
 
 from app.whitespace import WhitespaceScore, _head_terms, _log_norm
 
-NEIGHBOR_SOURCES = ("autocomplete", "frontier", "category")
+NEIGHBOR_SOURCES = ("autocomplete", "category")
 
 
 @dataclass
@@ -163,7 +163,6 @@ def gather_neighbors(
     *,
     candidates: list[Any],
     evidence_records: Iterable[dict[str, Any]],
-    frontier_terms: Iterable[str] = (),
     exclude_niches: Iterable[str] = (),
     limit: int = 40,
 ) -> list[Neighbor]:
@@ -201,30 +200,6 @@ def gather_neighbors(
                 evidence_ids=eids,
                 pre_score=pre_score(term, rows),
             )
-
-    # Frontier terms only attach where they genuinely extend a winner's
-    # language — otherwise they belong to discovery, not adjacency.
-    for term in frontier_terms:
-        t = _norm(term)
-        if not t or t in excluded or _is_noise_phrase(t):
-            continue
-        for cand in strong:
-            head = _head_terms(str(getattr(cand, "niche", "")))
-            if not _shares_head(t, head):
-                continue
-            key = (t, str(getattr(cand, "marketplace", "")) or "")
-            if key in found:
-                break
-            found[key] = Neighbor(
-                term=t,
-                parent_candidate_id=str(getattr(cand, "id", "")),
-                parent_niche=str(getattr(cand, "niche", "")),
-                source="frontier",
-                marketplace=str(getattr(cand, "marketplace", "")) or "",
-                evidence_ids=[],
-                pre_score=pre_score(t, rows),
-            )
-            break
 
     neighbors = sorted(found.values(), key=lambda n: (-n.pre_score, n.term))
     return neighbors[: max(0, limit)]
