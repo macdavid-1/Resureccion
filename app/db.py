@@ -112,6 +112,23 @@ CREATE TABLE IF NOT EXISTS research_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_notes_session ON research_notes(session_id, created_at);
 
+-- The model's own long-running memory for a run: an append-only journal it
+-- writes as it researches and reads back IN FULL on every step. Unlike notes
+-- and the phase fields it is neither parsed, distilled nor capped: it exists
+-- so the model keeps its whole train of thought across phases, resumes and
+-- follow-up runs instead of relying on summaries. `origin` marks entries
+-- inherited from an earlier run (its session id); '' means this run wrote it.
+CREATE TABLE IF NOT EXISTS research_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'memory',
+    origin TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_session ON research_memory(session_id, id);
+
 CREATE TABLE IF NOT EXISTS evidence (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES research_sessions(id),

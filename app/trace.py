@@ -105,6 +105,20 @@ class ActivityTrace:
             ).fetchall()
         return [self._row(r) for r in reversed(rows)]
 
+    def every(self, session_id: str) -> list[TraceEntry]:
+        """EVERY entry for the session, oldest first — no limit, no paging.
+
+        `tail()`/`recent()` are bounded because they feed a live UI. A
+        follow-up run inheriting the whole investigation is a different job:
+        it gets the complete trace, however long the parent run was.
+        """
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM activity_trace WHERE session_id = ? ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
     def count(self, session_id: str) -> int:
         with self.db.read() as conn:
             row = conn.execute(

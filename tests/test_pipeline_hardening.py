@@ -530,32 +530,37 @@ async def test_omitted_opportunity_marketplace_falls_back_to_the_candidate_marke
 
 # ------------------------------------------------------------- report delivery
 @pytest.mark.asyncio
-async def test_render_failure_still_delivers_a_report(db, config, session, monkeypatch):
-    from app import report_model
+async def test_a_failed_report_call_fails_the_run_instead_of_faking_one(
+    db, config, session
+):
+    """The report is the model's. When the writer cannot deliver, the run says
+    so — it never prints a backend-generated document under the model's name.
+    The banner a backend-rendered body would carry must not appear at all."""
     from app.sessions import SessionStore
 
-    def boom(model):
-        raise RuntimeError("injected render defect")
+    class SilentReport(ScriptedModel):
+        async def call(self, session_id: str, *, system: str, user: str, **k):
+            if "report writer" in system:
+                raise RuntimeError("injected writer defect")
+            return await super().call(session_id, system=system, user=user, **k)
 
-    monkeypatch.setattr(report_model, "render_markdown", boom)
-    # The generated layout only runs when the model's report call is off or
-    # fails; this test is about that renderer degrading instead of dying.
-    config.report_ai_enabled = False
-    runner = make_runner(db, config, ScriptedModel(_script()))
+    runner = make_runner(db, config, SilentReport(_script()))
     await runner.run(session)
 
     s = SessionStore(db, config).require(session)
-    assert s.status == "completed", s.error
-    _rep, body, _model = _final_report(db, config, session)
-    assert "delivered in compact form" in body
-    assert "injected render defect" in body
-    assert _events(db, session, "report_render_failed")
-    # The report is still validated and labeled.
-    assert "Report status:" in body
+    assert s.status == "failed"
+    assert "usable report" in (s.error or "")
+    reps = [r for r in __import__("app.reports", fromlist=["ReportStore"])
+            .ReportStore(db, config).list(session) if r.kind == "final"]
+    assert reps == []
+    assert _events(db, session, "report_writer_failed")
+    assert not _events(db, session, "report_render_failed")
 
 
 @pytest.mark.asyncio
-async def test_report_model_failure_still_delivers_a_report(db, config, session, monkeypatch):
+async def test_an_unbuildable_dossier_fails_the_run_without_inventing_one(
+    db, config, session, monkeypatch
+):
     from app import report_model
     from app.sessions import SessionStore
 
@@ -567,9 +572,8 @@ async def test_report_model_failure_still_delivers_a_report(db, config, session,
     await runner.run(session)
 
     s = SessionStore(db, config).require(session)
-    assert s.status == "completed", s.error
-    _rep, body, _model = _final_report(db, config, session)
-    assert "delivered in compact form" in body
+    assert s.status == "failed"
+    assert "dossier could not be assembled" in (s.error or "")
     assert _events(db, session, "report_model_failed")
 
 
@@ -606,23 +610,40 @@ class FakeReply:
 
 
 @pytest.mark.asyncio
-async def test_a_note_only_figure_never_becomes_analyst_prose(db, config, session):
-    """Notes are memory, not measurements: their numbers are not grounded."""
-    from app.sessions import SessionStore
+async def test_a_note_only_figure_never_survives_into_the_report(db, config, session):
+    """Notes are memory, not measurements: a figure that exists only in a note
+    is stripped from the model's report and flagged, never shipped as data."""
+    from app.report_writer import allowed_for, normalize_report
 
-    # Analyst-prose grounding is a property of the fallback renderer.
-    config.report_ai_enabled = False
-    runner = make_runner(db, config, NarrativeModel(_script()))
-    await runner.run(session)
-
-    s = SessionStore(db, config).require(session)
-    assert s.status == "completed", s.error
-    _rep, body, model = _final_report(db, config, session)
-    # The note itself is preserved, verbatim, in the notes section.
-    assert "42,777" in body
-    # …but the analyst prose may not repeat it as a measured figure.
-    narrative = (model or {}).get("narrative") or {}
-    assert "42,777" not in json.dumps(narrative), narrative
+    ctx = {
+        "evidence": [{"id": "ev-1", "title": "results", "data": {"total": 1200}}],
+        "research_journey": {
+            "notes": [{"text": "a keyword shows 42,777 competing titles"}],
+            "reasoning": [], "owner_guidance": [],
+        },
+        "research_notes": [],
+    }
+    body = (
+        "# A market that holds\n\n"
+        "The measured search total is 1,200 results [ev:ev-1]. "
+        "That is the number Amazon itself prints for this phrase, and it is "
+        "the one this report treats as competition. "
+        "A note written during research claims 42,777 competing titles, which "
+        "nobody measured. "
+        "Everything after this sentence exists only to keep the draft long "
+        "enough to be a report rather than a fragment of one, so the "
+        "grounding step can do its work on a document of realistic size.\n"
+    )
+    draft = normalize_report(
+        body,
+        session_id="s1",
+        allowed=allowed_for(ctx),
+        screenshots={},
+        evidence_index={"ev-1": {"url": "u"}},
+    )
+    assert draft is not None
+    assert "42,777" not in draft.markdown
+    assert "42,777" in " ".join(draft.removed_numbers)
 
 
 def test_redaction_scan_separates_prose_from_real_secrets():

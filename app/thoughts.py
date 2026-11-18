@@ -190,6 +190,28 @@ class ThoughtStore:
             out.append(t.summary_dict())
         return out
 
+    def every(self, session_id: str) -> list[Thought]:
+        """EVERY reasoning row for the session, oldest first, WITH its detail.
+
+        Uncapped on purpose. `recent()` is bounded for the live panel; a
+        follow-up run inheriting the investigation needs all of the previous
+        run's thinking (app.continuation_build).
+        """
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM thoughts WHERE session_id = ? ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        out: list[Thought] = []
+        for row in rows:
+            t = _row(row)
+            buf = self._live.get(t.id)
+            if buf is not None:  # DB lags up to a second while streaming
+                t.detail = buf["detail"]
+                t.chars = len(t.detail)
+            out.append(t)
+        return out
+
     def live(self, session_id: str) -> dict | None:
         """The call that is thinking right now, WITH its current detail.
 

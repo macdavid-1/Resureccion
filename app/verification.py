@@ -159,6 +159,38 @@ class VerificationEngine:
             or n_evidence >= 2 * self.t.min_independent_sources
         )
 
+        # --- consumer evidence, measured -------------------------------------
+        # How much real reader material this candidate actually has. Recorded
+        # as metrics, never as a verdict: absence of reviews is a fact about
+        # the record, not proof the market is bad (and a review wall is not a
+        # reason to reject a market the numbers support).
+        consumer = [
+            e for e in observed
+            if str(e.get("kind") or "") in ("review_research", "reviews")
+        ]
+        review_snippets = 0
+        review_text_chars = 0
+        ratings: list[float] = []
+        distributors = 0
+        for e in consumer:
+            data = e.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            if data.get("rating_distribution"):
+                distributors += 1
+            for r in data.get("reviews") or []:
+                if isinstance(r, dict):
+                    text = str(r.get("text") or r.get("body") or "")
+                    if text.strip():
+                        review_snippets += 1
+                        review_text_chars += len(text)
+                    rating = r.get("rating")
+                    if isinstance(rating, (int, float)):
+                        ratings.append(float(rating))
+                elif isinstance(r, str) and r.strip():
+                    review_snippets += 1
+                    review_text_chars += len(r)
+
         risk: KdpRiskScreening = screen_candidate(candidate, evidence_records)
         risk_ok = not risk.blocking
         record_screening(session_id, str(getattr(candidate, "id", "")), risk, self.assessments)
@@ -228,6 +260,21 @@ class VerificationEngine:
                 "supported_claim_ratio": round(supported_ratio, 3),
                 "inference_ratio": round(inference_ratio, 3),
                 "contradicted_claims": contradiction_count,
+                "review_records": len(consumer),
+                "review_snippets": review_snippets,
+                "review_text_chars": review_text_chars,
+                "review_distributions": distributors,
+                **(
+                    {
+                        "review_ratings_average": round(
+                            sum(ratings) / len(ratings), 2
+                        ),
+                        "review_ratings_low_share": round(
+                            sum(1 for r in ratings if r <= 2) / len(ratings), 3
+                        ),
+                    }
+                    if ratings else {}
+                ),
                 "kdp_risk_flags": risk.flags,
                 "kdp_risk_blocking": risk.blocking,
             },

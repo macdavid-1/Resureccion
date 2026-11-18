@@ -414,8 +414,11 @@ async def get_report_model(session_id: str, report_id: str, request: Request) ->
 async def rerender_report(session_id: str, report_id: str, request: Request) -> dict:
     """Re-render the markdown body from the stored structured model.
 
-    The model is the source of truth; edits to the model (e.g. owner polish)
-    become new renderings without touching durable research state.
+    A model-authored report is NEVER re-rendered by the backend: the stored
+    markdown IS the report, so rerendering an AI report returns it unchanged
+    (the structured model is kept for PDF figures and evidence indices, not as
+    a source of prose). Only legacy sessions, whose report was generated from
+    the template, are rendered again.
     """
     _auth(request)
     st = _st(request)
@@ -426,9 +429,10 @@ async def rerender_report(session_id: str, report_id: str, request: Request) -> 
     data = st.reports.read_model_json(rep)
     if data is None:
         raise HTTPException(status_code=404, detail="no structured model stored for this report")
-    # Rendered through the guarded path: a defect in one section must not
-    # turn a working report into a 500, and the stored validation verdict is
-    # rendered back into the body (FINAL / PROVISIONAL).
+    ai = data.get("ai_report") if isinstance(data, dict) else None
+    if isinstance(ai, dict) and str(ai.get("markdown") or "").strip():
+        return {"report": rep.to_dict(), "body_markdown": str(ai.get("markdown"))}
+    # Legacy report (generated before the model wrote the whole document).
     from app.report_model import ReportModel, safe_render_markdown
 
     body = safe_render_markdown(ReportModel.from_dict(data))

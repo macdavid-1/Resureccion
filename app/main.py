@@ -44,6 +44,7 @@ from app.research_data import (
     OpportunityStore,
     VerificationStore,
 )
+from app.research_memory import ResearchMemoryStore
 from app.routes import auth as auth_routes
 from app.routes import browser as browser_routes
 from app.routes import misc as misc_routes
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
         app.state.errors = _errors
         app.state.checkpoints = CheckpointStore(db)
         app.state.owner_messages = OwnerMessageStore(db)
+        app.state.research_memory = ResearchMemoryStore(db)
         app.state.browser = BrowserRegistry(db, app.state.sessions)
         app.state.observations = ObservationStore(db)
         app.state.evidence = EvidenceStore(db)

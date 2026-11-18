@@ -1,6 +1,8 @@
 """Tests for evidence-capture extraction utilities (pure functions)."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from app.evidence_capture import (
@@ -226,6 +228,192 @@ async def test_search_evidence_without_a_printed_total_never_guesses(monkeypatch
     assert data["result_count"] is None
     assert "total_results" not in data
     assert "NOT market size" in data["results_count_note"]
+
+
+# ------------------------------------------------------- review research
+class _El:
+    def __init__(self, text: str = "", attrs: dict[str, str] | None = None) -> None:
+        self._text = text
+        self._attrs = attrs or {}
+        self.clicks = 0
+
+    async def inner_text(self) -> str:
+        return self._text
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self._attrs.get(name)
+
+    async def click(self, **_kwargs) -> None:
+        self.clicks += 1
+
+
+class _Review:
+    """A review container: each selector returns its own piece of text."""
+
+    def __init__(
+        self, *, rating: str, title: str, date: str, body: str,
+        verified: bool = True, helpful: str = "", author: str = "A reader",
+    ) -> None:
+        self._parts = {
+            "review-star-rating": _El(rating),
+            "review-title": _El(title),
+            "review-date": _El(date),
+            "review-body": _El(body),
+            "helpful-vote-statement": _El(helpful),
+            "a-profile-name": _El(author),
+        }
+        self._verified = _El("Verified Purchase") if verified else None
+
+    async def query_selector(self, sel: str) -> Any:
+        if "avp-badge" in sel:
+            return self._verified
+        for key, el in self._parts.items():
+            if key in sel:
+                return el
+        return None
+
+    async def inner_text(self) -> str:
+        return " ".join(e._text for e in self._parts.values())
+
+
+class _ReviewPage:
+    """A page whose review section renders only after it is scrolled to.
+
+    Models the behaviour that made review capture fail in production: the
+    containers do not exist until the page has been scrolled, and a
+    collapsed body only exposes its opening line until it is expanded.
+    """
+
+    url = "https://www.amazon.com/dp/B0TEST1234"
+
+    def __init__(self, reviews: list[_Review], *, histogram: list[str] | None = None) -> None:
+        self.reviews = reviews
+        self.histogram = histogram or []
+        self.scrolled = 0
+        self.mounted = False
+        self.expand_links = [_El("Read more"), _El("Read more")]
+
+    async def evaluate(self, script: str, *args: Any) -> Any:
+        if "scrollBy" in script:
+            self.scrolled += 1
+            self.mounted = True
+            return None
+        if "querySelector" in script:
+            # The review section exists only once the page has moved.
+            return self.mounted
+        return None
+
+    async def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    async def query_selector(self, sel: str) -> Any:
+        if "rating-out-of-text" in sel or "acrPopover" in sel:
+            return _El("4.6 out of 5 stars")
+        if "total-review-count" in sel or "acrCustomerReviewText" in sel:
+            return _El("1,204 global ratings")
+        return None
+
+    async def query_selector_all(self, sel: str) -> list:
+        if "histogram" in sel or "aria-label" in sel:
+            return [_El(text) for text in self.histogram]
+        if "review-body" in sel and "review" not in sel.replace("review-body", ""):
+            return self.expand_links
+        if sel.startswith("#customerReviews") or "data-hook='review'" in sel:
+            return self.reviews if self.mounted else []
+        return []
+
+    async def inner_text(self, _sel: str) -> str:
+        return ""
+
+
+async def _no_summary(_sel: str) -> Any:
+    return None
+
+
+async def _collect(page: Any, monkeypatch, *, max_reviews: int = 40) -> dict:
+    from app import evidence_capture
+
+    captured: dict = {}
+    collector = EvidenceCollector(None, None, None)
+
+    async def fake_persist(_page, **kwargs):
+        captured.update(kwargs["data"])
+        record = type("Record", (), {"id": "e1", "data": kwargs["data"]})()
+        return type("Captured", (), {"record": record})()
+
+    monkeypatch.setattr(collector, "_persist", fake_persist)
+    await collector.capture_reviews(
+        page, session_id="s1", marketplace=AMAZON_MARKETPLACES["us"],
+        asin="B0TEST1234", max_reviews=max_reviews, screenshot=False,
+    )
+    assert evidence_capture is not None
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_reviews_are_read_after_scrolling_to_the_review_section(monkeypatch) -> None:
+    """The regression behind "it never captures any review content": reading
+    the DOM before scrolling found nothing, because the review list mounts
+    only once the page reaches it."""
+    page = _ReviewPage([
+        _Review(rating="5.0 out of 5 stars", title="Changed my life",
+                date="Reviewed in the United States on March 2, 2026",
+                body="I lost my mother last spring and this guided me through it."),
+        _Review(rating="2.0 out of 5 stars", title="Too repetitive",
+                date="Reviewed in the United Kingdom on January 9, 2026",
+                body="The prompts repeat after the first thirty pages."),
+    ])
+    data = await _collect(page, monkeypatch)
+    assert data["reviews_captured"] == 2
+    assert page.scrolled > 0, "the collector must scroll to the reviews"
+    assert page.expand_links[0].clicks == 1, "collapsed bodies must be expanded"
+    assert data["reviews"][0]["title"] == "Changed my life"
+    assert data["reviews"][1]["text"].startswith("The prompts repeat")
+    assert data["critical_reviews"] == 1
+    assert data["positive_reviews"] == 1
+    assert data["verified_reviews"] == 2
+    # Amazon's own printed average wins over anything derived from the two
+    # reviews read; the derived figure is only a fallback and says so.
+    assert data["average_rating"] == 4.6
+    assert "average_rating_basis" not in data
+    assert data["ratings_total"] == 1204
+    assert data["review_text_chars"] > 40
+
+
+@pytest.mark.asyncio
+async def test_an_unprinted_average_is_derived_and_labelled(monkeypatch) -> None:
+    page = _ReviewPage([
+        _Review(rating="5.0 out of 5 stars", title="A", date="2026", body="Loved it."),
+        _Review(rating="2.0 out of 5 stars", title="B", date="2026", body="Not for me."),
+    ])
+    page.query_selector = _no_summary  # type: ignore[method-assign]
+    data = await _collect(page, monkeypatch)
+    assert data["average_rating"] == 3.5
+    assert data["average_rating_basis"] == "computed from the reviews captured on this page"
+
+
+@pytest.mark.asyncio
+async def test_reviews_carry_the_printed_distribution(monkeypatch) -> None:
+    page = _ReviewPage(
+        [_Review(rating="4.0 out of 5 stars", title="Good", date="2026", body="Solid.")],
+        histogram=[
+            "5 stars 62% of ratings", "4 stars 21% of ratings",
+            "3 stars 9% of ratings", "2 stars 4% of ratings",
+            "1 star 4% of ratings",
+        ],
+    )
+    data = await _collect(page, monkeypatch)
+    assert data["rating_distribution"] == {"5": 62, "4": 21, "3": 9, "2": 4, "1": 4}
+    assert data["rating_distribution_unit"] == "percent of all ratings"
+
+
+@pytest.mark.asyncio
+async def test_a_page_without_reviews_says_why_instead_of_claiming_zero(monkeypatch) -> None:
+    page = _ReviewPage([])
+    data = await _collect(page, monkeypatch)
+    assert data["reviews_captured"] == 0
+    assert "no review container matched" in data["blocked_reason"]
+    assert "review_region_text" not in data
 
 
 def test_collector_requires_real_page_for_kdspy() -> None:

@@ -1,24 +1,27 @@
 """Read a finished (or paused) run out of the durable stores into a brief.
 
-`app/continuation.py` owns the SHAPE and the rendering; this module owns the
+`app.continuation.py` owns the SHAPE and the rendering; this module owns the
 READING. Every field comes from a stored row — nothing here summarizes with a
 model, and nothing invents a figure. Sections that a session never produced
 stay empty, and the renderer simply omits them.
+
+Nothing is paged, capped or truncated here: a follow-up run inherits the whole
+parent record however long that run was. The only bound on a stored value is
+the one the writing store itself applies.
 """
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-from app.continuation import (
-    OPPORTUNITY_LIMIT,
-    THOUGHT_LIMIT,
-    ContinuationBrief,
-)
+from app.continuation import ContinuationBrief
 
 # Candidate statuses that mean "this was researched and killed".
 _REJECTED = {"rejected"}
+
+# A hard ceiling only for the SQL LIMIT of a list query: "every row", not "the
+# first page". (SQLite needs a number; this is not a context budget.)
+_EVERY = 10_000_000
 
 
 def _opp_verdict(verifications: Any, session_id: str, candidate_id: str) -> str:
@@ -33,47 +36,68 @@ def _opp_verdict(verifications: Any, session_id: str, candidate_id: str) -> str:
     return ""
 
 
-def _report_summary(reports: Any, session_id: str) -> tuple[str, str]:
-    """(title, readable summary) of the newest report, or ('', '')."""
+def _report_record(reports: Any, session_id: str) -> tuple[str, str, str]:
+    """(title, full markdown, flat summary) of the newest report.
+
+    The REPORT ITSELF is what a continuation must carry: the previous run's
+    conclusions, in its own words, with its own numbers. It is handed over
+    verbatim — condensing it was what made the follow-up feel like a new
+    project with a brief instead of the same researcher continuing.
+    """
     try:
         rep = reports.latest(session_id)
     except Exception:
-        return "", ""
+        return "", "", ""
     if rep is None:
-        return "", ""
-    body = str(getattr(rep, "body_markdown", "") or "")
-    text = re.sub(r"^#{1,6}\s*", "", body, flags=re.MULTILINE)
-    text = re.sub(r"[*_`>#|]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return str(getattr(rep, "title", "") or ""), text
+        return "", "", ""
+    # The body lives on disk (`body_path`); the row itself carries no markdown.
+    # Reading the attribute off the row silently yielded "" — so the previous
+    # report never actually reached a follow-up run.
+    try:
+        body = str(reports.read_markdown(rep) or "")
+    except Exception:
+        body = ""
+    flat = " ".join(body.split())
+    return str(getattr(rep, "title", "") or ""), body, flat
 
 
-def _thought_excerpts(thoughts: Any, session_id: str) -> list[dict[str, Any]]:
-    """The last few reasoning rows, as short excerpts (never the raw dump)."""
+def _thought_rows(thoughts: Any, session_id: str) -> list[dict[str, Any]]:
+    """Every reasoning row the run produced, oldest first, uncondensed.
+
+    The model's own thinking is the richest context a continuation can get:
+    its reasoning about what it already ruled out, what it wanted to check
+    next, and why a number looked wrong. Excerpts lost exactly that.
+    """
     out: list[dict[str, Any]] = []
     try:
-        rows = thoughts.recent(session_id, limit=THOUGHT_LIMIT * 3)
+        if hasattr(thoughts, "every"):
+            rows: Any = thoughts.every(session_id)
+        else:  # duck-typed test double without the uncapped reader
+            rows = []
+            for row in thoughts.recent(session_id, limit=200):
+                detail = thoughts.get(int(row["id"]))
+                if detail is not None:
+                    rows.append(detail)
+        for t in rows:
+            text = str(getattr(t, "detail", "") or "").strip()
+            if not text:
+                continue
+            out.append({
+                "label": str(getattr(t, "label", "") or "thinking"),
+                "created_at": str(getattr(t, "created_at", "") or ""),
+                "excerpt": text,
+            })
     except Exception:
         return out
-    for row in rows:
-        try:
-            detail = thoughts.get(int(row["id"]))
-        except Exception:
-            continue
-        text = " ".join(str(getattr(detail, "detail", "") or "").split())
-        if not text:
-            continue
-        out.append({
-            "label": str(row.get("label") or "thinking"),
-            "excerpt": text[:700],
-        })
-    return out[-THOUGHT_LIMIT:]
+    return out
 
 
 def _actions(trace: Any, session_id: str) -> list[dict[str, Any]]:
-    """Latest trace entries (the run's own account of what it did)."""
+    """Every trace entry (the run's own account of what it did)."""
     try:
-        rows = trace.tail(session_id, limit=60)
+        rows = trace.every(session_id) if hasattr(trace, "every") else trace.tail(
+            session_id, limit=400
+        )
     except Exception:
         return []
     return [
@@ -113,7 +137,7 @@ def _keywords_and_categories(evidence_rows: list[Any]) -> tuple[list, list]:
     return keywords, categories
 
 
-def _competitors(evidence_rows: list[Any], limit: int = 8) -> list[dict[str, Any]]:
+def _competitors(evidence_rows: list[Any]) -> list[dict[str, Any]]:
     """Observed competitor products — the run's own browser evidence."""
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -142,33 +166,36 @@ def _competitors(evidence_rows: list[Any], limit: int = 8) -> list[dict[str, Any
             if r.get("rating") is not None:
                 note.append(f"rated {r['rating']}")
             out.append({"title": title[:160], "asin": r.get("asin"), "note": ", ".join(note)})
-            if len(out) >= limit:
-                return out
     return out
 
 
 def _consumer_lines(evidence_rows: list[Any]) -> list[str]:
-    """Verbatim-ish review material the run captured (nothing inferred)."""
+    """The review material the run captured, verbatim and whole.
+
+    Both kinds are read: `review_research` is what the collector writes now,
+    and `reviews` is what older runs stored. Review text is not truncated — a
+    later run must read the complaint in full, not its first line.
+    """
     lines: list[str] = []
     for e in evidence_rows:
-        if getattr(e, "kind", "") != "review_research":
+        if getattr(e, "kind", "") not in ("review_research", "reviews"):
             continue
         data = getattr(e, "data", None)
         if not isinstance(data, dict):
             continue
         for r in data.get("reviews") or []:
             if isinstance(r, dict):
-                text = str(r.get("text") or r.get("review") or "").strip()
+                text = str(r.get("text") or r.get("body") or r.get("review") or "").strip()
                 if text:
-                    lines.append(text[:240])
+                    lines.append(text)
             elif isinstance(r, str):
-                lines.append(r[:240])
-    return lines[:8]
+                lines.append(r)
+    return lines
 
 
-def _limitations(evidence_rows: list[Any], verifications: Any, session_id: str, cands: list[Any]) -> list[str]:
+def _limitations(verifications: Any, session_id: str, cands: list[Any]) -> list[str]:
     out: list[str] = []
-    for c in cands[:40]:
+    for c in cands:
         try:
             vers = verifications.for_candidate(session_id, c.id)
         except Exception:
@@ -180,7 +207,7 @@ def _limitations(evidence_rows: list[Any], verifications: Any, session_id: str, 
                     text = str(item).strip()
                     if text and text not in out:
                         out.append(text)
-    return out[:8]
+    return out
 
 
 def build_continuation_brief(
@@ -195,24 +222,26 @@ def build_continuation_brief(
     reports: Any = None,
     trace: Any = None,
     thoughts: Any = None,
+    owner_messages: Any = None,
+    memory: Any = None,
     adjacent_rows: list[dict[str, Any]] | None = None,
 ) -> ContinuationBrief:
     """Assemble the parent run's record. Read-only; never raises for a gap."""
     session = sessions.require(parent_session_id)
     cands: list[Any] = []
     try:
-        cands = candidates.list(parent_session_id, limit=400)
+        cands = candidates.list(parent_session_id, limit=_EVERY)
     except Exception:
         cands = []
     opps: list[Any] = []
     try:
-        opps = opportunities.list(parent_session_id, limit=60)
+        opps = opportunities.list(parent_session_id, limit=_EVERY)
     except Exception:
         opps = []
     ev_rows: list[Any] = []
     if browser_evidence is not None:
         try:
-            ev_rows = browser_evidence.list(parent_session_id, limit=800)
+            ev_rows = browser_evidence.list(parent_session_id, limit=_EVERY)
         except Exception:
             ev_rows = []
 
@@ -232,11 +261,26 @@ def build_continuation_brief(
     except Exception:
         brief.counts = {}
 
+    if owner_messages is not None:
+        try:
+            journal = owner_messages.journal(parent_session_id, limit=_EVERY)
+        except Exception:
+            journal = []
+        brief.owner_messages = [
+            {"created_at": getattr(m, "created_at", ""), "text": getattr(m, "text", "")}
+            for m in journal
+            if str(getattr(m, "text", "") or "").strip()
+        ]
+
     if reports is not None:
-        brief.report_title, brief.report_summary = _report_summary(reports, parent_session_id)
+        (
+            brief.report_title,
+            brief.report_markdown,
+            brief.report_summary,
+        ) = _report_record(reports, parent_session_id)
 
     # Opportunities carry the verification verdict — the report's portfolio.
-    for o in opps[:OPPORTUNITY_LIMIT * 2]:
+    for o in opps:
         brief.opportunities.append({
             "title": getattr(o, "title", ""),
             "niche": getattr(o, "niche", ""),
@@ -256,7 +300,7 @@ def build_continuation_brief(
         if status in _REJECTED:
             meta = getattr(c, "meta", None) or {}
             reasons = meta.get("rejection_reasons") or meta.get("reasons") or []
-            why = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else str(reasons)
+            why = "; ".join(str(r) for r in reasons) if isinstance(reasons, list) else str(reasons)
             brief.rejected_candidates.append({"niche": row["niche"], "why": why or row["rationale"]})
         else:
             brief.candidates.append(row)
@@ -264,25 +308,41 @@ def build_continuation_brief(
     brief.keywords, brief.categories = _keywords_and_categories(ev_rows)
     brief.competitors = _competitors(ev_rows)
     brief.consumer = _consumer_lines(ev_rows)
-    brief.limitations = _limitations(ev_rows, verifications, parent_session_id, cands)
+    brief.limitations = _limitations(verifications, parent_session_id, cands)
 
     if notes is not None:
         try:
-            rows = notes.list(parent_session_id, limit=300)
+            rows = notes.list(parent_session_id, limit=_EVERY)
         except Exception:
             rows = []
-        for n in rows[-40:]:
+        for n in rows:
             text = str(getattr(n, "text", "") or "").strip()
             if text:
                 brief.notes.append({"phase": getattr(n, "phase", ""), "text": text})
 
+    if memory is not None:
+        try:
+            entries = memory.list(parent_session_id)
+        except Exception:
+            entries = []
+        brief.memory = [
+            {
+                "kind": getattr(m, "kind", "") or "memory",
+                "phase": getattr(m, "phase", ""),
+                "created_at": getattr(m, "created_at", ""),
+                "text": str(getattr(m, "text", "") or ""),
+            }
+            for m in entries
+            if str(getattr(m, "text", "") or "").strip()
+        ]
+
     if thoughts is not None:
-        brief.thoughts = _thought_excerpts(thoughts, parent_session_id)
+        brief.thoughts = _thought_rows(thoughts, parent_session_id)
     if trace is not None:
         brief.actions = _actions(trace, parent_session_id)
 
     # Open threads: the adjacency ledger rows ARE the unfunded discoveries.
-    for r in (adjacent_rows or [])[:16]:
+    for r in (adjacent_rows or []):
         label = str(r.get("niche") or r.get("title") or "").strip()
         if not label:
             continue
@@ -296,6 +356,108 @@ def build_continuation_brief(
     return brief
 
 
+def seed_candidate_ledger(
+    parent_session_id: str,
+    session_id: str,
+    *,
+    candidates: Any,
+) -> list[dict[str, Any]]:
+    """Give the follow-up run the previous run's live candidate ledger.
+
+    The record tells the model what the previous run concluded; this makes the
+    child's own machinery agree with it. Without rows here, every downstream
+    layer (headroom ordering, adjacency, the CANDIDATES digest, synthesis
+    linking) sees an empty investigation and the run really does start from
+    nothing — which is exactly how a follow-up felt like a new research.
+
+    Rows are seeded as they were FOUND, never as VERIFIED: a verdict belongs to
+    the evidence that produced it, and this run has not reproduced that
+    evidence yet. The previous status/score ride along in ``continued_from`` so
+    nothing is lost and nothing is falsely claimed.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        rows = candidates.list(parent_session_id, limit=_EVERY)
+    except Exception:
+        return out
+    for c in rows:
+        if str(getattr(c, "status", "")) == "rejected":
+            # Rejections stay rejected; the record carries them. Copying them
+            # as rows would count dead ends as this run's unresolved work.
+            continue
+        niche = str(getattr(c, "niche", "") or "").strip()
+        if not niche:
+            continue
+        parent_meta = getattr(c, "meta", None) or {}
+        meta: dict[str, Any] = {
+            "continued_from": {
+                "session_id": parent_session_id,
+                "candidate_id": getattr(c, "id", ""),
+                "status": str(getattr(c, "status", "") or ""),
+                "score": float(getattr(c, "score", 0.0) or 0.0),
+            }
+        }
+        for key in ("parent_market", "chain"):
+            if parent_meta.get(key):
+                meta[key] = parent_meta[key]
+        try:
+            fresh = candidates.create(
+                session_id=session_id,
+                niche=niche,
+                marketplace=str(getattr(c, "marketplace", "") or ""),
+                rationale=str(getattr(c, "rationale", "") or ""),
+                score=float(getattr(c, "score", 0.0) or 0.0),
+                meta=meta,
+            )
+        except Exception:
+            continue
+        out.append({
+            "candidate_id": fresh.id,
+            "niche": niche,
+            "previous_status": meta["continued_from"]["status"],
+        })
+    return out
+
+
+def seed_memory(
+    parent_session_id: str,
+    session_id: str,
+    *,
+    memory: Any,
+) -> list[dict[str, Any]]:
+    """Copy the previous run's long-running memory into the follow-up run.
+
+    Memory is the one thing a continuation must not re-derive: the parent's
+    entries become the child's own first entries, verbatim and in order, with
+    their origin recorded. The child then keeps appending to the same journal,
+    so an investigation's memory grows across runs instead of being replaced
+    by a brief about them.
+    """
+    out: list[dict[str, Any]] = []
+    if memory is None:
+        return out
+    try:
+        entries = memory.list(parent_session_id)
+    except Exception:
+        return out
+    for m in entries:
+        text = str(getattr(m, "text", "") or "")
+        if not text.strip():
+            continue
+        try:
+            fresh = memory.append(
+                session_id,
+                text=text,
+                phase=str(getattr(m, "phase", "") or ""),
+                kind=str(getattr(m, "kind", "") or "memory"),
+                origin=parent_session_id,
+            )
+        except Exception:
+            continue
+        out.append({"id": fresh.id, "kind": fresh.kind, "chars": len(fresh.text)})
+    return out
+
+
 def brief_digest(brief: ContinuationBrief) -> str:
     """One-line summary for the trace/event log (never the full brief)."""
     return (
@@ -303,7 +465,8 @@ def brief_digest(brief: ContinuationBrief) -> str:
         f"{len(brief.opportunities)} opportunit(ies), "
         f"{len(brief.candidates)} kept / {len(brief.rejected_candidates)} rejected "
         f"candidate(s), {len(brief.keywords)} measured keyword(s), "
-        f"{len(brief.actions)} traced action(s), {len(brief.thoughts)} thought(s)"
+        f"{len(brief.actions)} traced action(s), {len(brief.thoughts)} thought(s), "
+        f"{len(brief.memory)} memory entry(ies)"
     )
 
 
@@ -321,7 +484,7 @@ def load_adjacent_rows(reports: Any, session_id: str) -> list[dict[str, Any]]:
         except Exception:
             continue
         if isinstance(model, dict) and model.get("adjacent_ledger"):
-            return [r for r in model["adjacent_ledger"] if isinstance(r, dict)][:60]
+            return [r for r in model["adjacent_ledger"] if isinstance(r, dict)]
     return []
 
 

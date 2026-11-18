@@ -637,6 +637,13 @@ class _PlaybookModel:
     async def aclose(self) -> None:
         return None
 
+    def __getattr__(self, name: str) -> Any:
+        """Anything the wrapper does not implement is the base model's."""
+        base = self.__dict__.get("base")
+        if base is None:
+            raise AttributeError(name)
+        return getattr(base, name)
+
 
 @pytest.mark.asyncio
 async def test_runner_writes_one_playbook_per_finalist_and_isolates_failures(
@@ -705,10 +712,8 @@ async def test_full_run_renders_a_complete_section_for_every_final_candidate(
         make_runner,
     )
 
-    # Playbooks are how the DETERMINISTIC layout carries per-candidate analysis;
-    # when the model writes the whole report they are part of its dossier
-    # instead. This test covers the fallback renderer.
-    config.report_ai_enabled = False
+    # The model writes the whole report; the deep-dive measurements per
+    # candidate are the dossier it writes those sections from.
     store = BrowserEvidenceStore(db)
 
     class _StubDive:
@@ -755,14 +760,10 @@ async def test_full_run_renders_a_complete_section_for_every_final_candidate(
         assert sec["review_findings"]["reviews"]
         assert sec["marketplace_ranking"]
 
-    playbooks = model_json["finalist_playbooks"]
-    assert set(playbooks) == {s["candidate_id"] for s in sections}
-    assert all(len(p["titles"]) == 10 for p in playbooks.values())
-
-    assert "## Final candidate playbooks" in md
-    assert f"### Final candidate 1 — {sections[0]['niche']}" in md
-    assert "**Kindle Store categories (10 of 10)**" in md
-    assert "**Backend keywords — 20 ranked for ranking potential and low competition**" in md
-    assert "**Premium titles — 10 written from these keywords and this niche**" in md
-    assert "Grounded Title 9" in md
-    assert "Publish in the ranked order shown." in md
+    # The report is the model's document: no backend-authored section list.
+    assert "## Final candidate playbooks" not in md
+    # …and every candidate's measured dive reached the dossier it wrote from.
+    dossier = runner.model.report_prompts[-1]
+    assert '"finalists"' in dossier
+    for sec in sections:
+        assert sec["niche"] in dossier

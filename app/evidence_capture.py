@@ -200,6 +200,45 @@ class EvidenceCollector:
             screenshot=screenshot,
         )
 
+    async def capture_reviews(
+        self,
+        page: Any,
+        *,
+        session_id: str,
+        marketplace: Marketplace,
+        asin: str = "",
+        max_reviews: int = 40,
+        screenshot: bool = True,
+    ) -> CapturedEvidence:
+        """Capture the customer reviews Amazon actually rendered on this page.
+
+        The old path read `div[data-hook='review']` straight after load, which
+        is why reviews came back empty: Amazon loads the review section far
+        below the fold and only expands the blocks the reader has scrolled to.
+        So this: scrolls to the review section, expands truncated bodies,
+        nudges lazy loading, then reads every review container (several
+        selector families plus a page-text fallback), collects the rating
+        distribution and captures a screenshot OF the review section as proof.
+
+        Stored as `review_research` — the kind the report dossier and the
+        follow-up record already read — with the review text, per-review
+        metadata and deterministic aggregates (distribution, critical count,
+        verified count). Those aggregates are measurements, so the report may
+        quote them; the summarising of praise and complaints stays the model's
+        job.
+        """
+        data = await _collect_review_research(
+            page, asin=asin, max_reviews=max_reviews
+        )
+        return await self._persist(
+            page,
+            session_id=session_id,
+            marketplace=marketplace,
+            kind="review_research",
+            data=data,
+            screenshot=screenshot,
+        )
+
     async def capture_page_state(
         self,
         page: Any,
@@ -552,6 +591,309 @@ def parse_format_prices(text: str) -> list[dict[str, str]]:
         seen.add(fmt)
         out.append({"format": fmt, "price": price})
     return out[:8]
+
+
+# --------------------------------------------------------- review research
+_REVIEW_CONTAINER_SELECTORS: tuple[str, ...] = (
+    "#cm-cr-dp-review-list div[data-hook='review']",
+    "#cm-cr-dl-review-list div[data-hook='review']",
+    "div[data-hook='review']",
+    "li[data-hook='review']",
+    "#reviewsMedley div.review",
+    "[data-hook='cr-widget-ReviewsListContainer'] div[data-hook='review']",
+)
+_REVIEW_SECTION_SELECTORS: tuple[str, ...] = (
+    "#customerReviews",
+    "#reviewsMedley",
+    "[data-hook='reviews-medley-footer']",
+    "div[data-hook='review']",
+    "#cm-cr-dp-review-list",
+)
+
+
+async def _scroll_to_reviews(page: Any) -> None:
+    """Bring the review section into view and let it lazy-load.
+
+    Amazon renders a handful of reviews near the bottom of a product page and
+    expands the rest as the reader approaches them, so a capture taken before
+    the scroll reads an empty list even though reviews exist.
+    """
+    for sel in _REVIEW_SECTION_SELECTORS:
+        try:
+            found = await page.evaluate(
+                "(sel) => { const el = document.querySelector(sel); "
+                "if (!el) return false; "
+                "el.scrollIntoView({block: 'center'}); return true; }",
+                sel,
+            )
+        except Exception:
+            found = False
+        if found:
+            break
+    # Step-scroll: some pages only mount the review list after movement.
+    for _ in range(6):
+        try:
+            await page.evaluate(
+                "() => window.scrollBy(0, Math.max(320, "
+                "Math.floor(window.innerHeight * 0.85)))"
+            )
+            await page.wait_for_timeout(250)
+        except Exception:
+            break
+    # Back to the reviews, which may have mounted during the walk.
+    for sel in _REVIEW_SECTION_SELECTORS:
+        try:
+            if await page.evaluate(
+                "(sel) => { const el = document.querySelector(sel); "
+                "if (!el) return false; el.scrollIntoView({block: 'start'}); "
+                "return true; }",
+                sel,
+            ):
+                break
+        except Exception:
+            continue
+    # Expand truncated review bodies. These toggles are in-page; the
+    # "see all reviews" links navigate and are deliberately not clicked.
+    for sel in (
+        "[data-hook='review-body'] span.a-expander-prompt",
+        "[data-hook='review-body'] a",
+        "a[data-hook='review-expand-link']",
+        "span[data-hook='review-expand']",
+    ):
+        try:
+            els = await page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els[:30]:
+            try:
+                await el.click(timeout=1200)
+            except Exception:
+                continue
+        if els:
+            # One family of expanders is enough; clicking a second family
+            # that wraps the same link would collapse what was just opened.
+            break
+
+
+async def _extract_rating_summary(page: Any) -> dict[str, Any]:
+    """The review summary Amazon prints: average, total, distribution."""
+    out: dict[str, Any] = {}
+    avg_txt = await _text_of(
+        page,
+        "[data-hook='rating-out-of-text'], #acrPopover, "
+        "span[data-hook='rating-out-of-text']",
+    )
+    if avg_txt:
+        out["rating_text"] = " ".join(avg_txt.split())[:80]
+        rating = _parse_rating(avg_txt)
+        if rating is not None:
+            out["average_rating"] = rating
+    total_txt = await _text_of(
+        page, "[data-hook='total-review-count'], #acrCustomerReviewText"
+    )
+    total = _parse_int(total_txt)
+    if total is not None:
+        out["ratings_total"] = total
+    distribution: dict[str, int] = {}
+    try:
+        rows = await page.query_selector_all(
+            "#histogramTable tr, [data-hook='histogram-row'], tr[aria-label]"
+        )
+    except Exception:
+        rows = []
+    for row in rows[:10]:
+        try:
+            label = (
+                await _attr(row, "aria-label")
+                or " ".join((await row.inner_text()).split())
+            )
+            text = " ".join(str(label or "").split())
+        except Exception:
+            continue
+        m = re.search(r"([1-5])\s*star", text, re.IGNORECASE)
+        pct = re.search(r"(\d{1,3})\s*%", text)
+        if not m:
+            continue
+        if pct:
+            distribution[m.group(1)] = int(pct.group(1))
+    if distribution:
+        out["rating_distribution"] = distribution
+        out["rating_distribution_unit"] = "percent of all ratings"
+    return out
+
+
+async def _extract_review_blocks(
+    page: Any, max_reviews: int
+) -> list[dict[str, Any]]:
+    """Every review container on the page, with as much detail as rendered."""
+    reviews: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    blocks: list[Any] = []
+    for sel in _REVIEW_CONTAINER_SELECTORS:
+        try:
+            blocks = await page.query_selector_all(sel)
+        except Exception:
+            blocks = []
+        if blocks:
+            break
+    for block in blocks:
+        if len(reviews) >= max_reviews:
+            break
+        try:
+            rating_txt = await _text_of_inner(
+                block,
+                "i[data-hook='review-star-rating'] span, "
+                "i[data-hook='cmps-review-star-rating'] span, "
+                "[data-hook='review-star-rating'], "
+                "span[data-hook='review-star-rating'] span",
+            )
+            title = await _text_of_inner(
+                block,
+                "a[data-hook='review-title'] span:last-child, "
+                "[data-hook='review-title'] span:not([class*='a-icon']), "
+                "a[data-hook='review-title']",
+            )
+            date = await _text_of_inner(block, "span[data-hook='review-date']")
+            body = await _text_of_inner(
+                block,
+                "span[data-hook='review-body'], "
+                "[data-hook='review-body'] span:not([class*='a-icon']), "
+                "div.reviewText, [data-hook='review-text-content']",
+            )
+            verified = None
+            try:
+                verified = await block.query_selector("span[data-hook='avp-badge']")
+            except Exception:
+                verified = None
+            helpful = await _text_of_inner(
+                block, "[data-hook='helpful-vote-statement']"
+            )
+            author = await _text_of_inner(block, ".a-profile-name")
+            text = " ".join(str(body or "").split())
+            if not text:
+                # A collapsed review can still carry its opening line.
+                text = " ".join(
+                    str(await _text_of_inner(block, "[data-hook='review-summary']")).split()
+                )
+            if not text:
+                continue
+            key = text[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            reviews.append({
+                "rating": _parse_rating(rating_txt),
+                "title": " ".join(str(title or "").split())[:200],
+                "date": " ".join(str(date or "").split())[:80],
+                "text": text[:4000],
+                "body": text[:4000],
+                "verified_purchase": verified is not None,
+                "helpful": " ".join(str(helpful or "").split())[:120],
+                "author": " ".join(str(author or "").split())[:80],
+            })
+        except Exception:
+            continue
+    return reviews
+
+
+async def _page_review_text(page: Any) -> str:
+    """A page-text fallback: whatever the review region rendered."""
+    for sel in ("#cm-cr-dp-review-list", "#reviewsMedley", "#customerReviews"):
+        try:
+            text = await _text_of(page, sel)
+        except Exception:
+            text = ""
+        if str(text or "").strip():
+            return " ".join(str(text).split())[:20_000]
+    return ""
+
+
+async def _page_has_signin_wall(page: Any) -> bool:
+    try:
+        if await page.query_selector("form[name='signIn'], input#ap_email"):
+            return True
+    except Exception:
+        pass
+    try:
+        body = (await page.inner_text("body"))[:4000].lower()
+    except Exception:
+        return False
+    return "sign in to see" in body or "sign in to continue" in body
+
+
+async def _collect_review_research(
+    page: Any, *, asin: str, max_reviews: int
+) -> dict[str, Any]:
+    """Read the review section in full and derive its measured aggregates."""
+    await _scroll_to_reviews(page)
+    summary = await _extract_rating_summary(page)
+    reviews = await _extract_review_blocks(page, max_reviews)
+    if not reviews:
+        # Last resort: whatever the review region's text holds. Snippets keep
+        # the report grounded instead of leaving the run with "no reviews"
+        # when the page clearly rendered some.
+        snippets = await _extract_review_snippets(page, max_items=min(12, max_reviews))
+        reviews = [
+            {
+                "rating": s.get("rating"),
+                "title": str(s.get("title") or "")[:200],
+                "text": str(s.get("body") or "")[:4000],
+                "body": str(s.get("body") or "")[:4000],
+                "verified_purchase": None,
+            }
+            for s in snippets
+            if str(s.get("body") or "").strip()
+        ]
+
+    data: dict[str, Any] = {"asin": asin, **summary}
+    data["reviews"] = reviews
+    data["reviews_captured"] = len(reviews)
+    data["products_read"] = 1
+    ratings = [r["rating"] for r in reviews if isinstance(r.get("rating"), (int, float))]
+    if ratings and not isinstance(data.get("average_rating"), (int, float)):
+        data["average_rating"] = round(sum(ratings) / len(ratings), 2)
+        data["average_rating_basis"] = "computed from the reviews captured on this page"
+    if ratings:
+        data["rating_counts"] = {
+            str(star): sum(1 for r in ratings if round(r) == star)
+            for star in (5, 4, 3, 2, 1)
+        }
+        data["critical_reviews"] = sum(1 for r in ratings if r <= 2)
+        data["positive_reviews"] = sum(1 for r in ratings if r >= 4)
+    data["verified_reviews"] = sum(
+        1 for r in reviews if r.get("verified_purchase") is True
+    )
+    data["review_text_chars"] = sum(len(r.get("text") or "") for r in reviews)
+    data["ranked_by"] = (
+        "the reviews Amazon renders on this book's own review section, read "
+        "live after scrolling to them"
+    )
+    if not reviews:
+        if await _page_has_signin_wall(page):
+            data["blocked_reason"] = (
+                "Amazon required sign-in to show these reviews; none could be "
+                "read. Reviews already visible elsewhere in the run still "
+                "count — otherwise say this buyer signal is unavailable."
+            )
+        else:
+            region = await _page_review_text(page)
+            data["blocked_reason"] = (
+                "no review container matched on this page"
+                + (
+                    "; the review region still rendered text, captured as "
+                    "review_region_text"
+                    if region else " and the review region rendered nothing"
+                )
+            )
+            if region:
+                data["review_region_text"] = region
+    elif len(reviews) < 5:
+        data["note"] = (
+            f"only {len(reviews)} review(s) were rendered on this page; "
+            "Amazon shows more after further scrolling or on the all-reviews "
+            "page — read another page if the buyer signal is thin"
+        )
+    return data
 
 
 async def _extract_review_snippets(page: Any, max_items: int = 4) -> list[dict[str, Any]]:

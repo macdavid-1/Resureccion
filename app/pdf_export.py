@@ -379,15 +379,9 @@ def ai_markdown_to_blocks(
             b["x"] = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", b["x"]).strip()
     blocks = [b for b in blocks if b.get("t") == "hr" or str(b.get("x", "")).strip() or b.get("t") in ("img", "table")]
 
-    # The audit stamp travels with the printed report: a provisional report
-    # says so and names the gates that did not pass.
-    validation = model.get("validation") or {}
-    if validation.get("mode"):
-        status = "FINAL" if validation.get("passed") else "PROVISIONAL"
-        blocks.append({"t": "hr"})
-        blocks.append({"t": "chip", "x": f"Report status: {status}"})
-        for failure in (validation.get("failures") or [])[:5]:
-            blocks.append({"t": "p", "x": f"— {failure}"})
+    # No audit stamp is appended to a MODEL-authored document: the report is
+    # the analyst's, whole, and the validation verdict lives on the report
+    # record (meta.validation) for the UI to show. The backend adds no section.
     return title, subtitle, blocks
 
 

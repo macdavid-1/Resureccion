@@ -18,18 +18,26 @@ from tests.test_research_runner import (
 )
 
 
-async def _run_session(db, config, session_id: str, *, ai_report: bool = True):
-    """Drive a full scripted research run to completion.
-
-    `ai_report=False` exercises the DETERMINISTIC renderer this module tests:
-    the normal path has the model write the report (app.report_writer), and the
-    generated layout is the fallback for a failed writing call.
-    """
+async def _run_session(db, config, session_id: str):
+    """Drive a full scripted research run to completion."""
     from tests.test_research_runner import ScriptedModel
 
-    config.report_ai_enabled = ai_report
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     await runner.run(session_id)
+
+
+def _legacy_body(model: dict) -> str:
+    """The deterministic layout, rendered from a stored model.
+
+    The model writes the report itself now, so this renderer survives only
+    for reports stored before that change (and to keep the structured model
+    readable on disk). These tests cover it on that basis: same durable
+    records, same layout.
+    """
+    from app.report_model import ReportModel, render_markdown
+
+    data = {k: v for k, v in model.items() if k != "ai_report"}
+    return render_markdown(ReportModel.from_dict(json.loads(json.dumps(data))))
 
 
 def _final_report(db, config, session_id: str):
@@ -94,8 +102,9 @@ class TestKeywordPlanAndCategories:
     async def test_real_run_renders_new_sections(self, db, config, session):
         """The rendered report carries the keyword plan, category
         recommendations, and the demand-vs-competition verdict."""
-        await _run_session(db, config, session, ai_report=False)
-        _, body, model = _final_report(db, config, session)
+        await _run_session(db, config, session)
+        _, _stored, model = _final_report(db, config, session)
+        body = _legacy_body(model)
         o = model["opportunities"][0]
         assert o["keyword_plan"], "keyword plan empty"
         assert "category_plan" in o and "demand_accommodation" in o
@@ -167,8 +176,9 @@ class TestReportModelFromRealRun:
 
     @pytest.mark.asyncio
     async def test_rendered_markdown_has_all_major_sections(self, db, config, session):
-        await _run_session(db, config, session, ai_report=False)
-        _, body, _ = _final_report(db, config, session)
+        await _run_session(db, config, session)
+        _, _stored, model = _final_report(db, config, session)
+        body = _legacy_body(model)
 
         for heading in (
             "# Resurrección — Market Intelligence Report",
@@ -288,16 +298,11 @@ class TestPlainLanguageRecords:
 class TestReportPersistenceAndRerender:
     @pytest.mark.asyncio
     async def test_model_json_is_round_trippable(self, db, config, session):
-        await _run_session(db, config, session, ai_report=False)
+        await _run_session(db, config, session)
         _rep, _body, model = _final_report(db, config, session)
 
-        from app.report_model import ReportModel, render_markdown
-
         # from_dict(to_json) must survive the round trip.
-        m2 = ReportModel.from_dict(json.loads(json.dumps(model)))
-        body2 = render_markdown(m2)
-        # Re-rendered body equals the stored body modulo the validation badge
-        # (which the runner splices in after rendering).
+        body2 = _legacy_body(model)
         assert "## Opportunity portfolio" in body2
         assert "**Precise niche:**" in body2
 

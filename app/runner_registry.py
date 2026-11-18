@@ -73,6 +73,7 @@ class RunnerRegistry:
             trace=getattr(st, "trace", None),
             supervisor=getattr(st, "autonomy", None),
             owner_messages=getattr(st, "owner_messages", None),
+            memory=getattr(st, "research_memory", None),
             live_view=getattr(st, "live_view", None),
             thoughts=getattr(st, "thoughts", None),
             live_session_id=session_id,

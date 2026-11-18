@@ -56,6 +56,7 @@ from app.marketplace import (
 from app.methodology import (
     EXTERNAL_ACTIONS,
     P1_DISCOVERY,
+    P2_NICHING,
     P3_COMPETITION,
     P4_CONSUMER,
     P5_DEMAND,
@@ -98,6 +99,7 @@ from app.research_data import (
     ResearchNoteStore,
     VerificationStore,
 )
+from app.research_memory import REMEMBER, ResearchMemoryStore
 from app.search_totals import competition_text, results_captured, search_total
 from app.sessions import SessionStore
 from app.thresholds import get_thresholds
@@ -159,7 +161,9 @@ _MODEL_FAILURE_LIMIT = 3
 # annotation data, never analysis: they are stripped before a phase's output
 # is committed, so they never come back to the model as "prior decisions" and
 # never bloat a checkpoint.
-_CONTROL_KEYS = frozenset({"goto_phase", "actions", "activity_note", "notes"})
+_CONTROL_KEYS = frozenset(
+    {"goto_phase", "actions", "activity_note", "notes", "memory"}
+)
 
 
 @asynccontextmanager
@@ -371,6 +375,7 @@ class ResearchRunner:
         supervisor: Any = None,
         live_view: Any = None,
         thoughts: Any = None,
+        memory: ResearchMemoryStore | None = None,
         live_session_id: str | None = None,
     ) -> None:
         self.db = db
@@ -388,6 +393,10 @@ class ResearchRunner:
         # Free-form notes the model writes during research (the escape hatch
         # for what no phase field holds). They reach the final report.
         self.notes = ResearchNoteStore(db)
+        # The model's own long-running memory: append-only, uncapped, re-read
+        # in full every step and inherited by follow-up runs (see
+        # app.research_memory).
+        self.research_memory = memory or ResearchMemoryStore(db)
         self.opportunities = opportunities
         self.artifacts = artifacts
         self.browser = browser
@@ -624,6 +633,56 @@ class ResearchRunner:
             self.events.append(
                 session_id, level="info", actor="model", action="notes_written",
                 detail={"phase": phase, "notes": stored},
+            )
+        return stored
+
+    def _capture_memory(self, session_id: str, phase: str, content: Any) -> int:
+        """Persist long-form memory the model wrote as part of a reply.
+
+        The `remember` action covers mid-phase writes; this covers the other
+        natural moment — when the model stops to consolidate: an optional
+        top-level `memory` key (a string, or a list of strings / {text, kind})
+        on any reply. Entries are stored verbatim and re-read in full on every
+        later step, so consolidating at the end of a phase is worth doing.
+
+        Additive by construction: a malformed entry is skipped and nothing
+        here can fail a run.
+        """
+        raw = content.get("memory") if isinstance(content, dict) else None
+        if not raw:
+            return 0
+        if isinstance(raw, (str, dict)):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return 0
+        stored = 0
+        for item in raw:
+            text = ""
+            kind = "memory"
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, dict):
+                text = str(item.get("text") or item.get("memory") or "")
+                kind = str(item.get("kind") or "memory")
+            if not text.strip():
+                continue
+            try:
+                self.research_memory.append(
+                    session_id, text=text, phase=phase, kind=kind
+                )
+            except Exception as exc:
+                self.events.append(
+                    session_id, level="warn", actor="model",
+                    action="memory_write_failed",
+                    detail={"phase": phase,
+                            "error": f"{type(exc).__name__}: {exc}"[:200]},
+                )
+                break
+            stored += 1
+        if stored:
+            self.events.append(
+                session_id, level="info", actor="model", action="memory_written",
+                detail={"phase": phase, "entries": stored},
             )
         return stored
 
@@ -1003,6 +1062,9 @@ class ResearchRunner:
         session_started: float,
     ) -> dict[str, Any]:
         spec = SPECS[phase]
+        # A follow-up continues an investigation instead of beginning one.
+        # That changes the framing and the floors below — never the law.
+        continuation = bool(getattr(session, "parent_session_id", None))
         # Per-mode budget profile: the SAME methodology, shaped differently
         # for a detailed brief vs keywords vs a run with no topic at all.
         max_iter = self._phase_iterations(phase, session.mode)
@@ -1120,12 +1182,19 @@ class ResearchRunner:
             # Vision ground truth: fetch the newest browser screenshot before
             # building the prompt (the prompt notes whether one is attached).
             screenshot_png = self._latest_screenshot()
-            system = build_system_prompt(phase)
+            system = build_system_prompt(phase, continuation=continuation)
             user = build_user_prompt(
                 phase,
                 mode=session.mode,
                 objective=session.objective,
                 prompt_text=session.prompt,
+                # A continuation's prompt IS the previous run's record: it is
+                # handed over whole (the generic digest cap would cut it).
+                continuation=continuation,
+                brief_limit=(
+                    max(16_000, len(session.prompt or "") + 1_000)
+                    if continuation else 16_000
+                ),
                 marketplaces=[m.code for m in self.executor._marketplace_cycle],
                 marketplace_mode=self._marketplace_mode(session_id),
                 evidence_digest=self._evidence_digest(session_id),
@@ -1145,6 +1214,8 @@ class ResearchRunner:
                 # What the model's LAST requested actions actually did (ok,
                 # summary or refusal) — closed-loop feedback, bounded.
                 recent_actions=list(self._recent_action_results.get(session_id) or []),
+                # The model's own memory, in full: uncapped, unsummarized.
+                memory_entries=self.research_memory.list(session_id),
                 depth_note=self._depth_note(session_started),
                 owner_messages=self._owner_note_lines_for(session_id),
                 pivot_directive=pivot_directive,
@@ -1163,6 +1234,7 @@ class ResearchRunner:
                     latest=last_counts,
                     prior_outputs=prior_outputs,
                     session_started=session_started,
+                    continuation=continuation,
                 ),
             )
             model_calls += 1
@@ -1296,6 +1368,10 @@ class ResearchRunner:
             # Anything the model noted that no contract field can hold is
             # stored durably here and replayed into the final report.
             self._capture_notes(session_id, phase, reply.content)
+            # Long-form memory the model consolidated at any point (the
+            # `remember` action is the mid-phase channel; this is the reply's
+            # own optional `memory` key).
+            self._capture_memory(session_id, phase, reply.content)
             # Durable per-run token/cost accounting (exposed on the session).
             self._record_model_usage(session_id, reply)
             if reply.elapsed_seconds and reply.elapsed_seconds >= 150:
@@ -1361,6 +1437,13 @@ class ResearchRunner:
                                     "mode": session.mode, "iteration": iteration},
                         )
                         continue
+                    # The model's own memory: written by it, read back in
+                    # full on every step. A store write, never a page action.
+                    if action_name == REMEMBER:
+                        self._remember(
+                            session_id, phase, dict(a.get("args") or {})
+                        )
+                        continue
                     # Record edits (candidate/opportunity/evidence/claim
                     # corrections) are applied through the stores, not the
                     # browser: same journaling, no page involved.
@@ -1409,9 +1492,18 @@ class ResearchRunner:
             primary = spec.output_contract[0]
             items = _primary_items(reply.content, primary)
             floor = self._item_floor(
-                spec, self._output_floor(phase, prior_outputs, counts["candidates"])
+                spec,
+                self._output_floor(
+                    phase, prior_outputs, counts["candidates"],
+                    continuation=continuation,
+                ),
+                continuation=continuation,
             )
             required_evidence = self._evidence_floor(spec.min_evidence, session_started)
+            if continuation and phase in (P1_DISCOVERY, P2_NICHING):
+                # Same reason as the declared floor above: a continuation's
+                # entry phase may close on the record it already has.
+                required_evidence = 0
 
             # The model's most complete analysis so far survives a forced or
             # budget exit: whichever reply filled the primary contract with
@@ -1487,11 +1579,23 @@ class ResearchRunner:
                     )
                     return {"_goto": goto}
 
+            # A continuation's discovery/niching entry phase owes no fresh
+            # browsing: the previous run's captures ARE its evidence, and this
+            # phase exists only to let the model decide where to go next.
+            # Without this, a model that already knows its next move would be
+            # forced to gather eight new captures (a new sweep) to satisfy a
+            # floor written for a run that starts empty.
+            evidence_owed = not (continuation and phase in (P1_DISCOVERY, P2_NICHING))
+
             # The DECLARED floors (what the phase always owes) …
             declared_floors_met = (
                 not missing
                 and items >= floor
-                and (spec.min_evidence == 0 or phase_new_evidence >= spec.min_evidence)
+                and (
+                    not evidence_owed
+                    or spec.min_evidence == 0
+                    or phase_new_evidence >= spec.min_evidence
+                )
             )
             # … versus the depth-raised floor, which only applies while the
             # session is still under RESEARCH_MIN_HOURS.
@@ -2191,7 +2295,31 @@ class ResearchRunner:
         buyers type (autocomplete frontier). Runs BEFORE Phase 1 so discovery
         reasons over measurements, and runs ONCE per session — the durable
         checkpoint makes a resumed session reuse it instead of re-walking.
+
+        A CONTINUATION skips it. Its census, keyword totals and demand
+        language are already in the record this session inherited, and
+        unrolling a fresh broad-market walk before the model has decided
+        anything is precisely the "start a new research from scratch"
+        behaviour a follow-up must not have.
         """
+        if getattr(session, "parent_session_id", None):
+            self.checkpoints.save(
+                session_id, "discovery_preflight",
+                {"done": True, "skipped": "continuation"},
+            )
+            self.trace.record(
+                session_id, KIND_DISCOVERY,
+                "Skipped the fresh-market census: this run continues an earlier "
+                "research, so the measured map and demand language it already "
+                "has come from that record instead of a new broad walk",
+            )
+            self.events.append(
+                session_id, level="info", actor="system",
+                action="discovery_preflight_skipped",
+                detail={"reason": "continuation",
+                        "parent_session_id": str(session.parent_session_id)},
+            )
+            return
         try:
             cp = self.checkpoints.get_safe(session_id, "discovery_preflight")
             payload = dict(cp.payload) if cp else {}
@@ -3632,6 +3760,55 @@ class ResearchRunner:
         bucket.append(entry)
         del bucket[:-8]
 
+    def _remember(
+        self, session_id: str, phase: str, args: dict[str, Any]
+    ) -> None:
+        """Append one entry to the model's own long-running memory.
+
+        The text is stored exactly as written (no trimming, no cap): the
+        model is writing notes to itself, and those words are the whole point.
+        A refusal is reported back through the action feedback so the model
+        knows its memory entry did not land.
+        """
+        text = str(args.get("text") or "")
+        kind = str(args.get("kind") or "memory").strip() or "memory"
+        try:
+            if not text.strip():
+                raise ValueError("remember needs non-empty 'text'")
+            entry = self.research_memory.append(
+                session_id, text=text, phase=phase, kind=kind
+            )
+        except Exception as exc:
+            reason = f"memory entry not stored: {exc}"
+            self.events.append(
+                session_id, level="warn", actor="agent",
+                action="memory_write_rejected",
+                detail={"phase": phase, "reason": reason[:400]},
+            )
+            self._note_action_result(session_id, REMEMBER, None, error=reason)
+            return
+        self.events.append(
+            session_id, level="info", actor="agent", action="memory_written",
+            detail={"phase": phase, "kind": entry.kind, "chars": len(entry.text)},
+        )
+        try:
+            self.trace.record(
+                session_id, KIND_DISCOVERY,
+                f"Recorded to its own memory ({entry.kind}): {entry.text[:160]}",
+            )
+        except Exception:
+            pass  # the entry is durable; the feed line is additive
+        bucket = self._recent_action_results.setdefault(session_id, [])
+        bucket.append({
+            "action": REMEMBER,
+            "ok": True,
+            "summary": (
+                f"stored {len(entry.text)} chars as entry #{entry.id}; every "
+                "entry is re-read in full on every step"
+            ),
+        })
+        del bucket[:-8]
+
     def _apply_record_edit(
         self, session_id: str, action: str, args: dict[str, Any], phase: str
     ) -> None:
@@ -3716,7 +3893,7 @@ class ResearchRunner:
                 score.to_dict().get("score") if score is not None
                 else (c.meta or {}).get("whitespace", {}).get("score")
             )
-            items.append({
+            item = {
                 "candidate_id": c.id,
                 "niche": c.niche,
                 "status": c.status,
@@ -3724,7 +3901,14 @@ class ResearchRunner:
                 "score": c.score,
                 "whitespace": value,
                 "rationale": c.rationale[:200],
-            })
+            }
+            # A follow-up's ledger starts with the previous run's candidates:
+            # the verdict they earned there travels with them so the model
+            # continues them instead of treating them as unknown.
+            inherited = (c.meta or {}).get("continued_from")
+            if inherited:
+                item["continued_from"] = inherited
+            items.append(item)
         items.sort(key=lambda d: (
             -(d["whitespace"] if isinstance(d["whitespace"], (int, float)) else -1.0),
             d["niche"],
@@ -3745,7 +3929,12 @@ class ResearchRunner:
         }
 
     def _output_floor(
-        self, phase: str, prior_outputs: dict[str, Any], candidates_seen: int
+        self,
+        phase: str,
+        prior_outputs: dict[str, Any],
+        candidates_seen: int,
+        *,
+        continuation: bool = False,
     ) -> int:
         """How many primary-output items this phase needs before it may commit.
 
@@ -3762,6 +3951,11 @@ class ResearchRunner:
         want = spec.min_output_items
         if want <= 0:
             return 0
+        if continuation and phase in (P1_DISCOVERY, P2_NICHING):
+            # A continuation may legitimately owe discovery NOTHING: the
+            # previous run already produced the signals and the candidates.
+            # Forcing a fresh pool here is what restarted the research.
+            return 0
         needs = set(spec.consumes)
         if not needs:
             return want
@@ -3773,7 +3967,7 @@ class ResearchRunner:
         return want
 
     @staticmethod
-    def _item_floor(spec: Any, floor: int) -> int:
+    def _item_floor(spec: Any, floor: int, *, continuation: bool = False) -> int:
         """Items a phase owes before it may commit.
 
         A phase that DECLARES content (`min_output_items > 0`) may never
@@ -3783,6 +3977,10 @@ class ResearchRunner:
         phases 8 and 9 (min 0) stay free, because the deterministic pipeline
         and the opportunity contract decide those instead of the model.
         """
+        if continuation and not floor:
+            # The continuation already has upstream content in its record; a
+            # zero floor there is a decision, not an empty hand-over.
+            return 0
         if getattr(spec, "min_output_items", 0) > 0:
             return max(int(floor), 1)
         return int(floor)
@@ -3795,6 +3993,7 @@ class ResearchRunner:
         latest: dict[str, int],
         prior_outputs: dict[str, Any],
         session_started: float = 0.0,
+        continuation: bool = False,
     ) -> dict[str, Any]:
         """Deterministic exit-gate snapshot for the model's prompt.
 
@@ -3809,10 +4008,18 @@ class ResearchRunner:
         required = max(
             0, self._evidence_floor(spec.min_evidence, session_started) - evidence_new
         )
+        if continuation and phase in (P1_DISCOVERY, P2_NICHING):
+            # The record already holds the evidence; nothing is owed here.
+            required = 0
         return {
             "primary_output": primary,
             "min_output_items": self._item_floor(
-                spec, self._output_floor(phase, prior_outputs, latest["candidates"])
+                spec,
+                self._output_floor(
+                    phase, prior_outputs, latest["candidates"],
+                    continuation=continuation,
+                ),
+                continuation=continuation,
             ),
             "evidence_new": evidence_new,
             "evidence_required": required,
@@ -4461,90 +4668,78 @@ class ResearchRunner:
             )
         return out
 
-    def _render_report_body(
-        self, session_id: str, model: Any, build_error: Exception | None
-    ) -> tuple[str, Exception | None]:
-        """Render the markdown body, never raising.
+    def _prior_run_records(self, session_id: str) -> list[dict[str, Any]]:
+        """The FULL record of every earlier run in this investigation.
 
-        Returns (body, error). `error` is set when the full layout failed and
-        the compact fallback was delivered, so the caller can re-render the
-        same way after validation and never pretend the full layout ran.
+        A follow-up's report must read like one analyst who has followed the
+        market from the first discovery: not a summary of the previous report,
+        but the earlier runs themselves — their briefs, owner instructions,
+        reports, measurements, rejected candidates, notes, reasoning, memory and
+        trace. Oldest first. Guarded against cycles and bounded only by the
+        number of runs in the chain.
         """
-        from app.report_model import render_fallback_markdown, render_markdown
+        from app.continuation_build import build_continuation_brief, load_adjacent_rows
+        from app.reports import ReportStore
 
-        if build_error is not None:
-            return render_fallback_markdown(model, build_error), build_error
+        reports = ReportStore(self.db, self.config)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = {session_id}
         try:
-            return render_markdown(model), None
-        except Exception as exc:
-            # A defect in one section must not cost the whole deliverable.
-            # The fallback is still a real report of this session's durable
-            # records, and says plainly that it is compact and why.
-            self.errors.record(
-                session_id, scope="report_render", severity="error",
-                message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
-            )
-            self.events.append(
-                session_id, level="error", actor="agent",
-                action="report_render_failed",
-                detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
-            )
-            self.trace.record(
-                session_id, KIND_REPORT,
-                f"Full report layout failed ({type(exc).__name__}); "
-                "delivered the compact report instead of nothing",
-            )
-            return render_fallback_markdown(model, exc), exc
-
-    def _minimal_report_model(self, session_id: str, notes: list[Any]) -> Any:
-        """A report model safe to render when the full build failed.
-
-        Reads only the session row, the opportunity portfolio and the run
-        notes — each guarded separately — so one broken section cannot take
-        the whole model down with it.
-        """
-        from app.report_model import ReportModel, _note_rows
-
-        session: dict[str, Any] = {"id": session_id}
-        try:
-            s = self.sessions.require(session_id)
-            session = {
-                "id": s.id, "name": s.name, "mode": s.mode,
-                "objective": s.objective, "prompt": s.prompt,
-            }
+            current = self.sessions.require(session_id).parent_session_id
         except Exception:
-            pass
-        opps: list[dict[str, Any]] = []
-        try:
-            opps = [o.to_dict() for o in self.opportunities.list(session_id, limit=50)]
-        except Exception:
-            pass
-        rows, total = ([], 0)
-        try:
-            rows, total = _note_rows(notes)
-        except Exception:
-            pass
-        return ReportModel(
-            session=session,
-            executive_summary={},
-            opportunities=opps,
-            research_notes=rows,
-            research_notes_total=total,
-        )
+            return out
+        while current and current not in seen and len(out) < 20:
+            seen.add(current)
+            try:
+                brief = build_continuation_brief(
+                    current,
+                    sessions=self.sessions,
+                    candidates=self.candidates,
+                    opportunities=self.opportunities,
+                    verifications=VerificationStore(self.db),
+                    notes=self.notes,
+                    browser_evidence=self.browser_evidence,
+                    reports=reports,
+                    trace=self.trace,
+                    thoughts=self.thoughts,
+                    owner_messages=self.owner_messages,
+                    memory=self.research_memory,
+                    adjacent_rows=load_adjacent_rows(reports, current),
+                )
+            except Exception as exc:
+                self.errors.record(
+                    session_id, scope="prior_runs", severity="warning",
+                    message=f"could not read earlier run {current}: "
+                            f"{type(exc).__name__}: {exc}"[:240],
+                    recoverable=True,
+                )
+                break
+            out.append({
+                "session_id": current,
+                "name": brief.parent_name,
+                "status": brief.parent_status,
+                "record": brief.record_text(),
+                "report_title": brief.report_title,
+            })
+            try:
+                current = self.sessions.require(current).parent_session_id
+            except Exception:
+                break
+        out.reverse()  # oldest first: the chain as it actually happened
+        return out
 
     async def _write_ai_report(
         self, session_id: str, model: Any, phase_outputs: dict[str, Any]
     ) -> dict[str, Any] | None:
         """The report, written BY THE MODEL from the whole research record.
 
-        One raw-text call over the complete dossier (app.report_writer), with a
-        single corrective retry when the draft quotes figures that were never
-        measured or selects screenshots that were never captured. Returns None
-        on any failure so the caller renders the deterministic report instead —
-        the owner always gets a deliverable.
+        One raw-text call over the complete dossier (app.report_writer), plus
+        corrective retries when the draft quotes figures that were never
+        measured, selects screenshots that were never captured, comes back
+        empty, or the call itself fails. The backend never authors a report,
+        so exhausting every attempt returns None and the caller reports the
+        failure instead of fabricating one.
         """
-        if not getattr(self.config, "report_ai_enabled", True):
-            return None
         from app.report_writer import (
             REPORT_SYSTEM,
             allowed_for,
@@ -4570,10 +4765,13 @@ class ResearchRunner:
                 thoughts=self.thoughts,
                 trace=self.trace,
                 owner_messages=self.owner_messages,
+                memory=self.research_memory,
                 artifacts=self.artifacts,
                 model=model.to_dict() if hasattr(model, "to_dict") else {},
                 phase_outputs=phase_outputs,
                 backlog=self._backlog_items(session_id),
+                # Earlier runs of this investigation, with their FULL records.
+                prior_runs=self._prior_run_records(session_id),
                 context_chars=int(
                     getattr(self.config, "report_context_chars", 600_000) or 600_000
                 ),
@@ -4591,7 +4789,8 @@ class ResearchRunner:
         prompt = user_prompt(ctx)
         prompt_chars = len(prompt)
         report = None
-        for attempt in (1, 2):
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
                 reply = await self.model.call(
                     session_id,
@@ -4611,10 +4810,11 @@ class ResearchRunner:
                 self.events.append(
                     session_id, level="warn", actor="agent",
                     action="report_writer_failed",
-                    detail={"attempt": attempt,
+                    detail={"attempt": attempt, "of": attempts,
                             "error": f"{type(exc).__name__}: {exc}"[:300]},
                 )
-                break
+                prompt = correction_prompt(ctx, [], [])
+                continue
             self._record_model_usage(session_id, reply)
             draft = normalize_report(
                 str(getattr(reply, "raw", "") or ""),
@@ -4626,7 +4826,7 @@ class ResearchRunner:
             report = draft
             if draft is not None and not (draft.removed_numbers or draft.removed_figures):
                 break
-            if attempt == 1:
+            if attempt < attempts:
                 prompt = correction_prompt(
                     ctx,
                     draft.removed_numbers if draft else [],
@@ -4634,15 +4834,19 @@ class ResearchRunner:
                 )
         if report is None:
             self.events.append(
-                session_id, level="warn", actor="agent", action="report_writer_unusable",
-                detail={"note": "the model's report was empty or could not be "
-                                 "grounded; delivering the deterministic report"},
+                session_id, level="error", actor="agent", action="report_writer_unusable",
+                detail={"note": "the model produced no usable report after "
+                                 f"{attempts} attempt(s); nothing was invented "
+                                 "to replace it",
+                        "attempts": attempts},
             )
             return None
 
         payload = report.to_dict()
         payload.update({
-            "generator": "report_writer.v1",
+            "authored_by": "model",
+            "prior_runs": len(ctx.get("prior_runs") or []),
+            "generator": "report_writer.v2",
             "model": str(getattr(self.model, "model_name", "") or ""),
             "context_chars": prompt_chars,
             "evidence_records": len(ctx.get("evidence") or []),
@@ -4671,7 +4875,15 @@ class ResearchRunner:
         return payload
 
     async def _write_final_report(self, session_id: str, phase_outputs: dict[str, Any]) -> None:
-        from app.report_model import build_report_model, render_markdown
+        """The report: written by the model, from the whole record, always.
+
+        The backend's entire contribution is the dossier (measured records,
+        evidence, screenshots, the chain of earlier runs) and the plumbing
+        that resolves citations and enforces grounding. It authors no section,
+        no summary, no stamp and no fallback: if the model cannot deliver, the
+        session reports that plainly rather than shipping prose nobody wrote.
+        """
+        from app.report_model import build_report_model
         from app.report_validation import ReportValidator
         from app.research_data import VerificationStore
 
@@ -4688,16 +4900,14 @@ class ResearchRunner:
                 message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
             )
 
-        # Structured model first — the report is a RENDERING of durable
-        # research state, never a free-form string.
+        # The dossier: durable research state assembled for the writer.
         # Headroom scores + backlog feed the report's ranking and its
         # "adjacent opportunities not yet researched" ledger.
         try:
             ws = self._whitespace_scores(session_id)
         except Exception:
             ws = {}
-        run_notes = self.notes.list(session_id, limit=500)
-        build_error: Exception | None = None
+        run_notes = self.notes.list(session_id, limit=10_000_000)
         try:
             model = build_report_model(
                 session_id,
@@ -4729,10 +4939,9 @@ class ResearchRunner:
                 notes=run_notes,
             )
         except Exception as exc:
-            # Even the structured build failing must not cost the owner the
-            # deliverable: a minimal model is assembled from durable records
-            # and rendered in compact form below.
-            build_error = exc
+            # The dossier comes from durable records. If THAT fails there is
+            # nothing to write from, and inventing a report to cover for it
+            # would be worse than saying so.
             self.errors.record(
                 session_id, scope="report_model", severity="error",
                 message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
@@ -4742,48 +4951,23 @@ class ResearchRunner:
                 action="report_model_failed",
                 detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
             )
-            model = self._minimal_report_model(session_id, run_notes)
-        ai_report: dict[str, Any] | None = None
-        if build_error is None:
-            # The model writes the report itself, from everything the run
-            # gathered. The deterministic model above is its dossier and, if
-            # the call fails, the fallback below.
-            ai_report = await self._write_ai_report(session_id, model, phase_outputs)
-        if ai_report:
-            model.ai_report = ai_report
-            body, render_error = str(ai_report.get("markdown") or ""), None
-        else:
-            # Fallback path: the model still supplies the analyst prose and the
-            # per-candidate playbooks so the deterministic report is analytical
-            # rather than a bare table dump.
-            #
-            # Analyst prose: the model interprets the verified records above;
-            # it never computes a figure. Empty on any failure — the report
-            # renders deterministically without it.
-            narrative = await self._analyst_narrative(session_id, model)
-            if narrative:
-                model.narrative = narrative
-            # Per-final-candidate playbooks: written by the model from that
-            # candidate's measured data only (app.finalist_playbook).
-            # Degrades to the measured tables when prose cannot be grounded.
-            try:
-                playbooks = await self._finalist_playbooks(session_id, model)
-            except Exception as exc:
-                # Playbooks are model prose on top of measured tables. A bug
-                # here may cost the prose; it may never cost the report.
-                playbooks = {}
-                self.errors.record(
-                    session_id, scope="finalist_playbooks", severity="warning",
-                    message=f"{type(exc).__name__}: {exc}"[:300], recoverable=True,
-                )
-                self.events.append(
-                    session_id, level="warn", actor="agent",
-                    action="finalist_playbooks_failed",
-                    detail={"error": f"{type(exc).__name__}: {exc}"[:300]},
-                )
-            if playbooks:
-                model.finalist_playbooks = playbooks
-            body, render_error = self._render_report_body(session_id, model, build_error)
+            raise ReportWriteError(
+                "the report dossier could not be assembled from the research "
+                f"record ({type(exc).__name__}: {exc}); no report was written"
+            ) from exc
+        # THE MODEL WRITES THE REPORT. There is no template, no generated
+        # layout and no fallback: a report the backend wrote is not the
+        # analyst's account the owner was promised.
+        ai_report = await self._write_ai_report(session_id, model, phase_outputs)
+        if not ai_report:
+            raise ReportWriteError(
+                "the model did not produce a usable report after repeated "
+                "attempts; nothing was generated by the backend to stand in "
+                "for it. All research data is saved, so the report can be "
+                "written once the model is available again."
+            )
+        model.ai_report = ai_report
+        body = str(ai_report.get("markdown") or "").strip()
 
         # Adversarial validation of the deliverable: gates + per-opportunity
         # chain-of-custody checks. A failing report is delivered as
@@ -4807,37 +4991,28 @@ class ResearchRunner:
             evidence=self.evidence,
         ).validate(session_id, report_body=body)
 
-        # The validation verdict lives in the model, and the renderer shows it
-        # from there — so a report re-rendered later from its stored model
-        # keeps the exact same FINAL / PROVISIONAL status.
+        # The validation verdict travels with the report as METADATA (status,
+        # failing gates) — the UI reads it. It is never written INTO the body:
+        # the model's document is the deliverable, whole.
         model.validation = validation.to_dict()
-        try:
-            from app.report_model import render_fallback_markdown
-
-            body = (
-                render_fallback_markdown(model, render_error)
-                if render_error is not None
-                else render_markdown(model)
-            )
-        except Exception:
-            pass  # the validated body above already holds the full analysis
         store = ReportStore(self.db, self.config)
         rep = store.save(
             session_id,
             kind="final",
-            title=str((ai_report or {}).get("title") or "Resurrección Market Intelligence Report")[:160],
+            title=str(ai_report.get("title") or "Resurrección Market Intelligence Report")[:160],
             body_markdown=body,
             meta={
                 "generated_by": "research_runner",
-                "generator": "report_writer.v1" if ai_report else "report_model.v2",
-                "authored_by": "model" if ai_report else "deterministic_fallback",
+                "generator": "report_writer.v2",
+                "authored_by": "model",
+                "prior_runs": int(ai_report.get("prior_runs") or 0),
                 "validation": validation.to_dict(),
                 "mode": validation.mode,
-                "figures": list((ai_report or {}).get("figures") or []),
-                "evidence_ids": list((ai_report or {}).get("evidence_ids") or []),
-                "words": int((ai_report or {}).get("words") or 0),
+                "figures": list(ai_report.get("figures") or []),
+                "evidence_ids": list(ai_report.get("evidence_ids") or []),
+                "words": int(ai_report.get("words") or 0),
                 "dropped_unknown_figures": list(
-                    (ai_report or {}).get("removed_numbers") or []
+                    ai_report.get("removed_numbers") or []
                 ),
             },
         )
@@ -4866,6 +5041,10 @@ class ResearchRunner:
 
 class _Cancelled(Exception):
     pass
+
+
+class ReportWriteError(Exception):
+    """The model did not deliver a report, and the backend does not invent one."""
 
 
 class _NicheProbe:

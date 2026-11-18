@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from app.research_data import MAX_NOTE_CHARS, ResearchNoteStore
+from app.research_data import ResearchNoteStore
 from tests.test_research_runner import session  # noqa: F401 — pytest fixture reuse
 
 
@@ -65,9 +65,11 @@ def test_notes_store_dedupes_normalizes_and_bounds(db, session):
     assert empty == "empty"
     assert store.count(session) == 1
 
-    long_note, _ = store.add(session, text="x" * (MAX_NOTE_CHARS + 500))
+    # No note text is ever truncated: a lossy note is worse than no note.
+    long_note, _ = store.add(session, text="detail " * 5_000)
     assert long_note is not None
-    assert len(long_note.text) == MAX_NOTE_CHARS
+    assert long_note.text == ("detail " * 5_000).strip()
+    assert len(long_note.text) == 34_999
 
 
 def test_notes_store_reports_a_spent_budget_instead_of_dropping_silently(
@@ -107,9 +109,6 @@ async def test_runner_stores_phase_notes_once_and_never_as_evidence(db, config, 
             ]
             return reply
 
-    # The generated layout is the fallback renderer now that the model writes
-    # the report; this test covers the notes→report guarantee on that path.
-    config.report_ai_enabled = False
     runner = make_runner(db, config, NoteModel(PHASE_OUTPUTS))
     await runner.run(session)
 
@@ -123,15 +122,15 @@ async def test_runner_stores_phase_notes_once_and_never_as_evidence(db, config, 
     # satisfied by writing prose.
     assert runner.observations.count(session) == 0
 
-    # …and they reach the final report.
+    # …and they reach the report writer: the model writes the report, so the
+    # guarantee is that every note is in the dossier it writes from.
     reps = ReportStore(db, config)
     final = [r for r in reps.list(session) if r.kind == "final"]
     assert final, "no final report persisted"
-    md = reps.read_markdown(final[0])
-    assert "## Research notes written during the run" in md
-    assert filler in md
-    assert "The Kindle category tree loops back on itself here." in md
-    assert "grief journals" in md
+    dossier = runner.model.report_prompts[-1]
+    assert filler in dossier
+    assert "The Kindle category tree loops back on itself here." in dossier
+    assert "grief journals" in dossier
 
 
 # ------------------------------------------------------------------- report

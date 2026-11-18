@@ -235,7 +235,10 @@ class ObservationStore:
         )
 
 
-MAX_NOTE_CHARS = 1500
+# Notes are a SHORT annotation channel; the model's long-form record lives in
+# app.research_memory. Note TEXT is therefore never truncated (a lossy note is
+# worse than no note: the model re-reads its own words later), while the number
+# of note rows per session stays bounded.
 MAX_NOTES_PER_SESSION = 400
 
 
@@ -296,7 +299,7 @@ class ResearchNoteStore:
         "full" (the session's bounded note budget is spent). Nothing raises
         for a bad note: notes are additive, research never stops for them.
         """
-        cleaned = " ".join(str(text or "").split())[:MAX_NOTE_CHARS].strip()
+        cleaned = " ".join(str(text or "").split()).strip()
         if not cleaned:
             return None, "empty"
         with self.db.read() as conn:

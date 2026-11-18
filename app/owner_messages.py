@@ -111,8 +111,12 @@ class OwnerMessageStore:
 
     def journal(self, session_id: str, limit: int = 200) -> list[OwnerMessage]:
         """Every owner message for the session, oldest first — the durable
-        guidance context re-included in each prompt."""
-        limit = max(1, min(limit, 500))
+        guidance context re-included in each prompt.
+
+        No upper clamp: a long investigation (and a follow-up inheriting it)
+        needs every instruction the owner ever gave, not the first 500.
+        """
+        limit = max(1, limit)
         with self.db.read() as conn:
             rows = conn.execute(
                 "SELECT * FROM owner_messages WHERE session_id = ? ORDER BY id ASC LIMIT ?",

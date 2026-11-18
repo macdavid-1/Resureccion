@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.record_edits import RECORD_ACTIONS
+from app.research_memory import MEMORY_ACTIONS
 
 # --------------------------------------------------------------------------- #
 # Phases
@@ -161,12 +162,13 @@ MODE_PROFILES: dict[str, ModeBudgetProfile] = {
         iterations={
             P1_DISCOVERY: 12,         # the brief already scopes discovery
             P2_NICHING: 16,
-            P3_COMPETITION: 24,       # …so depth moves downstream
-            P4_CONSUMER: 24,
+            P3_COMPETITION: 28,       # …so depth moves downstream
+            P4_CONSUMER: 30,          # reviews cost page loads; they carry the
+                                      # most decisive signal in the report
             P5_DEMAND: 16,
-            P6_GAP: 12,
-            P7_CROSS_MARKET: 12,
-            P8_ADVERSARIAL: 20,
+            P6_GAP: 14,
+            P7_CROSS_MARKET: 14,
+            P8_ADVERSARIAL: 24,
             P9_SYNTHESIS: 12,
         },
     ),
@@ -176,12 +178,12 @@ MODE_PROFILES: dict[str, ModeBudgetProfile] = {
         iterations={
             P1_DISCOVERY: 18,
             P2_NICHING: 16,
-            P3_COMPETITION: 20,
-            P4_CONSUMER: 20,
-            P5_DEMAND: 14,
-            P6_GAP: 12,
-            P7_CROSS_MARKET: 12,
-            P8_ADVERSARIAL: 18,
+            P3_COMPETITION: 26,
+            P4_CONSUMER: 28,
+            P5_DEMAND: 16,
+            P6_GAP: 14,
+            P7_CROSS_MARKET: 14,
+            P8_ADVERSARIAL: 22,
             P9_SYNTHESIS: 12,
         },
     ),
@@ -189,14 +191,14 @@ MODE_PROFILES: dict[str, ModeBudgetProfile] = {
         mode="auto",
         extra_calls=40,
         iterations={
-            P1_DISCOVERY: 20,         # no topic: discovery must search wider
-            P2_NICHING: 18,           # …and niching is where candidates born
-            P3_COMPETITION: 18,       # lighter early competitive work
-            P4_CONSUMER: 18,
-            P5_DEMAND: 14,
-            P6_GAP: 12,
-            P7_CROSS_MARKET: 12,
-            P8_ADVERSARIAL: 18,
+            P1_DISCOVERY: 22,         # no topic: discovery must search wider
+            P2_NICHING: 20,           # …and niching is where candidates born
+            P3_COMPETITION: 24,       # lighter early competitive work
+            P4_CONSUMER: 26,
+            P5_DEMAND: 16,
+            P6_GAP: 14,
+            P7_CROSS_MARKET: 14,
+            P8_ADVERSARIAL: 22,
             P9_SYNTHESIS: 12,
         },
     ),
@@ -283,6 +285,7 @@ SPECS: dict[str, PhaseSpec] = {
             "kdspy_data", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -322,6 +325,7 @@ SPECS: dict[str, PhaseSpec] = {
             "related_products", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "niches",  # list of {niche, parent_market, chain, evidence_ids, demand_hints}
@@ -354,6 +358,7 @@ SPECS: dict[str, PhaseSpec] = {
             "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "competitive_maps",  # list of {niche, competitors[], saturation, pricing, patterns}
@@ -376,8 +381,11 @@ SPECS: dict[str, PhaseSpec] = {
     P4_CONSUMER: PhaseSpec(
         key=P4_CONSUMER,
         agent_states=("observing", "analyzing"),
-        max_iterations=14,
-        min_evidence=10,
+        # Reviews are the deepest consumer signal there is and reading them
+        # costs page loads (scroll to the section, expand, screenshot), so
+        # this phase gets the most room of any phase.
+        max_iterations=24,
+        min_evidence=14,
         consumes=("discovered",),
         produces=("discovered", "rejected"),
         allowed_actions=(
@@ -385,16 +393,24 @@ SPECS: dict[str, PhaseSpec] = {
             "record_observation", "wait", "forum_search", "goodreads_check",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "consumer_maps",  # list of {niche, praises[], complaints[], unmet[], design_opportunities[]}
         ),
         min_output_items=1,
         guidance=(
-            "Treat reviews as PRIMARY consumer evidence. Collect "
-            "representative positive AND negative patterns. Identify what "
-            "readers actually wanted, what disappointed them, what they "
-            "praised, missing content, confusing explanations, poor "
+            "Treat reviews as PRIMARY consumer evidence. `read_reviews` scrolls "
+            "to the review section itself, expands the truncated bodies, "
+            "reads the rating distribution and screenshots what it read, so "
+            "it returns actual review text — use it on every serious "
+            "candidate and on the leading competitor in each variant of the "
+            "niche, not just one. Read at least two books per serious "
+            "candidate: the market leader and the best-rated small one, "
+            "because their complaints differ and the gap usually sits between "
+            "them. Collect representative positive AND negative patterns. "
+            "Identify what readers actually wanted, what disappointed them, "
+            "what they praised, missing content, confusing explanations, poor "
             "organization, insufficient depth, outdated information, audience "
             "mismatch, and unfulfilled promises. Where Amazon reviews are "
             "thin or absent (often true in the hidden niches), community "
@@ -402,7 +418,9 @@ SPECS: dict[str, PhaseSpec] = {
             "forum_search / goodreads_check for the candidate's audience and "
             "language; whether a source is worth mining is YOUR judgment, not "
             "the backend's. Do NOT merely summarize: convert each recurring "
-            "complaint into a concrete book-design opportunity."
+            "complaint into a concrete book-design opportunity, and note in "
+            "your memory which complaints recur across books, since those are "
+            "the ones a new book can own."
         ),
     ),
     P5_DEMAND: PhaseSpec(
@@ -417,6 +435,7 @@ SPECS: dict[str, PhaseSpec] = {
             "open_product", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
             *EXTERNAL_ACTIONS,
         ),
         output_contract=(
@@ -455,6 +474,7 @@ SPECS: dict[str, PhaseSpec] = {
             "capture_evidence", "record_observation", "wait", "forum_search",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "gap_analyses",  # list of {niche, exists, sells, readers_want, competitors_fail, better, why_choose}
@@ -480,6 +500,7 @@ SPECS: dict[str, PhaseSpec] = {
             "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "cross_market_checks",  # list of {niche, marketplace, verdict, notes}
@@ -509,6 +530,7 @@ SPECS: dict[str, PhaseSpec] = {
             "kdspy_data", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "verdicts",  # list of {niche, verdict: pass|downgrade|reject, contradictions[], reasons}
@@ -540,6 +562,7 @@ SPECS: dict[str, PhaseSpec] = {
             "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
+            *MEMORY_ACTIONS,
         ),
         output_contract=(
             "opportunities",  # full opportunity objects (see OPPORTUNITY_FIELDS)
@@ -767,6 +790,7 @@ class Methodology:
             ],
             "opportunity_contract": list(OPPORTUNITY_FIELDS),
             "external_actions": list(EXTERNAL_ACTIONS),
+            "memory_actions": list(MEMORY_ACTIONS),
             "phases_allowing_external": list(PHASES_ALLOWING_EXTERNAL),
             "mode_budget_profiles": {
                 mode: {

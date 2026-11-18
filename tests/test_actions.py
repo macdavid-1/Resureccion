@@ -602,6 +602,79 @@ async def test_login_wall_without_any_signin_never_pauses(db, tmp_path):
     assert any(e.action == "sign_in_wall_skipped" for e in events.tail("s1"))
 
 
+class _ReviewEl:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def inner_text(self) -> str:
+        return self._text
+
+    async def get_attribute(self, _name: str) -> str | None:
+        return None
+
+    async def click(self, **_kwargs) -> None:
+        return None
+
+
+class _ReviewCard:
+    def __init__(self, rating: str, title: str, body: str) -> None:
+        self._parts = {
+            "review-star-rating": _ReviewEl(rating),
+            "review-title": _ReviewEl(title),
+            "review-date": _ReviewEl("Reviewed in the United States on May 1, 2026"),
+            "review-body": _ReviewEl(body),
+            "helpful-vote-statement": _ReviewEl("3 people found this helpful"),
+            "a-profile-name": _ReviewEl("A reader"),
+        }
+
+    async def query_selector(self, sel: str) -> Any:
+        if "avp-badge" in sel:
+            return _ReviewEl("Verified Purchase")
+        for key, el in self._parts.items():
+            if key in sel:
+                return el
+        return None
+
+    async def inner_text(self) -> str:
+        return ""
+
+
+class ReviewsPage(FakePage):
+    """A product page that renders its reviews once it has been scrolled."""
+
+    def __init__(self) -> None:
+        super().__init__(url="https://www.amazon.com/dp/B0TEST1234", title="Grief Journal")
+        self.cards = [
+            _ReviewCard("5.0 out of 5 stars", "Helped me", "This journal helped me write again."),
+            _ReviewCard("1.0 out of 5 stars", "Thin", "Only forty pages and repeats itself."),
+        ]
+        self.mounted = False
+
+    async def evaluate(self, script: str, *_args: Any) -> Any:
+        if "scrollBy" in script:
+            self.mounted = True
+            return None
+        if "querySelector" in script:
+            return self.mounted
+        return None
+
+    async def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    async def query_selector(self, sel: str) -> Any:
+        if "total-review-count" in sel or "acrCustomerReviewText" in sel:
+            return _ReviewEl("842 global ratings")
+        return None
+
+    async def query_selector_all(self, sel: str) -> list:
+        if "data-hook='review'" in sel or sel.startswith("#customerReviews"):
+            return self.cards if self.mounted else []
+        return []
+
+    async def inner_text(self, _sel: str) -> str:
+        return ""
+
+
 @pytest.mark.asyncio
 async def test_read_reviews_not_gated_by_backend_auth_state(db, tmp_path):
     """Review mining is the AI's call: when the reviews page renders
@@ -617,12 +690,44 @@ async def test_read_reviews_not_gated_by_backend_auth_state(db, tmp_path):
     # that sees a normal page (reviews visible, no wall).
     executor.amazon_auth = StubAuthManager()
     executor.amazon_auth.auth_store = store
+    executor.browser.page = ReviewsPage()
 
     result = await executor.execute(
         session_id="s1", action="read_reviews", args={"asin": "B0TEST1234"}
     )
     assert result.ok, "visible reviews must be captured regardless of auth state"
-    assert result.summary.startswith("captured")
+    assert result.summary.startswith("captured 2 review(s)")
+    assert "1 critical" in result.summary
+    # Stored as review_research — the kind the report dossier and the
+    # follow-up record read (the old action wrote a kind nothing consumed).
+    rows = executor.collector.evidence_store.list("s1")
+    review_rows = [r for r in rows if r.kind == "review_research"]
+    assert len(review_rows) == 1
+    data = review_rows[0].data
+    assert data["reviews_captured"] == 2
+    assert data["reviews"][0]["text"] == "This journal helped me write again."
+    assert data["reviews"][1]["rating"] == 1.0
+    assert review_rows[0].screenshot_artifact_id == "art1"
+
+
+@pytest.mark.asyncio
+async def test_read_reviews_reports_why_a_page_had_nothing_to_read(db, tmp_path):
+    """A page that renders no reviews must say so — an empty capture is not
+    the same as "this book has no complaints", and the model has to know
+    which it got."""
+    from app.browser_store import BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    executor, *_ = _wall_executor(db, tmp_path, store, "unknown", "us")
+    executor.amazon_auth = StubAuthManager()
+    executor.amazon_auth.auth_store = store
+
+    result = await executor.execute(
+        session_id="s1", action="read_reviews", args={"asin": "B0NONE0001"}
+    )
+    assert result.ok
+    assert result.summary.startswith("no reviews captured")
+    assert "no review container matched" in result.summary
 
 
 @pytest.mark.asyncio

@@ -238,14 +238,18 @@ class Config:
         # request automatically, so research never depends on it. Set
         # MODEL_STREAM=false to force the plain request.
         self.model_stream_enabled = _flag("MODEL_STREAM", True)
-        # The final report is written BY THE MODEL from the complete research
-        # record (app.report_writer). Reports are markdown, not JSON, so the
-        # report call runs in raw-text mode with a large token budget.
-        self.report_ai_enabled = _flag("REPORT_AI", True)
+        # The final report is written BY THE MODEL, every time, from the
+        # complete research record (app.report_writer) — there is no backend
+        # report and so no switch to turn one on. Reports are markdown, not
+        # JSON, so the report call runs in raw-text mode with a large budget.
         self.report_max_tokens = max(2_000, _int_env("REPORT_MAX_TOKENS", 16_000))
         # Prompt budget for the research dossier. 0 means "the model's context
         # window, minus a safe margin" (see report_writer._fit_context).
-        self.report_context_chars = max(0, _int_env("REPORT_CONTEXT_CHARS", 600_000))
+        # The dossier now also carries the FULL record of every earlier run in
+        # a follow-up chain, so the default is large enough for a chain to
+        # arrive whole. 0 still means "the model's context window, minus a safe
+        # margin" (see report_writer._fit_context).
+        self.report_context_chars = max(0, _int_env("REPORT_CONTEXT_CHARS", 1_200_000))
         # Optional headers for OpenRouter attribution.
         self.app_title = os.environ.get("APP_TITLE", "Resurreccion").strip()
 

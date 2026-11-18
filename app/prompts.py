@@ -18,6 +18,8 @@ from typing import Any
 
 from app.methodology import (
     OPPORTUNITY_FIELDS,
+    P1_DISCOVERY,
+    P2_NICHING,
     P9_SYNTHESIS,
     PHASE_ORDER,
     PHASE_TITLES,
@@ -28,6 +30,7 @@ from app.methodology import (
 from app.methodology import (
     PHASES_ALLOWING_EXTERNAL as EXTERNAL_PHASES,
 )
+from app.research_memory import render_memory
 
 
 def _compact(value: Any, limit: int = 2400) -> str:
@@ -80,6 +83,28 @@ def owner_precedence_block(*, notes_field: bool = True) -> str:
     )
 
 
+MEMORY_INSTRUCTION = (
+    "LONG-RUNNING MEMORY — your own record of this research, kept by YOU:\n"
+    "The fields of the output contract store what the backend can measure; the "
+    "memory you keep stores what YOU know. Use the 'remember' action to write "
+    "an entry whenever something would be expensive to rediscover: a finding "
+    "and the evidence behind it, a decision and the reason for it, a niche you "
+    "ruled out (and exactly why), a doubt you still have, the next thing you "
+    "intend to check, or a correction to something you wrote earlier.\n"
+    "Every entry is stored verbatim and handed back to you IN FULL on every "
+    "step, oldest first, for the rest of this run — and a follow-up run "
+    "inherits all of it. Nothing is summarized, nothing is dropped, and there "
+    "is no length limit: write as much detail as your future self will need. "
+    "Do not restate what a field already carries; write the reasoning, the "
+    "context and the judgement that fields cannot hold.\n"
+    "You may also consolidate at any point in the optional top-level key "
+    "'memory' (a string, or a list of {\"text\": \"…\", \"kind\": \"…\"}) — "
+    "most usefully just before you commit a phase: what you learned, what you "
+    "decided, what you still owe. Consolidating before a commit costs one "
+    "field and saves you from re-deriving it later."
+)
+
+
 NOTES_INSTRUCTION = (
     "NOTES — the escape hatch for what no field holds:\n"
     "The output contract names what the backend can store structurally. You "
@@ -96,7 +121,34 @@ NOTES_INSTRUCTION = (
 )
 
 
-def build_system_prompt(phase: str) -> str:
+def continuation_phase_note(phase: str) -> str:
+    """What a continuation changes about a phase's fresh-run guidance.
+
+    The methodology's guidance is written for a run that begins with nothing.
+    A follow-up begins with its previous run's whole record, so for the two
+    phases that build a market pool from scratch the guidance must not send
+    the model looking for unrelated new markets.
+    """
+    if phase == P1_DISCOVERY:
+        return (
+            "THIS RUN IS A CONTINUATION — the guidance above is the fresh-run "
+            "default. The previous run's signals, candidates and measurements "
+            "are already in SESSION BRIEF: continue THAT investigation. Do not "
+            "generate a broad pool of unrelated market signals and do not open "
+            "a fresh autocomplete/keyword sweep to find new markets. If the "
+            "record already says what comes next, answer with 'goto_phase' "
+            "and no actions — you choose the first move, not the methodology."
+        )
+    if phase == P2_NICHING:
+        return (
+            "THIS RUN IS A CONTINUATION — narrow the candidates the previous "
+            "run left open (its record names them), never a new pool of broad "
+            "markets. A follow-up may owe this phase nothing at all."
+        )
+    return ""
+
+
+def build_system_prompt(phase: str, *, continuation: bool = False) -> str:
     spec = SPECS[phase]
     return (
         owner_precedence_block()
@@ -159,6 +211,21 @@ def build_system_prompt(phase: str) -> str:
         "autocomplete suggestions as they appear; click KDSpy's injected "
         "controls to open it on a search page. Use 'evaluate' when a number, "
         "panel or hidden section is on the page but no verb reaches it.\n"
+        "- REVIEWS ARE THE DEEPEST BUYER SIGNAL. 'read_reviews' (asin) opens "
+        "the book, scrolls to the review section, expands the truncated "
+        "bodies, reads the printed rating distribution and screenshots what "
+        "it read; the evidence it returns carries the review text plus the "
+        "star split and your own counts of critical/verified reviews. Use it "
+        "on the leading competitor AND the best-rated smaller one for every "
+        "serious candidate — their complaints differ and the gap usually sits "
+        "between them. Turn recurring complaints into book-design decisions; "
+        "never declare a niche's readers satisfied without their reviews.\n"
+        "- Avoid tunnel vision: depth means chasing the MEDIUM (reviews, the "
+        "leader's exact angle, the price ladder, the category a book actually "
+        "ranks in, the language buyers use), not re-running one search. When a "
+        "candidate keeps looking strong, spend extra passes on its variants "
+        "(audience, format, promise) and on one adjacent niche. A candidate "
+        "that survives that is worth more than ten that survived one search.\n"
         "- Your own records are editable mid-run: 'add_candidate' (niche, "
         "marketplace, rationale, score) for a niche you actually found while "
         "browsing, 'update_candidate' "
@@ -175,6 +242,7 @@ def build_system_prompt(phase: str) -> str:
         "and continue, or try another marketplace/page. When reviews or "
         "other data are visible without signing in, capture them.\n"
         "- Convert observations into concrete, actionable judgments.\n"
+        "- " + MEMORY_INSTRUCTION.replace("\n", " ") + "\n"
         "- " + NOTES_INSTRUCTION.replace("\n", " ") + "\n"
         "- PHASE SWITCHING: you may leave this phase at will and jump to any "
         "other phase of the methodology — the usual reason is that "
@@ -203,8 +271,13 @@ def build_system_prompt(phase: str) -> str:
             if phase in EXTERNAL_PHASES else ""
         )
         + f"Required output JSON fields: {', '.join(spec.output_contract)}. "
-        "Optional keys: 'actions', 'activity_note', 'goto_phase', 'notes'.\n"
+        "Optional keys: 'actions', 'activity_note', 'goto_phase', 'notes', "
+        "'memory' (your long-running memory entry for this step).\n"
         f"Phase guidance: {spec.guidance}"
+        + (
+            "\n" + continuation_phase_note(phase)
+            if continuation and continuation_phase_note(phase) else ""
+        )
     )
 
 
@@ -233,6 +306,9 @@ def build_user_prompt(
     adjacency_note: str = "",
     target_note: str = "",
     recent_actions: list[dict[str, Any]] | None = None,
+    continuation: bool = False,
+    brief_limit: int = 16_000,
+    memory_entries: list[Any] | None = None,
 ) -> str:
     spec = SPECS[phase]
     parts: list[str] = []
@@ -247,14 +323,61 @@ def build_user_prompt(
     }
     if images_note:
         brief["reference_images"] = images_note
-    # The owner brief can be large on purpose: a follow-up run's brief is the
-    # previous run's whole record (report, candidates, measurements, notes,
-    # trace). The generic 2400-char digest cap would cut most of it away, so
-    # this one section gets the room it needs.
-    parts.append(
-        "SESSION BRIEF: "
-        + _compact({k: v for k, v in brief.items() if v}, limit=16_000)
-    )
+    # The owner brief can be large on purpose: a follow-up run's prompt is the
+    # previous run's whole record (its brief, every owner message, the report,
+    # the measurements, notes, reasoning and trace). The caller passes the
+    # budget that section needs — a generic digest cap must never decide how
+    # much of a continuation the model gets to see.
+    if continuation and prompt_text:
+        # Handed over as TEXT, not as an escaped JSON string: the record is a
+        # document (markdown report, quoted reasoning, instructions), and
+        # escaping every newline and quote of it makes it markedly harder to
+        # read and act on. The small header stays structured.
+        header = {k: v for k, v in brief.items() if k not in ("owner_brief",)}
+        parts.append(
+            "SESSION BRIEF: " + _compact({k: v for k, v in header.items() if v}, limit=2_000)
+        )
+        parts.append(
+            "\nPREVIOUS RUN'S COMPLETE RECORD (verbatim — this is your own prior "
+            "research, carried forward whole):\n" + prompt_text
+        )
+    else:
+        parts.append(
+            "SESSION BRIEF: "
+            + _compact({k: v for k, v in brief.items() if v}, limit=brief_limit)
+        )
+
+    # --- continuation framing (a follow-up, not a fresh research) -----------
+    # Stated once, immediately after the record, because it governs how every
+    # other section of this prompt is read.
+    if continuation:
+        parts.append(
+            "\nHOW TO READ THIS RUN — you are CONTINUING an earlier research "
+            "run, not starting one:\n"
+            "- SESSION BRIEF and the RECORD above are your OWN previous run's "
+            "record: the owner's original brief, every instruction they gave "
+            "during it, "
+            "the report you wrote, everything you measured, the candidates you "
+            "kept and the ones you killed and why, your notes and your "
+            "reasoning. Treat all of it as state you already established.\n"
+            "- Do not re-discover the market, do not build a new keyword pool, "
+            "do not re-measure totals that are already recorded, and do not "
+            "re-propose a candidate that record rejected. Repeating your own "
+            "earlier work is not progress.\n"
+            "- YOU decide what this run does first. Nothing here forces a first "
+            "move: if the record already shows where the investigation "
+            "stopped, say so with 'goto_phase' in a COMMIT reply (no actions) "
+            "and start there. Otherwise do the next real piece of work on the "
+            "candidates and threads the record names.\n"
+            "- EXTEND the record instead of replacing it: continue the "
+            "strongest verified work, resolve the limitations it recorded, and "
+            "follow the open threads it left. New discovery is welcome when it "
+            "extends THIS investigation.\n"
+            "- CANDIDATES below is this run's own ledger; it carries the "
+            "candidates inherited from the previous run (meta.continued_from "
+            "names the previous row and the verdict it earned there). Work "
+            "them — do not orphan them and do not start from an empty slate."
+        )
 
     # --- niche target (deterministic; what the run owes the owner) ----------
     # Empty when the owner stated no target — nothing is invented here.
@@ -333,7 +456,27 @@ def build_user_prompt(
         )
 
     # --- phase-specific instruction ----------------------------------------
-    parts.append(f"\nTASK ({PHASE_TITLES[phase]}):\n{spec.guidance}")
+    if continuation and phase == P1_DISCOVERY:
+        parts.append(
+            f"\nTASK ({PHASE_TITLES[phase]} — CONTINUATION):\n"
+            "This phase is this run's entry point, not a fresh sweep. The "
+            "previous run already produced its signals and its candidates.\n"
+            "Decide what this run does FIRST, from the record:\n"
+            "1. If the record shows plainly where the investigation stopped — "
+            "a candidate still owing competitive or consumer work, an open "
+            "demand or gap question, an adversarial doubt, a report that must "
+            "be finished — reply with 'goto_phase' set to that phase and NO "
+            "actions. That is a complete reply here.\n"
+            "2. Otherwise do only the discovery this continuation needs: "
+            "extend a recorded candidate's niche chain, settle one specific "
+            "open question, or chase one adjacency the record names. Every "
+            "signal you emit must connect to something already in the record.\n"
+            "Do NOT generate a broad pool of unrelated market signals, do NOT "
+            "run a fresh autocomplete sweep to find new markets, and do NOT "
+            "re-run a search the record already measured."
+        )
+    else:
+        parts.append(f"\nTASK ({PHASE_TITLES[phase]}):\n{spec.guidance}")
 
     # --- opportunity contract + candidate links (synthesis only) ------------
     # A dossier missing any contract field is DISCARDED by the deterministic
@@ -361,15 +504,34 @@ def build_user_prompt(
             "never for any other status."
         )
 
+    # --- the model's own long-running memory --------------------------------
+    # Every entry it has written, in full and in order — no digest, no cap.
+    # This is what survives context churn, pauses, restarts and follow-up
+    # runs; a summary of it would defeat its purpose.
+    if memory_entries:
+        parts.append(
+            "\nYOUR LONG-RUNNING MEMORY (every entry you have written in this "
+            "research, oldest first, complete and unedited — add to it with "
+            "{\"action\": \"remember\", \"args\": {\"text\": \"…\", "
+            "\"kind\": \"finding|decision|dead-end|question|plan|correction\"}}):\n"
+            + render_memory(memory_entries)
+        )
+
     # --- evidence digest ----------------------------------------------------
     bounded_evidence = [
         {k: (v if not isinstance(v, (dict, list)) else _compact(v, _DIGEST_RECORD_LIMIT))
          for k, v in item.items()}
         for item in (evidence_digest or [])
     ]
+    # Generous total budget: per-record caps already bound a single huge
+    # capture, and a truncated evidence list is the one thing the model cannot
+    # work around — a summary of evidence is not evidence.
     parts.append(
         "\nEVIDENCE SO FAR (structured, redacted; ids are stable — reference them): "
-        + (_compact(bounded_evidence) if bounded_evidence else "[] (none yet — gather some)")
+        + (
+            _compact(bounded_evidence, limit=60_000)
+            if bounded_evidence else "[] (none yet — gather some)"
+        )
     )
 
     # --- what the last requested actions actually did -----------------------
@@ -423,14 +585,14 @@ def build_user_prompt(
             out = (prior_phase_outputs or {}).get(key)
             if not out:
                 continue
+            # Each phase gets its own budget, and the TOTAL is uncapped: this
+            # is the model's own prior analysis, and condensing it is what
+            # made later phases reason from a summary of their own work.
             chunks.append(
-                f"[{PHASE_TITLES.get(key, key)}] " + _compact(out, limit=2200)
+                f"[{PHASE_TITLES.get(key, key)}] " + _compact(out, limit=200_000)
             )
         if chunks:
-            body = "\n".join(chunks)
-            if len(body) > 16000:
-                body = body[:15999] + "…"
-            parts.append("\nPRIOR PHASE DECISIONS: " + body)
+            parts.append("\nPRIOR PHASE DECISIONS: " + "\n".join(chunks))
 
     # --- cross-session market memory ----------------------------------------
     # One owner-scoped knowledge base accumulated over earlier runs. Fresh
@@ -458,8 +620,8 @@ def build_user_prompt(
             "the system instructions above wherever they conflict — follow "
             "any new instruction in your next actions and analyses, unless "
             "the message is evidently a mistake (then keep to the "
-            "instructions and record the discrepancy in 'notes'): "
-            + _compact(rendered, limit=2000)
+            "instructions and record the discrepancy in 'notes'):\n- "
+            + "\n- ".join(rendered)
         )
 
     # --- research depth (how much time the run still owes) ------------------

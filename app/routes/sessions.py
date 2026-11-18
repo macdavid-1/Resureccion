@@ -338,12 +338,15 @@ async def continuation_preview(session_id: str, request: Request) -> dict:
             reports=st.reports,
             trace=st.trace,
             thoughts=st.thoughts,
+            owner_messages=st.owner_messages,
+            memory=getattr(st, "research_memory", None),
             adjacent_rows=load_adjacent_rows(st.reports, session_id),
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"digest": brief_digest(brief), "counts": brief.to_dict()["counts"],
             "open_threads": brief.open_threads[:20],
+            "memory_entries": len(brief.memory),
             "marketplaces": brief.marketplaces}
 
 
@@ -368,6 +371,8 @@ async def start_follow_up(
         brief_digest,
         build_continuation_brief,
         load_adjacent_rows,
+        seed_candidate_ledger,
+        seed_memory,
     )
 
     try:
@@ -382,6 +387,8 @@ async def start_follow_up(
             reports=st.reports,
             trace=st.trace,
             thoughts=st.thoughts,
+            owner_messages=st.owner_messages,
+            memory=getattr(st, "research_memory", None),
             adjacent_rows=load_adjacent_rows(st.reports, session_id),
         )
     except Exception as exc:
@@ -408,12 +415,55 @@ async def start_follow_up(
         )
         st.agent.initialize(session.id)
         st.browser.ensure(session.id)
+        # The previous run's live candidates become this run's own ledger, so
+        # the rest of the machinery (digests, headroom, adjacency, synthesis
+        # links) continues the investigation instead of seeing an empty one.
+        try:
+            seeded = seed_candidate_ledger(
+                session_id, session.id, candidates=st.candidates
+            )
+        except Exception as exc:
+            seeded = []
+            st.errors.record(
+                session.id, scope="continuation", severity="warning",
+                message=f"candidate ledger not seeded: {type(exc).__name__}: {exc}"[:300],
+                recoverable=True,
+            )
+        if seeded:
+            st.trace.record(
+                session.id, "candidate",
+                f"Inherited {len(seeded)} candidate(s) from the earlier run: "
+                + "; ".join(s["niche"][:60] for s in seeded[:6]),
+            )
+        # The previous run's own memory becomes this run's first entries —
+        # uncapped, verbatim, oldest first (app.research_memory).
+        try:
+            inherited = seed_memory(
+                session_id, session.id,
+                memory=getattr(st, "research_memory", None),
+            )
+        except Exception as exc:
+            inherited = []
+            st.errors.record(
+                session.id, scope="continuation", severity="warning",
+                message=f"memory not inherited: {type(exc).__name__}: {exc}"[:300],
+                recoverable=True,
+            )
+        if inherited:
+            st.trace.record(
+                session.id, "discovery",
+                f"Inherited {len(inherited)} memory entr(ies) from the earlier "
+                f"run ({sum(i['chars'] for i in inherited):,} chars) — re-read "
+                "in full on every step",
+            )
         st.checkpoints.save(
             session.id, "continuation:parent",
             {
                 "parent_session_id": session_id,
                 "instructions": instructions,
                 "record": brief.to_dict(),
+                "seeded_candidates": seeded,
+                "seeded_memory": inherited,
             },
         )
         st.trace.record(

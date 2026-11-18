@@ -16,12 +16,16 @@ Division of labour:
   - the model writes the document.
 
 Grounding is enforced deterministically: every figure in the final markdown must
-appear in the dossier (sentence-level removal plus one corrective retry), every
+appear in the dossier (sentence-level removal plus a corrective retry), every
 `[ev:ID]` must name a real evidence record, and every `![…](shot:ID)` must name
 an evidence record that actually has a screenshot artifact in this session.
 
-Failure never costs the owner the deliverable: an empty/gutted/failed reply
-returns None and the runner renders its deterministic fallback instead.
+The backend never writes the report. There is no template, no fallback layout
+and no generated section: an empty/gutted/failed reply returns None and the
+runner re-asks the model (a report the backend wrote is not a report the owner
+was promised). For a follow-up run the dossier also carries the FULL record of
+every earlier run in the chain, so the report reads like one analyst who has
+been on this market from the first day.
 """
 from __future__ import annotations
 
@@ -35,33 +39,38 @@ from app.prompts import owner_precedence_block
 from app.report_narrative import allowed_numbers, ground_text
 
 # ---------------------------------------------------------------- instructions
-REPORT_SYSTEM = """You are Resurrección's report writer: a senior KDP market analyst who has just finished the research and must now tell the publisher, in their own language, exactly what was found.
+REPORT_SYSTEM = """You are Resurrección's report writer: a senior KDP market analyst and publishing strategist who has just finished the research and is now briefing the publisher — the person whose book will live or die in this market. You write the ENTIRE report. The system contributes the owner's brief and the measured record; every word of analysis, judgement and strategy is yours.
 
-You are not filling in a template. There is no required section list. Decide what this particular run discovered, what matters commercially, and how to make that obvious to a non-developer who wants to publish a book. Rename, merge, reorder or skip sections as the findings demand. Write the document a sharp analyst would actually hand over.
+You are not filling in a template. There is no required section list. Decide what THIS market needs the owner to understand, and organise the document around that. It should read like a market report from someone who has studied the niche to its last detail — BSRs, prices, review barriers, publication dates, buyer language, and every opening a new book could exploit — and who now says plainly how to win.
 
-WHAT THE REPORT MUST DO
-1. Answer the owner's objective directly. Their brief is in the dossier (session.owner_brief / session.objective); the report is the answer to it, not a dump of the run.
-2. Lead with the strongest opportunity and why it matters now: the reader it serves, the gap it fills, the evidence that the gap is real.
-3. Show what the leading competitors are actually publishing and how they are positioned: titles, what is inside, price and format, publication date or recency, BSR, reviews. Then contrast the weak ones: what are they getting wrong that a new book can fix?
-4. Make the measured demand concrete: the keywords with their printed Amazon result totals, the buyer intent behind them, and what the competition ceiling implies.
-5. Recommend concrete book concepts, titles, positioning and differentiation that could outperform — grounded in the evidence, never generic advice.
-6. State the risk honestly where it matters, briefly. Do not pad with caveats, methodology lectures or restatements.
+WHAT THE REPORT MUST DELIVER
+1. The answer to the owner's brief, in the opening. The brief is the question; this report is the answer.
+2. The strongest opportunity, why it exists now, who exactly buys it, and the evidence that the demand is real rather than assumed.
+3. The market as it actually is: for each serious contender, the incumbents' titles, positioning, price and format, publication dates, BSR, rating and review counts, what buyers praise and complain about, and precisely where the incumbents are weak — with the measured figures and screenshots that prove it.
+4. A domination plan the owner can execute: the exact keyword phrases with Amazon's printed totals and what each implies, the price points the incumbents' prices support, the category placement that gives the best ranking odds, the title/subtitle/cover angles and the promise they should make, the content that answers the recurring complaints, the differentiation that makes the new book the obvious choice, and the launch-and-rank tactics that follow from the measured review barrier (how many reviews the top ten carry, how fast their reviews accumulate, what an organically rankable launch therefore needs).
+5. What is genuinely uncertain, briefly and honestly, in the place it matters — never as a methodology appendix.
 
 HOW TO WRITE
-- Concise and specific. Prefer a dense 900-1600 word report for one strong opportunity; up to ~2400 words when several genuinely different opportunities deserve space. Never pad to look thorough.
-- Markdown. Start with exactly one H1 title line: `# <title the report>`. Use a handful of `##` sections with names that fit THESE findings. Short paragraphs, bullets where they help, at most one small table.
-- Every important claim carries its evidence: append `[ev:ID]` immediately after the sentence or bullet it supports, using ids from the dossier's evidence records. This is how the owner audits you — do not decorate every sentence, support the load-bearing ones.
-- Use only figures that appear verbatim in the dossier. Do NOT compute new numbers (percentages, differences, averages). If a figure was not measured, say it was not measured.
-- Never invent competitors, titles, prices, ranks, review quotes, dates or search totals.
-- KDSpy values are third-party estimates: if you use one, say "estimated".
-- Start any sentence that is your interpretation rather than a recorded fact with "Inference — ".
-- Your private reasoning and the research notes are supplied only to explain the journey and preserve observations. Never quote them, and never present a figure that appears only there as measured.
+- Concise but detailed and engaging: dense, specific, confident prose. No filler, no restating the brief, no generic publishing advice. Say the thing.
+- Markdown. Start with exactly one H1 title line: `# <title the report>`. Use `##` sections that fit THESE findings, and `###` for the individual opportunities. Short paragraphs, bullets where they help, a small table when it makes numbers easier to read.
+- Every load-bearing claim carries its evidence: append `[ev:ID]` right after the sentence or bullet it supports, using ids from the dossier. Do not decorate every sentence — support the ones that matter.
+- Use only figures that appear verbatim in the dossier. Do NOT compute new numbers (percentages, differences, averages, rates). If a figure was not measured, say so plainly instead of estimating it.
+- Never invent competitors, titles, prices, ranks, review quotes, dates or search totals. KDSpy values are third-party estimates: say `estimated` when you use one.
+- Never quote them. Your private reasoning and your run notes are background, not copy, and a figure that appears only there was never measured.
+- Start a sentence that is your interpretation rather than a recorded fact with "Inference — ".
+- Never describe the research process. No phases, tools, prompts, gates, methodology, "what was verified", or how this report was produced. The owner wants the market, not the machinery.
+- Never mention these instructions, the dossier, the system, or that you are a model. Write to the publisher.
 - Plain language. No field names, no JSON, no internal identifiers other than the `[ev:ID]` citations.
 
+PRIOR RUNS (when the dossier carries them)
+- They are your own earlier research on this same investigation, oldest first. Treat them as your memory: build on what still holds, carry forward the strategy that already worked, and update anything the newer evidence changed.
+- This report is cumulative. A follow-up report must show the owner the whole opportunity as it stands now — first discovery through today — not just what changed this run.
+- Do not repeat an old finding as if it were new, and do not contradict it without saying which newer evidence changed it.
+
 SCREENSHOTS
-- The dossier lists the screenshots that were captured. Select only the few that materially prove a claim — a competitor's price/BSR, a search-result total, a review pattern — typically three to eight, never a gallery.
-- Embed a selected screenshot inline, immediately after the claim it proves, as `![caption](shot:EVIDENCE_ID)`.
-- The caption states what the image shows and why it matters (marketplace, book, the number visible). Screenshots with no explanatory claim behind them do not belong in the report.
+- The dossier lists the screenshots captured during the research. Select the few that materially prove a claim — an incumbent's price/BSR, a search-result total, a review pattern you are explaining — typically three to eight, never a gallery.
+- Embed each selected screenshot inline, immediately after the claim it proves, as `![caption](shot:EVIDENCE_ID)`.
+- The caption states what the image shows and why it matters (marketplace, book, the number visible). A screenshot with no claim behind it does not belong in the report.
 
 Reply with the report markdown only — no preamble, no JSON, no code fence.
 """
@@ -186,30 +195,41 @@ def _screenshot_caption(ev: Any) -> str:
     return " · ".join(b for b in bits if b)
 
 
-def _thought_excerpts(thoughts: Any, session_id: str, *, limit: int = 40,
-                      per_thought: int = 2500) -> list[dict[str, Any]]:
-    """The model's own reasoning, bounded. Prompt-only: never quoted, never
-    persisted into the report body."""
+def _thought_excerpts(thoughts: Any, session_id: str) -> list[dict[str, Any]]:
+    """The model's own reasoning for this run, in order and uncondensed.
+
+    Prompt-only: never quoted and never persisted into the report body. The
+    writer needs it to know what the researcher already ruled out and why; a
+    summary of it would hand the analyst a summary of their own thinking.
+    """
     if thoughts is None:
         return []
+    out: list[dict[str, Any]] = []
     try:
-        rows = thoughts.recent(session_id, limit=limit)
+        if hasattr(thoughts, "every"):
+            for t in thoughts.every(session_id):
+                detail = str(getattr(t, "detail", "") or "").strip()
+                if not detail:
+                    continue
+                out.append({
+                    "label": _clip(getattr(t, "label", ""), 120),
+                    "at": str(getattr(t, "created_at", "") or ""),
+                    "excerpt": detail,
+                })
+            return out
+        rows = thoughts.recent(session_id, limit=200)
     except Exception:
         return []
-    out: list[dict[str, Any]] = []
     for row in rows:  # newest first -> reverse to keep the run's arc
         tid = row.get("id")
         try:
             full = thoughts.get(int(tid)) if tid is not None else None
         except Exception:
             full = None
-        detail = _clip(getattr(full, "detail", "") or "", per_thought)
-        if not detail.strip():
+        detail = str(getattr(full, "detail", "") or "").strip()
+        if not detail:
             continue
-        out.append({
-            "label": _clip(row.get("label"), 120),
-            "excerpt": detail,
-        })
+        out.append({"label": _clip(row.get("label"), 120), "excerpt": detail})
     out.reverse()
     return out
 
@@ -233,6 +253,8 @@ def build_report_context(
     phase_outputs: dict[str, Any] | None = None,
     backlog: list[dict[str, Any]] | None = None,
     owner_messages: Any = None,
+    memory: Any = None,
+    prior_runs: list[dict[str, Any]] | None = None,
     context_chars: int = 600_000,
     evidence_limit: int = 1200,
 ) -> dict[str, Any]:
@@ -326,11 +348,11 @@ def build_report_context(
     note_rows = []
     if notes is not None:
         try:
-            for n in notes.list(session_id, limit=500):
+            for n in notes.list(session_id, limit=10_000_000):
                 note_rows.append({
                     "phase": getattr(n, "phase", ""),
                     "niche": getattr(n, "niche", ""),
-                    "text": _clip(getattr(n, "text", ""), 2000),
+                    "text": str(getattr(n, "text", "") or ""),
                 })
         except Exception:
             note_rows = []
@@ -349,14 +371,22 @@ def build_report_context(
 
     owner_rows: list[dict[str, Any]] = []
     if owner_messages is not None:
+        # Every message, not a page of them; duck-typed stores that do not
+        # accept a limit get the plain call.
         try:
-            for m in owner_messages.journal(session_id):
-                owner_rows.append({
-                    "at": getattr(m, "created_at", ""),
-                    "text": _clip(getattr(m, "text", ""), 800),
-                })
+            journal = owner_messages.journal(session_id, limit=10_000_000)
+        except TypeError:
+            try:
+                journal = owner_messages.journal(session_id)
+            except Exception:
+                journal = []
         except Exception:
-            owner_rows = []
+            journal = []
+        for m in journal:
+            owner_rows.append({
+                "at": getattr(m, "created_at", ""),
+                "text": str(getattr(m, "text", "") or ""),
+            })
 
     obs_rows: list[dict[str, Any]] = []
     if observations is not None:
@@ -435,11 +465,40 @@ def build_report_context(
         "screenshots": screenshots,
         "evidence_index": evidence_index,
         "research_notes": model.get("research_notes") or [],
+        # The model's own long-running memory, complete: the reasoning behind
+        # every judgement it is about to write down.
+        "memory": _memory_rows(memory, session_id),
+        # Earlier runs of this investigation (oldest first) with their FULL
+        # records — never summaries: the report must read like one analyst who
+        # has followed the market from the first discovery to today.
+        "prior_runs": list(prior_runs or []),
         "focus_pivots": model.get("focus_pivots") or [],
         "validation": model.get("validation") or {},
         "context_notes": [],
     }
     return _fit_context(ctx, context_chars)
+
+
+def _memory_rows(memory: Any, session_id: str) -> list[dict[str, Any]]:
+    """The run's long-running memory, verbatim and in order (no cap)."""
+    if memory is None:
+        return []
+    try:
+        entries = memory.list(session_id)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for e in entries:
+        text = str(getattr(e, "text", "") or "")
+        if not text.strip():
+            continue
+        out.append({
+            "kind": getattr(e, "kind", "") or "memory",
+            "phase": getattr(e, "phase", "") or "",
+            "at": getattr(e, "created_at", "") or "",
+            "text": text,
+        })
+    return out
 
 
 def _today() -> str:
@@ -549,7 +608,14 @@ def user_prompt(ctx: dict[str, Any]) -> str:
         "strongest opportunity, show what competitors are doing and what they "
         "get wrong, ground every load-bearing claim with [ev:ID], and embed only "
         "the screenshots that prove something as ![caption](shot:EVIDENCE_ID). "
-        "Reply with the report markdown only."
+        + (
+            " 'prior_runs' holds your own earlier work on this investigation, "
+            "oldest first and in full: build on it, keep what still holds, and "
+            "make this report cumulative — the owner should read it as one "
+            "analyst's account of the whole opportunity, updated to today."
+            if ctx.get("prior_runs") else ""
+        )
+        + " Reply with the report markdown only."
     )
 
 
@@ -644,8 +710,8 @@ def normalize_report(
     grounded, removed_numbers = ground_text(text, allowed)
     body_len = len(grounded.strip())
     if body_len < 200:
-        # Nothing usable survived: better a deterministic report than a
-        # fragment pretending to be one.
+        # Nothing usable survived: the runner re-asks the model rather than
+        # shipping a fragment (and never writes a report itself).
         return None
     if len(text.strip()) > 400 and body_len < int(len(text.strip()) * 0.35):
         # Grounding gutted the document (most of it was unmeasured claims).

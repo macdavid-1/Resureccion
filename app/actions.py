@@ -478,28 +478,82 @@ class ActionExecutor:
             await self.browser.close_page(page)
 
     async def _do_read_reviews(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Read a book's reviews: the product page first, then the all-reviews
+        pages, with a screenshot of the review section as proof.
+
+        The product page is tried first because that is where Amazon renders
+        the review block inline (and where reviews are readable without an
+        account); the all-reviews pages are tried only when that page showed
+        none, and they are best-effort — a sign-in wall there must not abort a
+        capture that already succeeded.
+        """
         asin = str(args.get("asin") or "").strip()
         if not asin:
             raise ActionError("read_reviews requires 'asin'")
         mkt = self._marketplace_for(args)
-        page = await self.browser.open_marketplace(
-            mkt, f"/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&reviewerType=all_reviews"
-        )
+        max_reviews = int(args.get("max_reviews") or 40)
+
+        page = await self.browser.open_marketplace(mkt, f"/dp/{asin}")
         try:
             await self._check_auth_wall(page, session_id)
-            reviews = await _extract_reviews(page)
-            record = self.collector.evidence_store.create(
-                session_id=session_id,
-                marketplace=mkt.code,
-                kind="reviews",
-                url=scrub_url(page.url),
-                title=f"reviews: {asin}",
-                data={"asin": asin, "reviews": reviews},
+            captured = await self.collector.capture_reviews(
+                page, session_id=session_id, marketplace=mkt, asin=asin,
+                max_reviews=max_reviews,
             )
+            if not int((captured.record.data or {}).get("reviews_captured") or 0):
+                # Fall through to the dedicated review pages.
+                try:
+                    page2 = await self.browser.open_marketplace(
+                        mkt,
+                        f"/product-reviews/{asin}/?ie=UTF8&reviewerType=all_reviews",
+                    )
+                except Exception as exc:
+                    page2 = None
+                    self.events.append(
+                        session_id, level="warn", actor="agent",
+                        action="reviews_page_failed",
+                        detail={"asin": asin,
+                                "error": f"{type(exc).__name__}: {exc}"[:300]},
+                    )
+                if page2 is not None:
+                    try:
+                        await self._check_auth_wall(page2, session_id)
+                        captured = await self.collector.capture_reviews(
+                            page2, session_id=session_id, marketplace=mkt,
+                            asin=asin, max_reviews=max_reviews,
+                        )
+                        await self.browser.close_page(page)
+                        page = page2
+                    except AuthPauseRequired:
+                        await self.browser.close_page(page2)
+                        raise
+                    except Exception as exc:
+                        # Keep the product-page record: it says why reviews
+                        # were unreadable, which is information for the report.
+                        self.events.append(
+                            session_id, level="warn", actor="agent",
+                            action="reviews_page_failed",
+                            detail={"asin": asin,
+                                    "error": f"{type(exc).__name__}: {exc}"[:300]},
+                        )
+                        await self.browser.close_page(page2)
+            data = captured.record.data or {}
+            count = int(data.get("reviews_captured") or 0)
+            bits = [f"captured {count} review(s) for {asin}" if count else f"no reviews captured for {asin}"]
+            if isinstance(data.get("average_rating"), (int, float)):
+                bits.append(f"average {data['average_rating']}")
+            if data.get("ratings_total"):
+                bits.append(f"{data['ratings_total']} ratings in total")
+            if data.get("critical_reviews"):
+                bits.append(f"{data['critical_reviews']} critical of the ones read")
+            bits.append("screenshot saved" if captured.screenshot_artifact_id
+                        else "no screenshot")
+            if data.get("blocked_reason"):
+                bits.append(str(data["blocked_reason"]))
             return ActionResult(
                 action="read_reviews", ok=True, marketplace=mkt.code,
-                url=scrub_url(page.url), evidence_ids=[record.id],
-                summary=f"captured {len(reviews)} reviews for {asin}",
+                url=scrub_url(page.url), evidence_ids=[captured.record.id],
+                summary="; ".join(bits),
             )
         finally:
             await self.browser.close_page(page)
@@ -966,32 +1020,6 @@ class ActionExecutor:
 
 
 # --------------------------------------------------------------------- DOM
-async def _extract_reviews(page: Any) -> list[dict[str, Any]]:
-    """Extract up to ~20 visible reviews (rating, title, date, text excerpt)."""
-    reviews: list[dict[str, Any]] = []
-    try:
-        cards = await page.query_selector_all("div[data-hook='review']")
-        for card in cards[:20]:
-            try:
-                rating = await _txt(card, "i[data-hook='review-star-rating'] span, i[data-hook='cmps-review-star-rating'] span")
-                title = await _txt(card, "a[data-hook='review-title'] span:last-child, a[data-hook='review-title']")
-                date = await _txt(card, "span[data-hook='review-date']")
-                body = await _txt(card, "span[data-hook='review-body']")
-                verified = await card.query_selector("span[data-hook='avp-badge']")
-                reviews.append({
-                    "rating": _rating_num(rating),
-                    "title": (title or "").strip()[:200],
-                    "date": (date or "").strip()[:60],
-                    "text": (body or "").strip()[:1200],
-                    "verified_purchase": verified is not None,
-                })
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return reviews
-
-
 async def _extract_carousel(page: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     try:

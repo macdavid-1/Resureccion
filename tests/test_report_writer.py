@@ -429,7 +429,7 @@ async def test_the_model_authors_the_report_in_every_mode(db, config, mode):
     body = store.read_markdown(final)
     meta = final.meta or {}
     assert meta["authored_by"] == "model"
-    assert meta["generator"] == "report_writer.v1"
+    assert meta["generator"] == "report_writer.v2"
     assert meta["validation"]["mode"] in ("final", "provisional")
 
     # The body is the model's document: its own title/sections, not the
@@ -496,9 +496,13 @@ async def test_inline_screenshot_evidence_reaches_the_report_and_renders(db, con
 
 
 @pytest.mark.asyncio
-async def test_a_useless_report_reply_falls_back_to_the_deterministic_report(
+async def test_a_useless_report_reply_never_becomes_a_backend_written_report(
     db, config, session
 ):
+    """No usable model reply after every retry = no report, said plainly.
+
+    The backend does not write a stand-in: a fallback layout would be a
+    document the owner was not promised, presented as the research."""
     from app.reports import ReportStore
     from tests.test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
@@ -511,11 +515,65 @@ async def test_a_useless_report_reply_falls_back_to_the_deterministic_report(
     runner = make_runner(db, config, MuteforReport(PHASE_OUTPUTS))
     await runner.run(session)
 
+    row = runner.sessions.require(session)
+    assert row.status == "failed"
+    assert "model did not produce a usable report" in (row.error or "")
     store = ReportStore(db, config)
-    final = next(r for r in store.list(session) if r.kind == "final")
-    body = store.read_markdown(final)
-    assert (final.meta or {})["authored_by"] == "deterministic_fallback"
-    assert "# Resurrección — Market Intelligence Report" in body
+    assert [r for r in store.list(session) if r.kind == "final"] == []
+    assert runner.model.report_prompts, (
+        "the model must be asked more than once before the run gives up"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_report_holds_every_earlier_run_in_full(db, config, session):
+    """A follow-up report gets the whole chain, oldest first, verbatim.
+
+    Not the previous report's summary: the earlier run's own brief, notes,
+    evidence and report, so the writer knows this market the way one analyst
+    who has followed it from day one would."""
+    from app.reports import ReportStore
+    from app.sessions import SessionStore
+    from tests.test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
+
+    sessions = SessionStore(db, config)
+    runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
+    first = sessions.create(
+        mode="prompt", prompt="research grief journals for adult children",
+        objective="find a publishable niche",
+    )
+    second = sessions.create(
+        mode="prompt", prompt="go deeper on the sudden-loss variant",
+        objective="find a publishable niche", parent_session_id=first.id,
+    )
+    third = sessions.create(
+        mode="prompt", prompt="now attack the price ladder",
+        objective="find a publishable niche", parent_session_id=second.id,
+    )
+    runner.notes.add(
+        first.id, phase="consumer_deep_dive", niche="sudden-loss grief",
+        text="Reviewers keep asking for prompts that address the first week.",
+    )
+    runner.notes.add(
+        second.id, phase="consumer_deep_dive", niche="sudden-loss grief",
+        text="The 90-day structure is what buyers complain is missing.",
+    )
+    store = ReportStore(db, config)
+    store.save(first.id, kind="final", title="Grief, first pass",
+               body_markdown="# Grief\n\nThe opening finding of the whole chain.")
+    store.save(second.id, kind="final", title="Grief, deeper",
+               body_markdown="# Deeper\n\nThe second run's own account.")
+
+    runs = runner._prior_run_records(third.id)
+
+    assert [r["session_id"] for r in runs] == [first.id, second.id], (
+        "the chain must arrive oldest first"
+    )
+    assert "The opening finding of the whole chain" in runs[0]["record"]
+    assert "The second run's own account" in runs[1]["record"]
+    assert "prompts that address the first week" in runs[0]["record"]
+    assert runs[0]["report_title"] == "Grief, first pass"
+    assert runs[1]["name"], "each earlier run carries its own identity"
 
 
 @pytest.mark.asyncio
