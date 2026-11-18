@@ -95,6 +95,71 @@ def generic_niche_reason(niche: str) -> str:
     return ""
 
 
+# Format/product words that describe a shelf rather than a reader. A phrase
+# built only from these is a store root, and autocomplete will happily complete
+# it with more store roots.
+GENERIC_FORMAT: frozenset[str] = frozenset({
+    "journal", "journals", "journaling", "logbook", "logbooks", "notebook",
+    "notebooks", "diary", "diaries", "planner", "planners", "workbook",
+    "workbooks", "guide", "guides", "handbook", "handbooks", "checklist",
+    "checklists", "tracker", "trackers", "worksheet", "worksheets", "gift",
+    "gifts", "coloring", "activity", "activities", "series", "edition",
+    "ebook", "audiobook", "paperback", "hardcover", "volume",
+})
+
+
+def generic_seed_reason(phrase: str) -> str:
+    """Why `phrase` is too generic to seed autocomplete with, or "".
+
+    Autocomplete answers a generic seed with generic completions: "grief"
+    completes to "grief books", "grief journal", "grief gifts" — the whole
+    store, not a reader. A seed has to carry a reader and a situation before
+    Amazon's suggestions tell you anything a book can win.
+    """
+    text = " ".join((phrase or "").lower().split())
+    if not text:
+        return "no phrase"
+    words = [w for w in _WORD_RE.findall(text) if w not in _FILLER]
+    if not words:
+        return f"{phrase!r} is a format word, not a subject"
+    if len(words) < 2:
+        return (
+            f"{phrase!r} is a single word: Amazon completes it with store "
+            "roots (\"… books\", \"… journal\", \"… gifts\"), not with demand"
+        )
+    if all(w in BROAD_MARKERS or w in GENERIC_AUDIENCE or w in GENERIC_FORMAT
+           for w in words):
+        return (
+            f"{phrase!r} is only a broad market, a format or a generic "
+            "audience — it names no reader and no situation"
+        )
+    if len(words) <= 2 and any(w in GENERIC_FORMAT for w in words):
+        return (
+            f"{phrase!r} is a subject plus a format (a shelf, not a reader): "
+            "add who buys it and the situation they are in"
+        )
+    return ""
+
+
+def generic_completion(phrase: str) -> bool:
+    """True when a completion is itself a store root and carries no signal.
+
+    "journal", "grief journals for women", "self help books", "books for men" —
+    none of them say who has what problem, so keeping them as research targets
+    only sends the run back to the whole store.
+    """
+    text = " ".join((phrase or "").lower().split())
+    words = [w for w in _WORD_RE.findall(text) if w not in _FILLER]
+    if len(words) < 2:
+        return True
+    if len(words) <= 2 and any(w in GENERIC_FORMAT for w in words):
+        return True  # "grief gifts", "prayer journal": a subject plus a shelf
+    return all(
+        w in BROAD_MARKERS or w in GENERIC_AUDIENCE or w in GENERIC_FORMAT
+        for w in words
+    )
+
+
 def screen_niche(niche: str) -> str:
     """The hard-rule reason to refuse `niche`, or "" when it may be researched."""
     term = banned_product_term(niche)

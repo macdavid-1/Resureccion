@@ -44,6 +44,7 @@ from app.marketplace import (
     get_marketplace,
     marketplace_from_url,
 )
+from app.product_rules import generic_completion, generic_seed_reason
 from app.redact import redact, scrub_url
 from app.search_totals import competition_text
 
@@ -418,10 +419,27 @@ class ActionExecutor:
             await self.browser.close_page(page)
 
     async def _do_autocomplete(self, session_id: str, args: dict[str, Any]) -> ActionResult:
-        """Amazon search suggestions (completion API via page fetch)."""
-        query = str(args.get("query") or "").strip()
+        """Amazon search suggestions for a TARGETED phrase.
+
+        Autocomplete is only as specific as its seed: "grief" completes to
+        "grief books", "grief journal", "grief gifts" — the whole store. So a
+        generic seed is refused with the reason and an example of what to try
+        instead, and the completions that are themselves store roots are dropped
+        before they reach the model (they stay on the record as dropped, so the
+        owner can see what Amazon offered and why it was not chased).
+        """
+        query = " ".join(str(args.get("query") or "").split())
         if not query:
             raise ActionError("autocomplete requires 'query'")
+        generic = generic_seed_reason(query)
+        if generic:
+            raise ActionError(
+                f"autocomplete needs a targeted phrase, not a generic one — "
+                f"{generic}. Seed with a reader and a situation, e.g. "
+                "'sudden loss grief for widowers in year one' or "
+                "'perimenopause sleep for shift nurses', then extend what "
+                "Amazon completes. Generic seeds only return store roots."
+            )
         mkt = self._marketplace_for(args)
         page = await self.browser.open_marketplace(mkt, "/")
         try:
@@ -437,18 +455,33 @@ class ActionExecutor:
                 )
             except Exception:
                 suggestion = []
+            raw = [str(t).strip() for t in (suggestion or []) if str(t).strip()]
+            kept = [t for t in raw if not generic_completion(t)]
+            dropped = [t for t in raw if generic_completion(t)]
             record = self.collector.evidence_store.create(
                 session_id=session_id,
                 marketplace=mkt.code,
                 kind="autocomplete",
                 url=scrub_url(page.url),
                 title=f"autocomplete: {query}",
-                data={"query": query, "suggestions": suggestion},
+                data={
+                    "query": query,
+                    "suggestions": kept,
+                    "suggestions_dropped_generic": dropped,
+                    "note": (
+                        "completions that are only a format, a broad market or "
+                        "a bare audience were dropped as store roots; the "
+                        "kept ones name a reader or a situation"
+                    ) if dropped else "",
+                },
             )
+            summary = f"{len(kept)} targeted suggestions for {query!r}"
+            if dropped:
+                summary += f" ({len(dropped)} generic completion(s) dropped)"
             return ActionResult(
                 action="autocomplete", ok=True, marketplace=mkt.code,
                 url=scrub_url(page.url), evidence_ids=[record.id],
-                summary=f"{len(suggestion)} suggestions for {query!r}",
+                summary=summary,
             )
         finally:
             await self.browser.close_page(page)

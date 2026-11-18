@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.product_rules import banned_product_term, generic_niche_reason, screen_niche
+from app.product_rules import (
+    banned_product_term,
+    generic_completion,
+    generic_niche_reason,
+    generic_seed_reason,
+    screen_niche,
+)
 from tests.test_research_runner import PHASE_OUTPUTS  # noqa: F401 — fixture reuse
 
 
@@ -130,6 +136,48 @@ def test_the_model_cannot_add_a_journal_candidate(db, config):
     with pytest.raises(RecordEditError, match="journal/logbook"):
         editor.apply(sid, "add_candidate", {"niche": "grief journals for adult children"})
     assert CandidateStore(db).list(sid) == []
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        "grief",
+        "journal",
+        "self help",
+        "books for women",
+        "grief books",
+        "prayer journal",
+        "mindfulness for beginners",
+    ],
+)
+def test_generic_autocomplete_seeds_are_refused(seed: str) -> None:
+    assert generic_seed_reason(seed), f"{seed!r} must not seed autocomplete"
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        "sudden loss grief for widowers in year one",
+        "perimenopause sleep for shift nurses",
+        "grief after a parent's stroke",
+    ],
+)
+def test_targeted_autocomplete_seeds_are_accepted(seed: str) -> None:
+    assert generic_seed_reason(seed) == ""
+
+
+def test_store_root_completions_are_dropped() -> None:
+    for completion in (
+        "grief books", "journal", "self help books", "books for women",
+        "grief gifts", "planner",
+    ):
+        assert generic_completion(completion), f"{completion!r} is a store root"
+    for completion in (
+        "sudden loss grief for widowers in year one",
+        "grief after a parent's stroke",
+        "perimenopause sleep for shift nurses",
+    ):
+        assert not generic_completion(completion)
 
 
 def test_the_prompt_states_the_hard_rules() -> None:

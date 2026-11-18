@@ -675,6 +675,65 @@ class ReviewsPage(FakePage):
         return ""
 
 
+class _SuggestPage(FakePage):
+    """Answers the completion call with a mix of store roots and real phrases."""
+
+    async def evaluate(self, _js: str, *_args: Any) -> list[str]:
+        return [
+            "grief books",
+            "grief journal",
+            "sudden loss grief for widowers in year one",
+            "books for women",
+            "grief after a parent's stroke",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_refuses_a_generic_seed(db, tmp_path):
+    """A generic seed only returns store roots, so it is refused before the
+    request is made — with instructions the model can act on."""
+    from app.browser_store import BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    executor, *_ = _wall_executor(db, tmp_path, store, "unknown", "us")
+    result = await executor.execute(
+        session_id="s1", action="autocomplete", args={"query": "grief"}
+    )
+    assert not result.ok
+    assert "targeted phrase" in (result.error or "")
+    assert "single word" in (result.error or "")
+    assert executor.browser.opened == [], "a refused seed must not touch Amazon"
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_drops_store_root_completions(db, tmp_path):
+    """Completions that are just a shelf are dropped before the model sees
+    them; the targeted ones are kept and the drop is recorded."""
+    from app.browser_store import BrowserAuthStore
+
+    store = BrowserAuthStore(db)
+    executor, *_ = _wall_executor(db, tmp_path, store, "unknown", "us")
+    executor.browser.page = _SuggestPage(url="https://www.amazon.com/")
+
+    result = await executor.execute(
+        session_id="s1", action="autocomplete",
+        args={"query": "sudden loss grief for widowers"},
+    )
+    assert result.ok, result.error
+    assert result.summary.startswith("2 targeted suggestions")
+    assert "3 generic completion(s) dropped" in result.summary
+    row = executor.collector.evidence_store.list("s1")[0]
+    assert row.kind == "autocomplete"
+    assert row.data["suggestions"] == [
+        "sudden loss grief for widowers in year one",
+        "grief after a parent's stroke",
+    ]
+    assert row.data["suggestions_dropped_generic"] == [
+        "grief books", "grief journal", "books for women",
+    ]
+    assert "store roots" in row.data["note"]
+
+
 @pytest.mark.asyncio
 async def test_read_reviews_not_gated_by_backend_auth_state(db, tmp_path):
     """Review mining is the AI's call: when the reviews page renders
