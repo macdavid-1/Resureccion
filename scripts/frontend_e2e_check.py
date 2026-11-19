@@ -104,8 +104,50 @@ async def main() -> int:
         r = client.get(f"/api/sessions/{sid}/reports/{rep['id']}", headers=h)
         assert r.status_code == 200, r.text
         rep_body = r.json()["body_markdown"]
-        assert "**Report status: FINAL**" in rep_body
-        print(f"[6] final report OK ({len(rep_body)} chars)")
+        # The report body is the model's own document, served verbatim — the
+        # backend neither writes it nor stamps a status onto it.
+        assert rep_body.strip(), "empty report body"
+        assert "**Report status" not in rep_body
+        r = client.get(f"/api/sessions/{sid}/reports/{rep['id']}/model", headers=h)
+        assert r.status_code == 200, r.text
+        stored = r.json()["model"]
+        assert stored["ai_report"]["markdown"].strip() == rep_body.strip()
+        print(f"[6] final report OK ({len(rep_body)} chars, model-authored)")
+
+        # 7. Chatting about the report (the analyst panel).
+        rid = rep["id"]
+        r = client.get(f"/api/sessions/{sid}/reports/{rid}/chat", headers=h)
+        assert r.status_code == 200 and r.json()["messages"] == []
+
+        class _Chat:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            async def call(self, session_id, *, system, user, **kw):
+                self.prompts.append(user)
+                reply = type("R", (), {})()
+                reply.raw = "The measured opening is the sudden-loss memoir."
+                return reply
+
+        chat_model = _Chat()
+        app.state.chat_model = chat_model
+        r = client.post(
+            f"/api/sessions/{sid}/reports/{rid}/chat",
+            headers=h, json={"message": "Which niche is strongest?"},
+        )
+        assert r.status_code == 200, r.text
+        assert [m["role"] for m in r.json()["messages"]] == ["owner", "analyst"]
+        # The answer's input was the whole record plus the report. The dossier
+        # is JSON (newlines escaped), so compare a single-line fragment.
+        first_line = next(l for l in rep_body.splitlines() if l.strip())[:60]
+        assert first_line in chat_model.prompts[0]
+        r = client.post(
+            f"/api/sessions/{sid}/reports/{rid}/chat",
+            headers=h, json={"message": "And why?"},
+        )
+        assert r.status_code == 200, r.text
+        assert "Which niche is strongest?" in chat_model.prompts[1]
+        print("[7] report chat OK (2 turns, full record + thread)")
 
     print("FRONTEND E2E RESULT: PASS")
     return 0

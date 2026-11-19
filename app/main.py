@@ -42,6 +42,7 @@ from app.research_data import (
     EvidenceStore,
     ObservationStore,
     OpportunityStore,
+    ResearchNoteStore,
     VerificationStore,
 )
 from app.research_memory import ResearchMemoryStore
@@ -82,6 +83,9 @@ def create_app() -> FastAPI:
         app.state.research_memory = ResearchMemoryStore(db)
         app.state.browser = BrowserRegistry(db, app.state.sessions)
         app.state.observations = ObservationStore(db)
+        # The model's own run notes: read by the report chat, so a question can
+        # be answered from what the analyst actually recorded mid-run.
+        app.state.notes = ResearchNoteStore(db)
         app.state.evidence = EvidenceStore(db)
         app.state.candidates = CandidateStore(db)
         app.state.verifications = VerificationStore(db)

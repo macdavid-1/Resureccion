@@ -95,7 +95,10 @@ class PhaseSpec:
     key: str
     # Session agent-states this phase may legitimately use.
     agent_states: tuple[str, ...]
-    # Hard cap on model iterations for this phase (deterministic budget).
+    # The phase's intended depth in model iterations. NOT a cap: a phase runs
+    # until its output contract is met (0 in MODE_ITERATIONS_<mode> means no
+    # cap either). Shown by /api/methodology and used as the mode profile's
+    # shape, never enforced against a live phase.
     max_iterations: int
     # Minimum evidence pieces the phase should have gathered before exit
     # (0 = no minimum; quality gates still apply).
@@ -132,10 +135,12 @@ class ModeBudgetProfile:
                  and Phase 2 get the largest share and early competitive work
                  is lighter.
 
-    Iteration caps override the per-phase spec while RUNNING (the spec value
-    stays the contract shown by /api/methodology); `extra_calls` raises the
-    per-session model-call ceiling above RunnerConfig's base, scaled by the
-    hard time budget available (see ResearchRunner._model_call_ceiling).
+    DESCRIPTIVE ONLY since the owner removed every repetition limit: these
+    profiles describe how each mode's depth is distributed across the
+    phases, and they are what `MODE_ITERATIONS_<mode>` overrides when the
+    owner explicitly asks for a per-phase cap. By default no phase is capped
+    and there is no model-call ceiling at all (see
+    ResearchRunner._phase_iterations / _model_call_ceiling).
     """
 
     mode: str
@@ -146,15 +151,15 @@ class ModeBudgetProfile:
         return max(1, int(self.iterations.get(phase, default)))
 
 
-# Iteration caps per mode, keyed by phase (PHASE_ORDER order). Values are a
+# Intended depth per mode, keyed by phase (PHASE_ORDER order). Values are a
 # deliberate rebalancing of the SAME total budget — no phase gets starved,
 # the shape of the research changes with what the owner actually supplied.
 #
-# These caps are CEILINGS, not targets: a phase still closes the moment its
-# deterministic exit gate is satisfied. They exist so a session with hours
-# left on the clock is never the thing that ends research — an earlier build
-# summed to ~98 iterations, which is why runs stopped after an hour or two
-# with most of the time budget unspent and thin, partly-empty analysis.
+# Nothing here caps a live phase: a phase closes when its deterministic exit
+# gate is satisfied, and otherwise keeps researching until the session's
+# wall-clock budget, an owner pause/cancel, or the anti-stall pivot. The
+# numbers describe the shape and back the optional MODE_ITERATIONS_<mode>
+# override.
 MODE_PROFILES: dict[str, ModeBudgetProfile] = {
     "prompt": ModeBudgetProfile(
         mode="prompt",

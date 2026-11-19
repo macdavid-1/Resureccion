@@ -74,28 +74,23 @@ async def main() -> int:
     print(f"\nquality: rejected={q['rejected']} reasons={len(q['rejection_reasons'])} "
           f"uncertain={len(q['remains_uncertain'])}")
 
-    headings = [h for h in (
-        "## Executive summary", "## Opportunity portfolio",
-        "## Consumer intelligence", "## Candidate ledger",
-        "## Methodology trace", "## Research quality statement",
-        "## Evidence appendix") if h in body]
-    print(f"\nrendered headings present: {len(headings)}/7")
-    print("report status line:", next(
-        (l for l in body.splitlines() if l.startswith("**Report status")), "MISSING"))
-
-    # Round-trip: re-render from the model must reproduce the report.
-    from app.report_model import ReportModel, render_markdown
-
-    body2 = render_markdown(ReportModel.from_dict(model))
-    assert "## Opportunity portfolio" in body2 and "**Precise niche:**" in body2
-    print("re-render from model: OK")
+    # The report body IS the model's document: the backend no longer writes a
+    # section of it, re-renders it, or stamps a status onto it.
+    ai = model.get("ai_report") or {}
+    ai_body = str(ai.get("markdown") or "")
+    print(f"\nmodel-authored report: {len(ai_body)} chars, {ai.get('words')} words, "
+          f"{len(ai.get('figures') or [])} figures, {ai.get('prior_runs')} prior runs")
+    print("body equals the model's markdown:", body.strip() == ai_body.strip())
+    print("backend status stamp present:", any(
+        l.startswith("**Report status") for l in body.splitlines()))
 
     ok = (
         sess.status == "completed"
         and sections_ok
         and ex["survived_verification"] == 1
-        and len(headings) == 7
-        and "**Report status: FINAL**" in body
+        and bool(ai_body.strip())
+        and body.strip() == ai_body.strip()
+        and not any(l.startswith("**Report status") for l in body.splitlines())
         and o["verification"]["status"] == "verified"
     )
     print("\nREPORT E2E RESULT:", "PASS" if ok else "FAIL")

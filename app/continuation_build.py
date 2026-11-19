@@ -488,6 +488,70 @@ def load_adjacent_rows(reports: Any, session_id: str) -> list[dict[str, Any]]:
     return []
 
 
+def prior_run_records(
+    session_id: str,
+    *,
+    sessions: Any,
+    candidates: Any,
+    opportunities: Any,
+    verifications: Any,
+    notes: Any,
+    browser_evidence: Any,
+    reports: Any,
+    trace: Any = None,
+    thoughts: Any = None,
+    owner_messages: Any = None,
+    memory: Any = None,
+) -> list[dict[str, Any]]:
+    """The FULL record of every earlier run in this session's chain.
+
+    A follow-up's report — and a chat about a report — must read like one
+    analyst who has followed the market from the first discovery: not a
+    summary of the previous report, but the earlier runs themselves, oldest
+    first, bounded only by the number of runs in the chain (cycles are
+    guarded). Shared by the report writer and the report chat.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = {session_id}
+    try:
+        current = sessions.require(session_id).parent_session_id
+    except Exception:
+        return out
+    while current and current not in seen:
+        seen.add(current)
+        try:
+            brief = build_continuation_brief(
+                current,
+                sessions=sessions,
+                candidates=candidates,
+                opportunities=opportunities,
+                verifications=verifications,
+                notes=notes,
+                browser_evidence=browser_evidence,
+                reports=reports,
+                trace=trace,
+                thoughts=thoughts,
+                owner_messages=owner_messages,
+                memory=memory,
+                adjacent_rows=load_adjacent_rows(reports, current),
+            )
+        except Exception:
+            break
+        out.append({
+            "session_id": current,
+            "name": brief.parent_name,
+            "status": brief.parent_status,
+            "record": brief.record_text(),
+            "report_title": brief.report_title,
+        })
+        try:
+            current = sessions.require(current).parent_session_id
+        except Exception:
+            break
+    out.reverse()  # oldest first: the chain as it actually happened
+    return out
+
+
 def _safe_json(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw

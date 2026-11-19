@@ -134,8 +134,16 @@ def _clip(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _compact(value: Any, limit: int = 6000) -> Any:
-    """JSON-safe copy bounded in size; keeps every key, trims the values."""
+def _compact(value: Any, limit: int = 0) -> Any:
+    """JSON-safe copy of `value`.
+
+    `limit` <= 0 (the default) means NOTHING is trimmed: the writer gets the
+    record exactly as it was captured. A missing review, a dropped search row
+    or a clipped verdict message is a summary of evidence, and the report then
+    argues from half a measurement.
+    """
+    if limit <= 0:
+        return _json_copy(value)
     if isinstance(value, str):
         return value if len(value) <= limit else value[: limit - 1] + "…"
     if isinstance(value, list):
@@ -148,24 +156,41 @@ def _compact(value: Any, limit: int = 6000) -> Any:
     return value
 
 
-def _trim_evidence_data(data: dict[str, Any]) -> dict[str, Any]:
-    """Keep every measured field, bound the bulky collections."""
+def _json_copy(value: Any) -> Any:
+    """Plain, JSON-safe copy (tuples become lists, anything odd becomes str)."""
+    if isinstance(value, dict):
+        return {str(k): _json_copy(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_copy(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _trim_evidence_data(data: dict[str, Any], limit: int = 0) -> dict[str, Any]:
+    """The captured evidence data, complete unless a limit is asked for.
+
+    Default 0 = every row and every string as captured (a review-research
+    record carries its reviews, a search record its rows).
+    """
+    if limit <= 0:
+        return _json_copy(data or {})
     out: dict[str, Any] = {}
     for key, value in (data or {}).items():
         if isinstance(value, list):
-            rows = value[:20]
+            rows = value[: max(1, limit // 6)]
             trimmed = [
-                {k: (_clip(v, 500) if isinstance(v, str) else v) for k, v in row.items()}
-                if isinstance(row, dict) else _clip(row, 500)
+                {k: (_clip(v, limit) if isinstance(v, str) else v) for k, v in row.items()}
+                if isinstance(row, dict) else _clip(row, limit)
                 for row in rows
             ]
             if len(value) > len(rows):
                 trimmed.append(f"…(+{len(value) - len(rows)} more)")
             out[key] = trimmed
         elif isinstance(value, dict):
-            out[key] = _trim_evidence_data(value)
+            out[key] = _trim_evidence_data(value, limit)
         elif isinstance(value, str):
-            out[key] = _clip(value, 1500)
+            out[key] = _clip(value, limit)
         else:
             out[key] = value
     return out
@@ -255,10 +280,10 @@ def build_report_context(
     owner_messages: Any = None,
     memory: Any = None,
     prior_runs: list[dict[str, Any]] | None = None,
-    context_chars: int = 600_000,
-    evidence_limit: int = 1200,
+    context_chars: int = 0,
+    evidence_limit: int = 10_000_000,
 ) -> dict[str, Any]:
-    """The complete research record, bounded, for the report-writing model."""
+    """The complete research record, unbounded, for the report-writing model."""
     session = sessions.require(session_id)
     model = model or {}
     ex = dict(model.get("executive_summary") or {})
@@ -271,7 +296,7 @@ def build_report_context(
 
     # ---- candidates: every row, with the recorded reason it died ----------
     cand_rows: list[dict[str, Any]] = []
-    for cand in candidates.list(session_id, limit=500):
+    for cand in candidates.list(session_id, limit=10_000_000):
         meta = getattr(cand, "meta", None) or {}
         cand_rows.append({
             "candidate_id": cand.id,
@@ -279,19 +304,19 @@ def build_report_context(
             "status": cand.status,
             "marketplace": cand.marketplace,
             "score": cand.score,
-            "rationale": _clip(cand.rationale, 600),
+            "rationale": str(cand.rationale or ""),
             "parent_market": meta.get("parent_market"),
             "chain": meta.get("chain"),
             "rejection_reasons": meta.get("rejection_reasons") or meta.get("reasons"),
         })
     # ---- verifications: the verdict AND the checks behind it --------------
     ver_rows: list[dict[str, Any]] = []
-    for v in verifications.list(session_id, limit=500):
+    for v in verifications.list(session_id, limit=10_000_000):
         ver_rows.append({
             "candidate_id": v.candidate_id,
             "verdict": v.verdict,
             "confidence": v.confidence,
-            "checks": _compact(v.checks, 4000),
+            "checks": _compact(v.checks),
             "error": v.error,
         })
 
@@ -316,8 +341,8 @@ def build_report_context(
             "id": ev.id,
             "kind": ev.kind,
             "marketplace": ev.marketplace,
-            "title": _clip(ev.title, 240),
-            "url": _clip(ev.url, 400),
+                            "title": str(ev.title or ""),
+            "url": str(ev.url or ""),
             "captured_at": ev.captured_at,
             "has_screenshot": bool(artifact_id),
             "data": _trim_evidence_data(getattr(ev, "data", None) or {}),
@@ -343,7 +368,7 @@ def build_report_context(
             phases.append({
                 "phase": phase,
                 "title": PHASE_TITLES.get(str(phase), str(phase)),
-                "output": _compact(output, 20_000),
+                "output": _compact(output),
             })
     note_rows = []
     if notes is not None:
@@ -359,11 +384,11 @@ def build_report_context(
     action_rows: list[dict[str, Any]] = []
     if trace is not None:
         try:
-            for entry in trace.tail(session_id, limit=400):
+            for entry in trace.tail(session_id, limit=10_000_000):
                 action_rows.append({
                     "at": getattr(entry, "created_at", ""),
                     "kind": getattr(entry, "kind", ""),
-                    "text": _clip(getattr(entry, "text", ""), 300),
+                    "text": str(getattr(entry, "text", "") or ""),
                 })
         except Exception:
             action_rows = []
@@ -391,11 +416,11 @@ def build_report_context(
     obs_rows: list[dict[str, Any]] = []
     if observations is not None:
         try:
-            for ob in observations.list(session_id, limit=400):
+            for ob in observations.list(session_id, limit=10_000_000):
                 obs_rows.append({
                     "source": getattr(ob, "source", ""),
                     "kind": getattr(ob, "kind", ""),
-                    "content": _clip(getattr(ob, "content", ""), 1200),
+                    "content": str(getattr(ob, "content", "") or ""),
                     "at": getattr(ob, "created_at", ""),
                 })
         except Exception:
@@ -403,11 +428,11 @@ def build_report_context(
 
     claim_rows: list[dict[str, Any]] = []
     try:
-        for c in claims.list(session_id, limit=1200):
+        for c in claims.list(session_id, limit=10_000_000):
             claim_rows.append({
                 "candidate_id": getattr(c, "candidate_id", ""),
-                "statement": _clip(getattr(c, "statement", ""), 500),
-                "evidence_ids": list(getattr(c, "evidence_ids", []) or [])[:8],
+                "statement": str(getattr(c, "statement", "") or ""),
+                "evidence_ids": list(getattr(c, "evidence_ids", []) or []),
                 "status": getattr(c, "status", ""),
             })
     except Exception:
@@ -536,6 +561,9 @@ def _fit_context(ctx: dict[str, Any], budget: int) -> dict[str, Any]:
     is recorded in `context_notes` so the model knows the record is complete in
     substance even where it was shortened for the prompt.
     """
+    # 0 (or less) = no budget: the dossier is handed over whole.
+    if budget <= 0:
+        return ctx
     budget = max(20_000, int(budget))
     if _context_size(ctx) <= budget:
         return ctx

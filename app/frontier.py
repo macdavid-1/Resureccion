@@ -84,14 +84,15 @@ SUGGEST_JS = """async ([alias, mid, prefix]) => {
       const res = await fetch(path, {headers: {'accept': 'application/json'}});
       if (!res.ok) continue;
       const data = await res.json();
+      // Every suggestion the endpoint returns, unfiltered: which ones to
+      // pursue is the model's judgement, never this script's.
       if (Array.isArray(data) && Array.isArray(data[1])) {
-        return data[1].filter((t) => typeof t === 'string').slice(0, 11);
+        return data[1].filter((t) => typeof t === 'string');
       }
       if (data && Array.isArray(data.suggestions)) {
         return data.suggestions
           .map((s) => (s && typeof s === 'object' ? s.value : s))
-          .filter((t) => typeof t === 'string' && t.trim())
-          .slice(0, 11);
+          .filter((t) => typeof t === 'string' && t.trim());
       }
     } catch (e) { /* try the next endpoint */ }
   }

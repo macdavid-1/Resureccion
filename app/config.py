@@ -117,26 +117,21 @@ class Config:
         # --- research depth (how much of the time budget research may spend) --
         # A run used to finish in 1-2 hours on an 8-hour budget: every phase
         # satisfied its floors on the first pass and the session simply ran
-        # out of things to do while hours remained. Two deterministic knobs
-        # stop that, and BOTH are disabled by setting them to 0:
+        # out of things to do while hours remained. One deterministic knob
+        # stops that (0 disables it):
         #   - research_min_hours: while the session is under this wall-clock
         #     mark, a phase owes DEPTH_EVIDENCE_MULTIPLIER times its normal
         #     new-evidence floor before it may close (the model sees the
         #     raised number in its exit gate and keeps researching).
-        #   - model_calls_per_hour: the session's model-call ceiling is
-        #     derived from the time budget instead of being a fixed cap, so
-        #     an unfinished run is never stopped by a call budget. 45/hour
-        #     against the 12-hour hard budget = 540 calls per session; a full
-        #     two-pass methodology uses ~300, so the ceiling only ever binds
-        #     on a runaway loop, never on honest work (it never approaches a
-        #     multi-million-token bill: calls are capped before they run).
+        # There is no model-call ceiling and no per-phase iteration cap: the
+        # model is never told it has run out of moves. Wall-clock time, an
+        # owner pause/cancel and the phase's own completion are the stops.
         self.research_min_hours = max(
             0.0, float(os.environ.get("RESEARCH_MIN_HOURS", "3").strip() or "3")
         )
         self.depth_evidence_multiplier = max(
             1, _int_env("DEPTH_EVIDENCE_MULTIPLIER", 2)
         )
-        self.model_calls_per_hour = max(1, _int_env("MODEL_CALLS_PER_HOUR", 45))
 
         # --- deep-discovery layers (deterministic, model-free) ----------------
         # Keyword and phrase discovery is NOT one of these layers: it belongs
@@ -238,6 +233,11 @@ class Config:
         # report and so no switch to turn one on. Reports are markdown, not
         # JSON, so the report call runs in raw-text mode with a large budget.
         self.report_max_tokens = max(2_000, _int_env("REPORT_MAX_TOKENS", 16_000))
+        # Talking to the analyst about a delivered report: how long one answer
+        # may take before it is stopped and reported (the question is saved),
+        # and how much room the answer gets.
+        self.chat_timeout_seconds = max(30, _int_env("CHAT_TIMEOUT_SECONDS", 240))
+        self.chat_max_tokens = max(500, _int_env("CHAT_MAX_TOKENS", 4_000))
         # Prompt budget for the research dossier. 0 means "the model's context
         # window, minus a safe margin" (see report_writer._fit_context).
         # The dossier now also carries the FULL record of every earlier run in

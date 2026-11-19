@@ -935,11 +935,12 @@
       const banner = val.mode === "provisional"
         ? `<div class="rep-banner"><strong>Provisional report</strong> — ${failures.length} validation ${failures.length === 1 ? "gate" : "gates"} did not pass. The findings are still shown, with the shortfall named.${failures.length ? `<ul>${failures.slice(0, 4).map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}</div>`
         : "";
+      // Every report is model-authored: the backend no longer writes one, and
+      // a run whose model produced no usable draft fails instead of shipping a
+      // generated stand-in. Legacy sessions simply carry no authorship note.
       const authorLine = meta.authored_by === "model"
         ? "Written by the research model from this run's complete research record."
-        : meta.authored_by === "deterministic_fallback"
-          ? "Rendered by the deterministic pipeline: the report-writing model did not return a usable draft, so the measured findings are presented without its analysis."
-          : "";
+        : "";
       const authored = authorLine
         ? `<div class="rep-note">${esc(authorLine)}${(meta.figures || []).length ? ` ${esc(String((meta.figures || []).length))} screenshot${(meta.figures || []).length === 1 ? "" : "s"} embedded as evidence.` : ""}</div>`
         : "";
@@ -957,10 +958,20 @@
         <div class="panel"><div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">${esc(report.title || title)}</h2>
           <span class="chip ${esc(report.kind)}">${esc(report.kind)}</span></div>
         ${authored}${banner}
-        <div class="section report-body" id="rep-body">${sections}</div></div>`;
+        <div class="section report-body" id="rep-body">${sections}</div></div>
+        <div class="panel chat-panel" id="rep-chat">
+          <div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">Ask the analyst</h2>
+            <span class="muted" style="font-size:0.72rem">answered from this run's whole record</span></div>
+          <div class="chat-log" id="chat-log"><div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div></div>
+          <form class="chat-form" id="chat-form">
+            <textarea id="chat-input" rows="2" maxlength="8000" placeholder="e.g. who exactly buys this, and what would make them choose a new book?"></textarea>
+            <button class="btn small primary" id="chat-send" type="submit">Send</button>
+          </form>
+        </div>`;
       $("#rep-back").addEventListener("click", renderReportsView);
       $("#rep-pdf").addEventListener("click", () => exportPdf(sid, rid));
       loadFollowupButton(sid);
+      loadReportChat(sid, rid);
       // Collapsible h2 sections for phone usability on long reports.
       $("#rep-body").querySelectorAll("h2").forEach((h) => {
         const wrap = document.createElement("div");
@@ -988,6 +999,89 @@
   }
 
   function splitReportSections(md) { return mdToHtml(md); }
+
+  // ---------- talking to the analyst about a delivered report ---------------
+  // The conversation is durable and per-report: the analyst sees the whole
+  // research record plus the whole thread on every turn, so follow-ups keep
+  // their meaning. The owner's messages sit on the right, the analyst's on the
+  // left, like any chat.
+  async function loadReportChat(sid, rid) {
+    const log = $("#chat-log");
+    const form = $("#chat-form");
+    if (!log || !form) return;
+    let messages = [];
+    try {
+      const data = await api(`/api/sessions/${sid}/reports/${rid}/chat`);
+      messages = Array.isArray(data.messages) ? data.messages : [];
+    } catch (e) {
+      log.innerHTML = `<div class="chat-empty error-text">${esc(e.message)}</div>`;
+    }
+    renderChat(log, messages);
+    form.onsubmit = async (ev) => {
+      ev.preventDefault();
+      const input = $("#chat-input");
+      const send = $("#chat-send");
+      const text = String(input.value || "").trim();
+      if (!text || send.disabled) return;
+      messages.push({ role: "owner", text, created_at: new Date().toISOString() });
+      renderChat(log, messages, true);
+      input.value = "";
+      send.disabled = true;
+      send.textContent = "Thinking…";
+      try {
+        const data = await api(`/api/sessions/${sid}/reports/${rid}/chat`, {
+          method: "POST",
+          body: JSON.stringify({ message: text }),
+        });
+        messages = Array.isArray(data.messages) ? data.messages : messages;
+        renderChat(log, messages);
+      } catch (e) {
+        renderChat(log, messages);
+        const err = document.createElement("div");
+        err.className = "chat-row chat-ai";
+        err.innerHTML = `<div class="chat-bubble error-text">${esc(e.message)}</div>`;
+        log.appendChild(err);
+        scrollChat(log);
+      } finally {
+        send.disabled = false;
+        send.textContent = "Send";
+        input.focus();
+      }
+    };
+  }
+
+  function scrollChat(log) {
+    try { log.scrollTop = log.scrollHeight; } catch (e) { /* not scrollable */ }
+  }
+
+  function renderChat(log, messages, keepThinking) {
+    log.innerHTML = "";
+    if (!messages.length) {
+      log.innerHTML = `<div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div>`;
+      return;
+    }
+    for (const m of messages) {
+      const ai = m.role !== "owner";
+      const row = document.createElement("div");
+      row.className = `chat-row ${ai ? "chat-ai" : "chat-owner"}`;
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble";
+      if (ai) {
+        bubble.innerHTML = mdToHtml(String(m.text || ""));
+      } else {
+        bubble.innerHTML = esc(String(m.text || "")).replace(/\n/g, "<br>");
+      }
+      row.appendChild(bubble);
+      log.appendChild(row);
+    }
+    if (keepThinking) {
+      const thinking = document.createElement("div");
+      thinking.className = "chat-row chat-ai chat-thinking";
+      thinking.innerHTML = `<div class="chat-bubble"><span class="spinner"></span> reading the research record…</div>`;
+      log.appendChild(thinking);
+    }
+    scrollChat(log);
+  }
 
   // ---------- follow-up run (continues the WHOLE previous session) ----------
   // The new run inherits the previous session's complete record — report,

@@ -303,8 +303,8 @@ autonomous discovery).
 Guardrails stay deterministic:
 
 - every figure in the delivered markdown must appear in the dossier — unknown
-  figures are removed and one corrective retry is attempted before the
-  generated fallback report is used;
+  figures are removed and a corrective retry is attempted (three attempts in
+  all); the model's document is then the deliverable, whole;
 - every `[ev:ID]` citation must name a real evidence record and resolves to
   `/api/sessions/{id}/evidence/{evidence_id}`, a page showing the capture;
 - every `![caption](shot:EVIDENCE_ID)` must name a captured screenshot and
@@ -313,9 +313,30 @@ Guardrails stay deterministic:
 - no claim can cite a figure that exists only in the model's reasoning or its
   run notes.
 
-A failed or unusable report-writing call never costs the deliverable: the
-session is reported with the deterministic layout instead, and the report's
-metadata says which path produced it.
+If the model cannot produce a usable report after those attempts, the run is
+reported as failed (`ReportWriteError`) rather than shipping a backend-written
+stand-in: all research data stays saved, so the report can be written once the
+model is available again. There is no generated fallback and no
+`REPORT_AI` switch — the backend never authors a section of the report.
+
+### Talking to the analyst (`app/report_chat.py`)
+
+A delivered report opens a conversation, not a dead end: the owner asks
+questions and keeps asking (
+`POST /api/sessions/{id}/reports/{rid}/chat`, history at `GET …/chat`).
+The analyst answers from the SAME record the report was written from — the
+brief, every phase's analysis, every capture (search totals, competitor
+prices/BSRs/review counts, category charts, the review text read), the
+candidate ledger with rejection reasons, the verification checks, its own
+notes and reasoning, the screenshots, the earlier runs in the chain and the
+report itself — nothing sampled and nothing summarised. Every earlier question
+and answer is re-sent on each turn, so "that one" and "the second option" keep
+their meaning; the conversation is stored in `report_chat_messages` per report
+and survives restarts. Answers are grounded exactly like the report: `[ev:ID]`
+citations resolve to real evidence pages (unknown ids are dropped and reported,
+never linked), and a question the research cannot answer is answered as a gap,
+not a guess. In the dashboard the panel sits under the report — owner messages
+on the right, the analyst's on the left.
 
 
 

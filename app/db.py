@@ -19,7 +19,7 @@ from pathlib import Path
 
 from app.config import Config, get_config
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -470,6 +470,20 @@ CREATE TABLE IF NOT EXISTS market_memory (
     UNIQUE (owner, kind, subject, marketplace)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_kind ON market_memory(kind, captured_at);
+
+-- Owner↔analyst conversation about a delivered report. Durable and ordered:
+-- every question and answer is kept verbatim and re-sent on each turn, so the
+-- thread ("that one", "the second option") keeps its meaning across restarts.
+CREATE TABLE IF NOT EXISTS report_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id),
+    report_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    meta TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_chat_report ON report_chat_messages(session_id, report_id, id);
 """
 
 

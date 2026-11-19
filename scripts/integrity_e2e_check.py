@@ -63,25 +63,28 @@ def main() -> int:
     for k, n in sorted(Counter(x.kind for x in a.list(s.id, limit=1000)).items()):
         print(f"  {k}: {n}")
 
-    final = next(r for r in ReportStore(db, cfg).list(s.id) if r.kind == "final")
+    store = ReportStore(db, cfg)
+    final = next(r for r in store.list(s.id) if r.kind == "final")
     print("\nREPORT MODE:", final.meta.get("mode"))
-    body = ReportStore(db, cfg).read_markdown(final)
-    print("\n--- REPORT EXCERPTS ---")
-    for line in body.splitlines():
-        if any(
-            t in line
-            for t in (
-                "Report status",
-                "KDP risk",
-                "Keyword integrity",
-                "Evidence trail",
-                "Verification status",
-            )
-        ):
-            print(" ", line[:170])
+    body = store.read_markdown(final)
+    # The report is the model's document; the integrity findings live in the
+    # stored model (assessments above) and in the PDF/HTML export, not in a
+    # backend-written status line.
+    ai = (store.read_model_json(final) or {}).get("ai_report") or {}
+    ai_body = str(ai.get("markdown") or "")
+    print("\n--- REPORT (model-authored) ---")
+    for line in body.splitlines()[:6]:
+        print(" ", line[:170])
+    print(f"  … {len(ai_body)} chars, {ai.get('words')} words")
+    ok = (
+        sess.status == "completed"
+        and bool(ai_body.strip())
+        and body.strip() == ai_body.strip()
+    )
+    print("\nINTEGRITY E2E RESULT:", "PASS" if ok else "FAIL")
 
     db.close()
-    return 0 if sess.status == "completed" else 1
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -239,7 +239,10 @@ class ObservationStore:
 # app.research_memory. Note TEXT is therefore never truncated (a lossy note is
 # worse than no note: the model re-reads its own words later), while the number
 # of note rows per session stays bounded.
-MAX_NOTES_PER_SESSION = 400
+# 0 = the model may record as many notes as its research needs. The owner's
+# rule: no limit on how many times the model may act. (A long run that keeps
+# noticing things must never be told its own memory is full.)
+MAX_NOTES_PER_SESSION = 0
 
 
 @dataclass
@@ -296,7 +299,8 @@ class ResearchNoteStore:
         """Store one note. Returns (note, outcome).
 
         outcome is "stored", "duplicate" (identical text already present) or
-        "full" (the session's bounded note budget is spent). Nothing raises
+        "full" (only when an owner sets MAX_NOTES_PER_SESSION; the default is
+        no cap at all). Nothing raises
         for a bad note: notes are additive, research never stops for them.
         """
         cleaned = " ".join(str(text or "").split()).strip()
@@ -313,7 +317,7 @@ class ResearchNoteStore:
                 "SELECT COUNT(*) AS n FROM research_notes WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-        if int(total["n"]) >= MAX_NOTES_PER_SESSION:
+        if MAX_NOTES_PER_SESSION and int(total["n"]) >= MAX_NOTES_PER_SESSION:
             return None, "full"
         note = ResearchNote(
             id=new_id(),

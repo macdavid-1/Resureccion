@@ -41,6 +41,10 @@ class ReportRequest(BaseModel):
     body_markdown: str
 
 
+class ChatRequest(BaseModel):
+    message: str
+
+
 def _auth(request: Request) -> None:
     try:
         require_owner_sync(request)
@@ -556,6 +560,210 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
     )
     result["reports"] = [{"id": r.id, "title": r.title} for r in chosen]
     return result
+
+
+# ------------------------------------------------------- talking to the analyst
+_EV_RE = __import__("re").compile(r"\[ev:([A-Za-z0-9_\-]+)\]")
+
+
+def _link_chat_citations(text: str, session_id: str, known: set[str]) -> tuple[str, list[str], list[str]]:
+    """Resolve `[ev:ID]` into a clickable evidence link (as the report does).
+
+    A citation naming a record this session never captured is not a link: it
+    is dropped from the text and reported, never left pointing at a 404.
+    """
+    cited: list[str] = []
+    dropped: list[str] = []
+
+    def _sub(m: Any) -> str:
+        ev_id = m.group(1)
+        if ev_id not in known:
+            dropped.append(ev_id)
+            return ""
+        if ev_id not in cited:
+            cited.append(ev_id)
+        return (
+            f'[ev:{ev_id}](/api/sessions/{session_id}/evidence/{ev_id} '
+            f'"Evidence {ev_id} — the captured page behind this answer")'
+        )
+
+    out = _EV_RE.sub(_sub, text)
+    return out, cited, dropped
+
+
+def _chat_dossier(st: Any, session_id: str, report: Any) -> dict:
+    """The whole research record, assembled for one conversation."""
+    from app.continuation_build import prior_run_records
+    from app.methodology import PHASE_ORDER
+    from app.report_chat import build_chat_dossier
+
+    verifications = getattr(st, "verifications", None)
+    if verifications is None:
+        from app.research_data import VerificationStore
+
+        verifications = VerificationStore(st.db)
+    prior_runs: list[dict] = []
+    try:
+        prior_runs = prior_run_records(
+            session_id,
+            sessions=st.sessions,
+            candidates=st.candidates,
+            opportunities=st.opportunities,
+            verifications=verifications,
+            notes=getattr(st, "notes", None),
+            browser_evidence=st.browser_evidence,
+            reports=st.reports,
+            trace=getattr(st, "trace", None),
+            thoughts=getattr(st, "thoughts", None),
+            owner_messages=getattr(st, "owner_messages", None),
+            memory=getattr(st, "research_memory", None),
+        )
+    except Exception:
+        prior_runs = []
+    return build_chat_dossier(
+        session_id,
+        report,
+        sessions=st.sessions,
+        candidates=st.candidates,
+        opportunities=st.opportunities,
+        verifications=verifications,
+        claims=st.claims,
+        browser_evidence=st.browser_evidence,
+        observations=st.observations,
+        notes=getattr(st, "notes", None),
+        thoughts=getattr(st, "thoughts", None),
+        trace=getattr(st, "trace", None),
+        owner_messages=getattr(st, "owner_messages", None),
+        memory=getattr(st, "research_memory", None),
+        reports=st.reports,
+        checkpoints=getattr(st, "checkpoints", None),
+        phase_order=list(PHASE_ORDER),
+        prior_runs=prior_runs,
+        artifacts=getattr(st, "artifacts", None),
+    )
+
+
+def _report_or_404(request: Request, session_id: str, report_id: str) -> Any:
+    _session_or_404(request, session_id)
+    rep = _st(request).reports.get(session_id, report_id)
+    if rep is None:
+        raise HTTPException(status_code=404, detail="report not found")
+    return rep
+
+
+@router.get("/sessions/{session_id}/reports/{report_id}/chat")
+async def get_report_chat(session_id: str, report_id: str, request: Request) -> dict:
+    """The owner↔analyst conversation attached to this report."""
+    _auth(request)
+    st = _st(request)
+    _report_or_404(request, session_id, report_id)
+    from app.report_chat import ChatStore
+
+    messages = ChatStore(st.db).list(session_id, report_id)
+    return {"report_id": report_id, "messages": [m.to_dict() for m in messages]}
+
+
+@router.post("/sessions/{session_id}/reports/{report_id}/chat")
+async def ask_report_chat(
+    session_id: str, report_id: str, body: ChatRequest, request: Request
+) -> dict:
+    """Ask the analyst a question about this report, in the ongoing thread.
+
+    The model receives the ENTIRE research record (every capture, candidate,
+    verification, note, reasoning line, screenshot, earlier run and the report
+    itself, nothing summarised) plus the whole conversation so far, so
+    follow-ups keep their meaning. Answers are prose, grounded the same way the
+    report is: citations resolve to real evidence or are dropped.
+    """
+    _auth(request)
+    st = _st(request)
+    rep = _report_or_404(request, session_id, report_id)
+    question = (body.message or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="message is required")
+    if len(question) > 8_000:
+        raise HTTPException(status_code=400, detail="message is too long (8000 characters max)")
+
+    from app.report_chat import ChatStore, answer
+
+    chats = ChatStore(st.db)
+    history = chats.list(session_id, report_id)
+    owner_msg = chats.add(session_id, report_id, role="owner", text=question)
+    st.events.append(
+        session_id, level="info", actor="owner", action="report_question_asked",
+        detail={"report_id": report_id, "chars": len(question)},
+    )
+
+    dossier = await run_in_threadpool(_chat_dossier, st, session_id, rep)
+    model = getattr(st, "chat_model", None)
+    owned_client = None
+    if model is None:
+        from app.model_client import ModelClient
+
+        owned_client = ModelClient(st.config, st.events, thoughts=getattr(st, "thoughts", None))
+        model = owned_client
+    timeout = float(getattr(st.config, "chat_timeout_seconds", 240) or 240)
+    try:
+        text = await asyncio.wait_for(
+            answer(
+                model=model,
+                session_id=session_id,
+                dossier=dossier,
+                history=history,
+                question=question,
+                max_tokens=int(getattr(st.config, "chat_max_tokens", 4_000) or 4_000),
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        st.events.append(
+            session_id, level="warn", actor="model", action="report_question_timeout",
+            detail={"report_id": report_id, "timeout_seconds": timeout},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"the analyst took longer than {int(timeout)}s and was stopped. "
+                "The question is saved — ask again to retry."
+            ),
+        ) from exc
+    except Exception as exc:
+        st.events.append(
+            session_id, level="warn", actor="model", action="report_question_failed",
+            detail={"report_id": report_id, "error": f"{type(exc).__name__}: {exc}"[:300]},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"the analyst could not answer: {type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        if owned_client is not None:
+            try:
+                await owned_client.aclose()
+            except Exception:
+                pass
+    if not text:
+        raise HTTPException(
+            status_code=502,
+            detail="the analyst returned an empty answer; the question is saved — ask again",
+        )
+
+    known = {row.get("id") for row in (dossier.get("evidence") or []) if isinstance(row, dict)}
+    linked, cited, dropped = _link_chat_citations(text, session_id, known)
+    analyst_msg = chats.add(
+        session_id, report_id, role="analyst", text=linked,
+        meta={"citations": cited, "dropped_citations": dropped},
+    )
+    st.events.append(
+        session_id, level="info", actor="agent", action="report_question_answered",
+        detail={"report_id": report_id, "chars": len(linked), "citations": len(cited)},
+    )
+    return {
+        "report_id": report_id,
+        "question": owner_msg.to_dict(),
+        "answer": analyst_msg.to_dict(),
+        "messages": [m.to_dict() for m in chats.list(session_id, report_id)],
+    }
 
 
 @router.get("/sessions/{session_id}/recordings/{artifact_id}/file")

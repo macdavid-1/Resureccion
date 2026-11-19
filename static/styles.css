@@ -517,6 +517,62 @@ table.rt tr:last-child td { border-bottom: none; }
   .report-body figure.rep-fig figcaption { font-size: 0.68rem; }
 }
 
+/* ---------- ask the analyst (report chat) ---------- */
+.chat-panel { display: flex; flex-direction: column; }
+.chat-log {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px; max-height: 62vh; overflow-y: auto;
+  scroll-behavior: smooth;
+}
+.chat-empty {
+  font-size: 0.78rem; color: var(--text-3); line-height: 1.5;
+  border: 1px dashed var(--line-strong); border-radius: var(--r);
+  padding: 12px 13px;
+}
+.chat-row { display: flex; }
+.chat-owner { justify-content: flex-end; }
+.chat-ai { justify-content: flex-start; }
+.chat-bubble {
+  max-width: min(78ch, 88%); padding: 10px 13px; border-radius: 12px;
+  font-size: 0.86rem; line-height: 1.55; overflow-wrap: anywhere;
+}
+.chat-owner .chat-bubble {
+  background: var(--accent); color: #fff; border: 1px solid var(--accent-soft);
+  border-bottom-right-radius: 3px;
+}
+.chat-ai .chat-bubble {
+  background: var(--bg-inset); border: 1px solid var(--line);
+  border-bottom-left-radius: 3px; color: var(--text);
+}
+.chat-ai .chat-bubble p { margin: 0 0 8px; }
+.chat-ai .chat-bubble p:last-child { margin-bottom: 0; }
+.chat-ai .chat-bubble ul, .chat-ai .chat-bubble ol { margin: 0 0 8px; padding-left: 20px; }
+.chat-ai .chat-bubble li { margin: 3px 0; }
+.chat-ai .chat-bubble h1, .chat-ai .chat-bubble h2, .chat-ai .chat-bubble h3,
+.chat-ai .chat-bubble h4 {
+  font-size: 0.86rem; margin: 4px 0 6px; color: var(--text);
+  text-transform: none; letter-spacing: 0;
+}
+.chat-ai .chat-bubble a.ev-ref { color: inherit; }
+.chat-ai .chat-bubble table.rt { font-size: 0.76rem; }
+.chat-thinking .chat-bubble { color: var(--text-3); display: flex; align-items: center; gap: 8px; }
+.chat-form {
+  display: flex; gap: 8px; align-items: flex-end;
+  padding: 10px 14px 14px; border-top: 1px solid var(--line);
+}
+.chat-form textarea {
+  flex: 1; resize: vertical; min-height: 46px; max-height: 34vh;
+  background: var(--bg-inset); color: var(--text);
+  border: 1px solid var(--line-strong); border-radius: var(--r);
+  padding: 11px 12px; font: inherit; font-size: 0.88rem; line-height: 1.45;
+}
+.chat-form textarea:focus { outline: none; border-color: var(--accent-bright); }
+.chat-form .btn { flex: 0 0 auto; }
+@media (max-width: 640px) {
+  .chat-log { max-height: 58vh; }
+  .chat-bubble { max-width: 92%; }
+}
+
 details.sect { border: 1px solid var(--line); border-radius: var(--r); margin: 10px 0; background: var(--bg-panel); }
 details.sect > summary {
   list-style: none; cursor: pointer; padding: 13px 14px;

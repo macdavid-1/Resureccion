@@ -137,9 +137,9 @@ from app.whitespace import WhitespaceScore, compute_whitespace, priority_lines
 # A missing field is a degraded iteration — research NEVER pauses for it.
 _CONTRACT_REPAIR_ATTEMPTS = 1
 
-# Notes accepted from a single model reply (the session-wide cap lives in
-# app.research_data.MAX_NOTES_PER_SESSION). Bounded so one runaway reply cannot
-# flood the session or the report.
+# Notes accepted from a single model reply (there is no session-wide cap:
+# app.research_data.MAX_NOTES_PER_SESSION is 0 by default). Bounded so one
+# malformed runaway reply cannot flood the session or the report.
 _MAX_NOTES_PER_REPLY = 12
 
 # Unexpected errors inside a run are RECOVERED this many times before the
@@ -4690,55 +4690,35 @@ class ResearchRunner:
         trace. Oldest first. Guarded against cycles and bounded only by the
         number of runs in the chain.
         """
-        from app.continuation_build import build_continuation_brief, load_adjacent_rows
+        from app.continuation_build import prior_run_records
         from app.reports import ReportStore
 
-        reports = ReportStore(self.db, self.config)
-        out: list[dict[str, Any]] = []
-        seen: set[str] = {session_id}
+        # No depth limit: every ancestor run is part of the record. The
+        # dossier's own safety ceiling (REPORT_CONTEXT_CHARS) is what protects
+        # a pathologically long chain, not a silent cut-off.
         try:
-            current = self.sessions.require(session_id).parent_session_id
-        except Exception:
-            return out
-        while current and current not in seen and len(out) < 20:
-            seen.add(current)
-            try:
-                brief = build_continuation_brief(
-                    current,
-                    sessions=self.sessions,
-                    candidates=self.candidates,
-                    opportunities=self.opportunities,
-                    verifications=VerificationStore(self.db),
-                    notes=self.notes,
-                    browser_evidence=self.browser_evidence,
-                    reports=reports,
-                    trace=self.trace,
-                    thoughts=self.thoughts,
-                    owner_messages=self.owner_messages,
-                    memory=self.research_memory,
-                    adjacent_rows=load_adjacent_rows(reports, current),
-                )
-            except Exception as exc:
-                self.errors.record(
-                    session_id, scope="prior_runs", severity="warning",
-                    message=f"could not read earlier run {current}: "
-                            f"{type(exc).__name__}: {exc}"[:240],
-                    recoverable=True,
-                )
-                break
-            out.append({
-                "session_id": current,
-                "name": brief.parent_name,
-                "status": brief.parent_status,
-                "record": brief.record_text(),
-                "report_title": brief.report_title,
-            })
-            try:
-                current = self.sessions.require(current).parent_session_id
-            except Exception:
-                break
-        out.reverse()  # oldest first: the chain as it actually happened
-        return out
+            return prior_run_records(
+                session_id,
+                sessions=self.sessions,
+                candidates=self.candidates,
+                opportunities=self.opportunities,
+                verifications=VerificationStore(self.db),
+                notes=self.notes,
+                browser_evidence=self.browser_evidence,
+                reports=ReportStore(self.db, self.config),
+                trace=self.trace,
+                thoughts=self.thoughts,
+                owner_messages=self.owner_messages,
+                memory=self.research_memory,
+            )
+        except Exception as exc:
+            self.errors.record(
+                session_id, scope="prior_runs", severity="warning",
+                message=f"could not read the earlier runs: "
+                        f"{type(exc).__name__}: {exc}"[:240],
+                recoverable=True,
+            )
+            return []
 
     async def _write_ai_report(
         self, session_id: str, model: Any, phase_outputs: dict[str, Any]
@@ -4784,8 +4764,10 @@ class ResearchRunner:
                 backlog=self._backlog_items(session_id),
                 # Earlier runs of this investigation, with their FULL records.
                 prior_runs=self._prior_run_records(session_id),
+                # 0 = hand the dossier over whole; a positive value is the
+                # owner's own ceiling on the writing prompt.
                 context_chars=int(
-                    getattr(self.config, "report_context_chars", 600_000) or 600_000
+                    getattr(self.config, "report_context_chars", 1_200_000)
                 ),
             )
         except Exception as exc:

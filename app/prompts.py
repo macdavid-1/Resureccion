@@ -466,8 +466,10 @@ def build_user_prompt(
         g = phase_gate
         floor = int(g.get("min_output_items") or 0)
         parts.append(
-            "\nPHASE EXIT GATE (deterministic — the orchestrator, not you, "
-            "decides when this phase ends): " + _compact(g) + "\n"
+            "\nPHASE EXIT GATE (deterministic — this gate, not a fixed "
+            "iteration count, decides when the phase may close; research as "
+            "long as the work needs, there is no cap on how many times you may "
+            "act): " + _compact(g) + "\n"
             "- EXPLORE: a reply carrying a non-empty 'actions' list runs those "
             "actions and re-prompts you with fresh evidence. It never ends the phase.\n"
             "- COMMIT: reply with NO 'actions' key, with the contract fully "

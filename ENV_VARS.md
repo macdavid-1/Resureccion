@@ -63,9 +63,10 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 | `MODEL_VISION_ENABLED` | no | `true` | Attach latest browser screenshot to each iteration |
 | `MODEL_VISION_MAX_BYTES` | no | `400000` | Screenshot size guard for vision input |
 | `MODEL_STREAM` | no | `true` | Stream the model response so the owner watches the chain of thought grow live (session → *Chain of thought*). Purely an enhancement: any endpoint that rejects or ignores `stream` falls back to a plain request automatically, and `false` forces that plain request |
-| `REPORT_AI` | no | `true` | The final report is written by the model from the run's complete record (prompt, phases, reasoning, captures, competitor metadata, rejections, screenshots). `false` uses the generated fallback layout for every report |
 | `REPORT_MAX_TOKENS` | no | `16000` | Completion budget for the report-writing call (min 2000). The report is markdown, not JSON, so it gets its own allowance |
-| `REPORT_CONTEXT_CHARS` | no | `600000` | Prompt budget for the research dossier. Older captures and journey detail are condensed to fit; nothing measured is altered and the condensation is recorded for the model |
+| `REPORT_CONTEXT_CHARS` | no | `1200000` | Safety ceiling on the research dossier handed to the report writer — every record arrives whole (nothing is trimmed), and only a dossier larger than this is sampled, with the omission recorded for the model. `0` = no ceiling |
+| `CHAT_TIMEOUT_SECONDS` | no | `240` | How long one answer about a delivered report may take before it is stopped and reported as a timeout (the question stays saved, so it can be asked again) |
+| `CHAT_MAX_TOKENS` | no | `4000` | Completion budget for one answer in the report conversation |
 
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw
@@ -136,10 +137,6 @@ engine.
 | `CENSUS_ITEMS_PER_CATEGORY` | no | `20` | Items (rank/price/rating/reviews) captured per node |
 | `CENSUS_MAX_MARKETPLACES` | no | `1` | Marketplaces censused — keep `1` on a 2-core box |
 | `CENSUS_TIME_BUDGET_SECONDS` | no | `600` | Wall-clock cap for the whole census walk |
-| `FRONTIER_ENABLED` | no | `true` | Autocomplete demand-language miner: seed → append a–z → deepen, against Amazon's real suggestion endpoint (one page load per marketplace, no login needed) |
-| `FRONTIER_MAX_QUERIES` | no | `240` | Total suggestion queries per run |
-| `FRONTIER_MAX_DEPTH` | no | `2` | Recursive deepening depth (1–4) |
-| `FRONTIER_TIME_BUDGET_SECONDS` | no | `420` | Wall-clock cap for the frontier sweep |
 | `ADJACENCY_ENABLED` | no | `true` | After competition/demand phases, walk outward from every strong candidate and promote high-headroom neighbours mid-run |
 | `ADJACENCY_MAX_NEW` | no | `6` | Neighbours promotable to candidates per adjacency round |
 | `ADJACENCY_MIN_WHITESPACE` | no | `0.55` | Measured headroom a neighbour must clear before it becomes a candidate |
@@ -156,9 +153,8 @@ engine.
 | `DIVE_TIME_BUDGET_SECONDS` | no | `300` | Wall-clock cap per candidate; unmeasured keywords are reported as “not searched”, never as a number |
 | `RESEARCH_MIN_HOURS` | no | `3` | Minimum wall-clock research duration. While a session is under it, every phase owes a raised new-evidence floor before it may close, so spare hours become deeper research instead of a 1–2 hour finish. `0` disables depth-raising entirely |
 | `DEPTH_EVIDENCE_MULTIPLIER` | no | `2` | How many times its declared new-evidence floor a phase owes while under `RESEARCH_MIN_HOURS` (Phase 1's `8` asks for `16` new records, and the model sees the raised number in its exit gate) |
-| `MODEL_CALLS_PER_HOUR` | no | `45` | Model-call ceiling per hour of `SESSION_HARD_TIMEOUT_HOURS` — the budget follows the time budget instead of a fixed cap, so a run is never stopped by a call counter with hours unspent. At the 12-hour default this is **540 calls per session** (a full two-pass methodology uses ~300). `MODEL_CALLS_<mode>` still overrides it outright |
-| `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | time-scaled | Override the per-session model-call ceiling for a mode. By default the ceiling is `max(120, SESSION_HARD_TIMEOUT_HOURS × MODEL_CALLS_PER_HOUR)` plus the mode's profile extra — 540 + extra at the 12-hour default |
-| `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | profile | Nine colon-separated integers in phase order (`12:16:24:24:16:12:12:20:12` for a briefed run) overriding that mode's per-phase iteration caps |
+| `MODEL_CALLS_prompt` / `MODEL_CALLS_keywords` / `MODEL_CALLS_auto` | no | `0` (no ceiling) | An optional per-session model-call ceiling for a mode. Unset means no ceiling at all: the model is never told it has run out of moves, and `SESSION_HARD_TIMEOUT_HOURS` is the only time stop |
+| `MODE_ITERATIONS_prompt` / `_keywords` / `_auto` | no | `0` (no cap) | Nine colon-separated integers in phase order (`12:16:24:24:16:12:12:20:12` for example) imposing a per-phase iteration cap for that mode. Unset means a phase runs until its output contract is met |
 
 External (non-Amazon) research actions — `forum_search`, `google_suggest`,
 `goodreads_check` — are not env-configurable: the allow-listed hosts live in
