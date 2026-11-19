@@ -424,9 +424,13 @@ class ActionExecutor:
         Autocomplete is only as specific as its seed: "grief" completes to
         "grief books", "grief journal", "grief gifts" — the whole store. So a
         generic seed is refused with the reason and an example of what to try
-        instead, and the completions that are themselves store roots are dropped
-        before they reach the model (they stay on the record as dropped, so the
-        owner can see what Amazon offered and why it was not chased).
+        instead.
+
+        Every completion the targeted seed returns is handed over, unfiltered:
+        which suggestions are worth pursuing is a research judgement and it
+        belongs to the model, not to a word list. The store-root completions
+        are MARKED (`store_root_suggestions`) so the model can weigh them, and
+        nothing is thrown away.
         """
         query = " ".join(str(args.get("query") or "").split())
         if not query:
@@ -455,9 +459,10 @@ class ActionExecutor:
                 )
             except Exception:
                 suggestion = []
-            raw = [str(t).strip() for t in (suggestion or []) if str(t).strip()]
-            kept = [t for t in raw if not generic_completion(t)]
-            dropped = [t for t in raw if generic_completion(t)]
+            suggestions = [
+                str(t).strip() for t in (suggestion or []) if str(t).strip()
+            ]
+            roots = [t for t in suggestions if generic_completion(t)]
             record = self.collector.evidence_store.create(
                 session_id=session_id,
                 marketplace=mkt.code,
@@ -466,18 +471,19 @@ class ActionExecutor:
                 title=f"autocomplete: {query}",
                 data={
                     "query": query,
-                    "suggestions": kept,
-                    "suggestions_dropped_generic": dropped,
+                    "suggestions": suggestions,
+                    "store_root_suggestions": roots,
                     "note": (
-                        "completions that are only a format, a broad market or "
-                        "a bare audience were dropped as store roots; the "
-                        "kept ones name a reader or a situation"
-                    ) if dropped else "",
+                        "all completions are here, exactly as Amazon returned "
+                        "them; 'store_root_suggestions' are the ones that name "
+                        "only a format, a broad market or a bare audience — "
+                        "you decide whether any is worth pursuing"
+                    ),
                 },
             )
-            summary = f"{len(kept)} targeted suggestions for {query!r}"
-            if dropped:
-                summary += f" ({len(dropped)} generic completion(s) dropped)"
+            summary = f"{len(suggestions)} suggestions for {query!r}"
+            if roots:
+                summary += f" ({len(roots)} of them are store roots)"
             return ActionResult(
                 action="autocomplete", ok=True, marketplace=mkt.code,
                 url=scrub_url(page.url), evidence_ids=[record.id],

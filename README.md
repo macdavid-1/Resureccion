@@ -448,9 +448,11 @@ Supporting changes:
   while a session is under `RESEARCH_MIN_HOURS` (default 3) every phase owes
   `DEPTH_EVIDENCE_MULTIPLIER` times its declared new-evidence floor before it
   may close (the model sees the raised number and a time-remaining line in
-  every prompt), and the model-call ceiling is now
-  `SESSION_HARD_TIMEOUT_HOURS × MODEL_CALLS_PER_HOUR` instead of a fixed
-  cap. Depth never becomes a spin loop: when the declared floors are met and
+  every prompt), and there is **no model-call ceiling and no per-phase
+  iteration cap**: the model is never told it has run out of moves (0 = no
+  limit in `MODEL_CALLS_<mode>` / `MODE_ITERATIONS_<mode>`; setting either
+  restores a cap). Wall-clock time, an owner pause/cancel and the phase's own
+  completion are the only stops. Depth never becomes a spin loop: when the declared floors are met and
   no NEW distinct source appears for `STALL_LIMIT` rounds, the phase commits
   and records `phase_committed_at_depth_ceiling` rather than re-capturing
   duplicates forever.
@@ -465,10 +467,10 @@ Supporting changes:
   *produced no output* instead of *completed*.
 - **Per-mode budget profiles** (`app/methodology.MODE_PROFILES`) — a detailed
   brief spends on competition/verification, no topic at all spends on
-  discovery/niching; iteration caps are ceilings (not targets) sized so a
-  session with hours left is never the thing that ends research, and the
-  model-call ceiling scales with the hard time budget. Env-overridable per
-  mode.
+  discovery/niching. The profiles no longer cap a live phase (a phase runs
+  until its contract is met), and the model-call ceiling is unlimited unless
+  the owner sets one explicitly with `MODEL_CALLS_<mode>` or
+  `MODE_ITERATIONS_<mode>`.
 - **No more silently dropped niches** — candidates past the live cap land in
   a durable backlog and appear in the report's ledger.
 - **Adjacent-opportunities ledger** — surviving-but-unfunded candidates,

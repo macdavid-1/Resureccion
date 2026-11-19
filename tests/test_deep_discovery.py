@@ -415,39 +415,34 @@ def test_mode_profiles_rebalance_the_same_methodology():
     assert mode_profile("nonsense").mode == "keywords"
 
 
-def test_model_ceiling_scales_with_the_time_budget(db, config):
-    """The call budget follows the session's TIME budget.
+def test_no_model_call_ceiling_and_no_phase_iteration_cap(db, config, monkeypatch):
+    """The model is never capped on how many times it may act.
 
-    A fixed cap ended research after ~120 calls — an hour or two into an
-    8-12 hour budget — so the ceiling is derived from the hard wall-clock
-    budget instead, with the runner's floor underneath it.
+    Only time, an owner stop, or its own completion end a phase. An explicit
+    MODE_ITERATIONS_<mode> override still applies when the owner sets one.
     """
     from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
-    base = runner.rc.max_model_calls_per_session
-    hours = config.session_hard_timeout_hours
-    per_hour = config.model_calls_per_hour
-    assert runner._model_call_ceiling("prompt") == max(base, hours * per_hour)
-    assert runner._model_call_ceiling("prompt") > base  # an hour or two is not a budget
-    assert runner._model_call_ceiling("keywords") > runner._model_call_ceiling("prompt")
-    assert runner._model_call_ceiling("auto") > runner._model_call_ceiling("keywords")
-    # A shorter hard budget buys proportionally fewer calls …
-    config.session_hard_timeout_hours = 6
-    assert runner._model_call_ceiling("auto") < 12 * per_hour + MODE_PROFILES["auto"].extra_calls
-    # …but never below the runner's safety floor.
-    config.session_hard_timeout_hours = 1
-    assert runner._model_call_ceiling("prompt") >= base
+    for mode in ("prompt", "keywords", "auto"):
+        assert runner._model_call_ceiling(mode) == 0
+        for phase in SPECS:
+            assert runner._phase_iterations(phase, mode) == 0
+
+    # An owner who does want a cap can still set one.
+    config.mode_iterations["auto"] = "4:4:4:4:4:4:4:4:4"
+    assert runner._phase_iterations(P1_DISCOVERY, "auto") == 4
 
 
-def test_phase_iterations_follow_the_session_mode(db, config):
+def test_phase_iterations_are_unlimited_by_default(db, config):
     from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
-    assert runner._phase_iterations(P1_DISCOVERY, "auto") > \
-        runner._phase_iterations(P1_DISCOVERY, "prompt")
-    assert runner._phase_iterations(P1_DISCOVERY, "prompt") == \
-        mode_profile("prompt").iterations[P1_DISCOVERY]
+    assert runner._phase_iterations(P1_DISCOVERY, "auto") == 0
+    assert runner._phase_iterations(P1_DISCOVERY, "prompt") == 0
+    # The mode profiles still exist as an owner-facing shape, they just no
+    # longer cap a live phase.
+    assert mode_profile("auto").iterations[P1_DISCOVERY] > 0
 
 
 def test_external_sources_are_gated_in_phase1(db, config):

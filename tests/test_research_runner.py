@@ -276,7 +276,7 @@ def make_runner(db: Database, config: Config, model: Any, *, pause_auth: bool = 
         browser_evidence=be_store,
         browser_auth=type("BAS", (), {})(),
         model=model,  # type: ignore[arg-type]
-        runner_config=RunnerConfig(max_model_calls_per_session=100),
+        runner_config=RunnerConfig(),
         executor=executor,
         trace=trace,
         supervisor=supervisor,
@@ -953,7 +953,11 @@ def requestless_job(db, config, session_id):
 
 def test_runner_config_defaults_are_depth_friendly():
     rc = RunnerConfig()
-    assert rc.max_model_calls_per_session >= 100
+    # 0 = no ceiling and no digest cap: the model is never stopped by a
+    # counter and never reads a sample of its own research.
+    assert rc.max_model_calls_per_session == 0
+    assert rc.max_phase_jumps == 0
+    assert rc.max_evidence_digest_items == 0
     assert rc.max_opportunities >= 10
 
 

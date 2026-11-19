@@ -706,9 +706,10 @@ async def test_autocomplete_refuses_a_generic_seed(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_autocomplete_drops_store_root_completions(db, tmp_path):
-    """Completions that are just a shelf are dropped before the model sees
-    them; the targeted ones are kept and the drop is recorded."""
+async def test_autocomplete_hands_over_every_suggestion_and_marks_the_roots(db, tmp_path):
+    """Which suggestions are worth pursuing is the model's judgement, not a
+    word list's: nothing is hidden. The store roots are MARKED so the model can
+    skip them knowingly."""
     from app.browser_store import BrowserAuthStore
 
     store = BrowserAuthStore(db)
@@ -720,18 +721,22 @@ async def test_autocomplete_drops_store_root_completions(db, tmp_path):
         args={"query": "sudden loss grief for widowers"},
     )
     assert result.ok, result.error
-    assert result.summary.startswith("2 targeted suggestions")
-    assert "3 generic completion(s) dropped" in result.summary
+    assert result.summary.startswith("5 suggestions")
+    assert "3 of them are store roots" in result.summary
     row = executor.collector.evidence_store.list("s1")[0]
     assert row.kind == "autocomplete"
+    # Everything Amazon returned, in order, unfiltered.
     assert row.data["suggestions"] == [
+        "grief books",
+        "grief journal",
         "sudden loss grief for widowers in year one",
+        "books for women",
         "grief after a parent's stroke",
     ]
-    assert row.data["suggestions_dropped_generic"] == [
+    assert row.data["store_root_suggestions"] == [
         "grief books", "grief journal", "books for women",
     ]
-    assert "store roots" in row.data["note"]
+    assert "you decide" in row.data["note"]
 
 
 @pytest.mark.asyncio

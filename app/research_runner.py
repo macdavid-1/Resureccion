@@ -8,7 +8,7 @@ Executes the deterministic methodology (app/methodology.py) phase by phase:
 - exit gates (min evidence, required output fields) must pass before the
   runner advances — the model cannot skip the methodology,
 - every model iteration is checkpointed, journaled, and budgeted
-  (max_iterations per phase + STALL_LIMIT anti-stall pivot),
+  (no iteration cap + STALL_LIMIT anti-stall pivot),
 - auth walls / browser crashes / model failures pause or downgrade the run
   safely and durably; nothing is lost to a restart,
 - final opportunities are validated against the opportunity contract and
@@ -17,6 +17,7 @@ Executes the deterministic methodology (app/methodology.py) phase by phase:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import re
 import time
@@ -69,7 +70,6 @@ from app.methodology import (
     STALL_LIMIT,
     PhaseTiming,
     focus_pivot_directive,
-    mode_profile,
     validate_opportunity,
 )
 from app.model_client import (
@@ -181,8 +181,12 @@ async def _noop_keepalive():
 class RunnerConfig:
     """Runner-level tunables (deterministic; not model-visible)."""
 
-    max_model_calls_per_session: int = 120      # absolute safety ceiling
-    max_evidence_digest_items: int = 40         # digest size cap per prompt
+    # 0 = no ceiling. The owner's rule: the model is never told it has run out
+    # of moves. Time (the session's hard budget), an owner pause/cancel, or the
+    # phase's own completion are the only things that end work.
+    max_model_calls_per_session: int = 0
+    # 0 = every evidence record this session captured, not a page of them.
+    max_evidence_digest_items: int = 0
     max_candidates: int = 24                    # candidates tracked at once
     max_reference_images: int = 4               # owner images attached per model call
     min_opportunities_target: int = 5           # target for auto sessions
@@ -191,9 +195,8 @@ class RunnerConfig:
     # fires while this fraction of the session's hard time budget remains.
     min_remaining_session_fraction_for_pivot: float = 0.5
     # Model-directed phase switches ("goto_phase") allowed per session.
-    # Deterministic and durable: the count survives restarts, so a looping
-    # model can never jump forever.
-    max_phase_jumps: int = 10
+    # 0 = no limit: the model decides when a phase switch is the right move.
+    max_phase_jumps: int = 0
 
 
 # Signature keys that count as REAL progress for the anti-stall guard.
@@ -1135,7 +1138,12 @@ class ResearchRunner:
         # to the model for the WHOLE phase (a text note alone cannot steer).
         ref_images = self._reference_images(session_id)
         has_images = bool(ref_images) or self._has_images(session_id)
-        for iteration in range(start_iteration + 1, max_iter + 1):
+        # max_iter == 0 means "no iteration cap": the loop runs until the model
+        # completes the phase, the owner stops it, or the session's wall-clock
+        # budget runs out.
+        for iteration in itertools.count(start_iteration + 1):
+            if max_iter and iteration > max_iter:
+                break
             if self._cancelled:
                 raise _Cancelled()
             if self._pause_requested:
@@ -1147,13 +1155,16 @@ class ResearchRunner:
                     f"Paused by owner during {PHASE_TITLES.get(phase, phase)}",
                 )
                 return {"_paused": True}
-            # Session-wide model budget (durable, profile-aware): a resumed
-            # session continues the count it already spent.
-            if self._model_calls_used(session_id) >= self._model_call_ceiling(session.mode):
+            # Session-wide model budget: normally there is NO ceiling (0) —
+            # the model is never told it has run out of moves. A ceiling exists
+            # only when the owner sets one explicitly (MODEL_CALLS_<mode> or
+            # RunnerConfig.max_model_calls_per_session).
+            ceiling = self._model_call_ceiling(session.mode)
+            if ceiling > 0 and self._model_calls_used(session_id) >= ceiling:
                 self.events.append(
                     session_id, level="warn", actor="agent",
                     action="session_model_budget_reached",
-                    detail={"phase": phase, "ceiling": self._model_call_ceiling(session.mode)},
+                    detail={"phase": phase, "ceiling": ceiling},
                 )
                 break
             # Hard wall-clock ceiling per session (deterministic safety).
@@ -1172,7 +1183,15 @@ class ResearchRunner:
             # Known progress: this phase's slice of the 9-phase methodology.
             self._bump_progress(
                 session_id,
-                (phase_idx + iteration / max(1, max_iter)) / len(PHASE_ORDER),
+                (
+                    phase_idx
+                    + (
+                        iteration / max_iter if max_iter
+                        # No cap: creep toward the end of the phase instead of
+                        # sitting at a fixed fraction for the whole phase.
+                        else iteration / (iteration + 20)
+                    )
+                ) / len(PHASE_ORDER),
             )
 
             # --- owner message pickup (non-interrupting) -----------------
@@ -1193,10 +1212,9 @@ class ResearchRunner:
                 # A continuation's prompt IS the previous run's record: it is
                 # handed over whole (the generic digest cap would cut it).
                 continuation=continuation,
-                brief_limit=(
-                    max(16_000, len(session.prompt or "") + 1_000)
-                    if continuation else 16_000
-                ),
+                # A continuation's record is handed over whole; so is a fresh
+                # run's brief. 0 = no cap.
+                brief_limit=0,
                 marketplaces=[m.code for m in self.executor._marketplace_cycle],
                 marketplace_mode=self._marketplace_mode(session_id),
                 evidence_digest=self._evidence_digest(session_id),
@@ -1553,7 +1571,10 @@ class ResearchRunner:
                         detail={"phase": phase, "requested": goto[:60]},
                     )
                     goto = ""
-                elif self._phase_jump_count(session_id) >= self.rc.max_phase_jumps:
+                elif (
+                    self.rc.max_phase_jumps > 0
+                    and self._phase_jump_count(session_id) >= self.rc.max_phase_jumps
+                ):
                     self.events.append(
                         session_id, level="warn", actor="agent",
                         action="phase_switch_ignored_budget",
@@ -2228,12 +2249,31 @@ class ResearchRunner:
 
     # ------------------------------------------------ deep-discovery layers
     def _phase_iterations(self, phase: str, mode: str) -> int:
-        """Effective iteration cap for this phase under the mode's profile."""
-        spec = SPECS[phase]
-        try:
-            return mode_profile(mode).iterations_for(phase, spec.max_iterations)
-        except Exception:
-            return spec.max_iterations
+        """Iterations this phase may run. 0 means AS MANY AS IT NEEDS.
+
+        The owner's rule is that the model is never capped on how many times it
+        may act: a phase ends when the model completes its output contract, when
+        the owner pauses or cancels, or when the session's wall-clock budget is
+        spent. The old per-phase caps ended phases mid-investigation, which is
+        how runs finished with work still obviously open.
+        """
+        # An explicit MODE_ITERATIONS_<mode> override (nine colon-separated
+        # per-phase numbers) is the owner's own instruction, so it still
+        # applies. No override means no cap at all.
+        overrides = getattr(self.config, "mode_iterations", None) or {}
+        raw = overrides.get(mode, "") if isinstance(overrides, dict) else ""
+        parts = [p.strip() for p in str(raw).split(":")]
+        if any(parts):
+            try:
+                idx = PHASE_ORDER.index(phase)
+            except ValueError:
+                return 0
+            if idx < len(parts) and parts[idx]:
+                try:
+                    return max(0, int(parts[idx]))
+                except ValueError:
+                    return 0
+        return 0
 
     def _model_calls_used(self, session_id: str) -> int:
         """Durable, session-wide model-call spend (survives restarts)."""
@@ -2253,27 +2293,20 @@ class ResearchRunner:
             pass  # budget accounting must never break the call itself
 
     def _model_call_ceiling(self, mode: str) -> int:
-        """Per-session model-call ceiling, derived from the TIME budget.
+        """Per-session model-call ceiling. 0 means no ceiling.
 
-        A fixed cap made the call budget the thing that ended research: on an
-        8–12 hour wall-clock budget, runs died after ~120 calls — an hour or
-        two in — with most of the time unspent. The ceiling now scales with
-        the hard budget (MODEL_CALLS_PER_HOUR × hours, never below the
-        runner's floor) plus the mode's profile extra, so TIME decides when
-        research is finished, not a call counter. A hard timeout still caps
-        the run, and per-phase iteration caps still bound each phase."""
-        base = self.rc.max_model_calls_per_session
+        The owner's rule is that the model is never capped on how many times it
+        may think or act; the session's wall-clock budget is the only stop. A
+        ceiling still exists for an owner who sets one explicitly —
+        MODEL_CALLS_<mode> (an absolute number) or RunnerConfig.
+        max_model_calls_per_session — and either is honoured.
+        """
+        base = int(getattr(self.rc, "max_model_calls_per_session", 0) or 0)
         try:
             env = int(getattr(self.config, "mode_model_calls", {}).get(mode, 0) or 0)
         except (TypeError, ValueError):
             env = 0
-        if env:
-            return max(base, env)
-        profile = mode_profile(mode)
-        hard = max(1, int(getattr(self.config, "session_hard_timeout_hours", 12)))
-        per_hour = max(1, int(getattr(self.config, "model_calls_per_hour", 30) or 30))
-        extra = round(profile.extra_calls * min(1.0, hard / 12.0))
-        return max(base, hard * per_hour) + extra
+        return max(base, env)
 
     def _evidence_floor(self, min_evidence: int, session_started: float) -> int:
         """New-evidence floor for a phase, depth-raised while the session is
@@ -3703,14 +3736,16 @@ class ResearchRunner:
             "ok": bool(getattr(result, "ok", False)) if result is not None else False,
         }
         if result is not None:
-            entry["summary"] = str(getattr(result, "summary", "") or "")[:300]
+            entry["summary"] = str(getattr(result, "summary", "") or "")
             if getattr(result, "error", None):
-                entry["error"] = str(result.error)[:300]
+                entry["error"] = str(result.error)
         elif error:
-            entry["error"] = str(error)[:300]
+            entry["error"] = str(error)
         bucket = self._recent_action_results.setdefault(session_id, [])
         bucket.append(entry)
-        del bucket[:-8]
+        # Every action of this phase: a window of eight made the model repeat
+        # work whose result had already scrolled out of its own feedback.
+        del bucket[:-200]
 
     def _remember(
         self, session_id: str, phase: str, args: dict[str, Any]
@@ -3759,7 +3794,7 @@ class ResearchRunner:
                 "entry is re-read in full on every step"
             ),
         })
-        del bucket[:-8]
+        del bucket[:-200]
 
     def _apply_record_edit(
         self, session_id: str, action: str, args: dict[str, Any], phase: str
@@ -3791,11 +3826,11 @@ class ResearchRunner:
         entry = {
             "action": action,
             "ok": True,
-            "summary": str(summary.get("summary") or "")[:300],
+            "summary": str(summary.get("summary") or ""),
         }
         bucket = self._recent_action_results.setdefault(session_id, [])
         bucket.append(entry)
-        del bucket[:-8]
+        del bucket[:-200]
 
     def _evidence_digest(self, session_id: str) -> list[dict[str, Any]]:
         """Compact, model-safe digest of recent browser evidence.
@@ -3807,8 +3842,10 @@ class ResearchRunner:
         older rows published the row count under that name.
         """
         items: list[dict[str, Any]] = []
+        # EVERY capture this session made (0 = no cap): a page of records made
+        # the model reason from a sample of its own research.
         for e in self.browser_evidence.list(
-            session_id, limit=self.rc.max_evidence_digest_items
+            session_id, limit=self.rc.max_evidence_digest_items or 10_000_000
         ):
             data = e.data
             if e.kind == "search_results" and isinstance(data, dict):
@@ -3836,7 +3873,7 @@ class ResearchRunner:
         competition) so the model spends its iterations on the highest-
         headroom candidates first. Ordering only — every candidate stays in
         the list and no verdict changes."""
-        rows = self.candidates.list(session_id, limit=self.rc.max_candidates)
+        rows = self.candidates.list(session_id, limit=10_000_000)
         ws = self._ws_scores.get(session_id) or {}
         items: list[dict[str, Any]] = []
         for c in rows:

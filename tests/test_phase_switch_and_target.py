@@ -104,16 +104,32 @@ async def test_model_can_switch_phase_at_will_without_losing_data(db, config, se
 
 
 @pytest.mark.asyncio
-async def test_phase_switch_is_capped_durably(db, config, session):
-    model = GotoModel(PHASE_OUTPUTS)
-    runner = make_runner(db, config, model)
-    runner.rc.max_phase_jumps = 0  # budget spent before the first jump
+async def test_phase_switch_is_unlimited_unless_the_owner_caps_it(db, config, session):
+    """0 = the model may switch as often as it judges right; an owner-set cap
+    is still enforced from the durable jump count."""
+    runner = make_runner(db, config, GotoModel(PHASE_OUTPUTS))
+    assert runner.rc.max_phase_jumps == 0
     await runner.run(session)
 
-    assert SessionStore(db, config).require(session).status == "completed"
     events = EventLog(db).tail(session)
-    assert not any(e.action == "phase_switched" for e in events)
-    assert any(e.action == "phase_switch_ignored_budget" for e in events)
+    assert any(e.action == "phase_switched" for e in events)
+
+    assert SessionStore(db, config).require(session).status == "completed"
+
+    # An explicit cap refuses the switch, counting from the durable record.
+    cps = CheckpointStore(db)
+    capped = make_runner(db, config, GotoModel(PHASE_OUTPUTS))
+    capped.rc.max_phase_jumps = 1
+    second = SessionStore(db, config).create(
+        mode="prompt", prompt="research grief memoirs", objective="find niches"
+    ).id
+    cps.save(second, "phase_gotos", {"jumps": [{"from": "x", "to": "y"}]})
+    await capped.run(second)
+
+    assert SessionStore(db, config).require(second).status == "completed"
+    capped_events = EventLog(db).tail(second)
+    assert not any(e.action == "phase_switched" for e in capped_events)
+    assert any(e.action == "phase_switch_ignored_budget" for e in capped_events)
 
 
 def test_merge_phase_output_keeps_prior_work():

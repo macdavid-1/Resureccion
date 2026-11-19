@@ -34,20 +34,27 @@ from app.methodology import (
 from app.research_memory import render_memory
 
 
-def _compact(value: Any, limit: int = 2400) -> str:
-    """Compact JSON rendering bounded in size for prompt inclusion."""
+def _compact(value: Any, limit: int = 0) -> str:
+    """Compact JSON rendering of `value`.
+
+    `limit` <= 0 (the default) means NO truncation: the model gets the whole
+    record. A truncated digest is a summary, and a summary of evidence is not
+    evidence — the model then reasons from half a measurement. Callers that
+    genuinely need a cap (a closed set of field names, a small header) pass one
+    explicitly.
+    """
     try:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         text = str(value)
-    if len(text) > limit:
+    if limit > 0 and len(text) > limit:
         text = text[: limit - 1] + "…"
     return text
 
 
-# Per-record size cap when rendering digests: a single huge evidence record
-# (e.g. a full search result set) must not crowd out the rest of the prompt.
-_DIGEST_RECORD_LIMIT = 900
+# Per-record size cap when rendering digests. 0 = a whole record, however big:
+# a truncated capture is a summary, and the model must see what was measured.
+_DIGEST_RECORD_LIMIT = 0
 
 
 # ------------------------------------------------------- owner precedence
@@ -318,7 +325,7 @@ def build_user_prompt(
     target_note: str = "",
     recent_actions: list[dict[str, Any]] | None = None,
     continuation: bool = False,
-    brief_limit: int = 16_000,
+    brief_limit: int = 0,
     memory_entries: list[Any] | None = None,
 ) -> str:
     spec = SPECS[phase]
@@ -404,7 +411,7 @@ def build_user_prompt(
             "\nMARKET CENSUS (deterministic backend walk of the bestseller and "
             "new-release charts plus the browse-node categories — measured "
             "before this phase started; the evidence ids are stable):\n"
-            + _compact(census_digest, limit=3000)
+            + _compact(census_digest)
             + "\nUse it as your map: regions with strong demand and light "
             "top-review barriers are where hidden markets live. Ask for more "
             "category/chart actions to walk deeper where the census looks "
@@ -431,10 +438,12 @@ def build_user_prompt(
             "women\"). A generic seed returns store roots — \"grief books\", "
             "\"grief journal\", \"grief gifts\" — which tell you nothing and "
             "send the run back to the whole store. A generic seed is refused, "
-            "and generic completions are dropped before you see them, so build "
-            "the phrase up: topic + who + when/situation, then extend it with "
-            "the next word or letter and keep only completions that still name "
-            "that reader. A phrase buyers really complete but few books answer "
+            "so build the phrase up: topic + who + when/situation, then extend "
+            "it with the next word or letter. You receive EVERY completion the "
+            "seed returns and decide yourself which are worth pursuing — the "
+            "ones that are only a format, a broad market or a bare audience "
+            "are listed under 'store_root_suggestions' so you can skip them, "
+            "but they are not hidden from you. A phrase buyers really complete but few books answer "
             "is the target; a phrase with huge totals is a store root in "
             "disguise — niche it down instead."
         )
@@ -544,13 +553,13 @@ def build_user_prompt(
          for k, v in item.items()}
         for item in (evidence_digest or [])
     ]
-    # Generous total budget: per-record caps already bound a single huge
-    # capture, and a truncated evidence list is the one thing the model cannot
-    # work around — a summary of evidence is not evidence.
+    # No total budget: a truncated evidence list is the one thing the model
+    # cannot work around — a summary of evidence is not evidence.
     parts.append(
-        "\nEVIDENCE SO FAR (structured, redacted; ids are stable — reference them): "
+        "\nEVIDENCE SO FAR (structured, redacted; ids are stable — reference them — "
+        "complete: every record this session captured, nothing summarised): "
         + (
-            _compact(bounded_evidence, limit=60_000)
+            _compact(bounded_evidence)
             if bounded_evidence else "[] (none yet — gather some)"
         )
     )
@@ -561,12 +570,12 @@ def build_user_prompt(
     # blind actions or assuming an edit landed.
     if recent_actions:
         lines = []
-        for a in recent_actions[-8:]:
+        for a in recent_actions:
             head = f"- {a.get('action')}: {'ok' if a.get('ok') else 'FAILED'}"
             detail = str(a.get("summary") or "").strip()
             if a.get("error"):
                 detail = (detail + " — " if detail else "") + str(a["error"])
-            lines.append(head + (f" — {detail[:400]}" if detail else ""))
+            lines.append(head + (f" — {detail}" if detail else ""))
         parts.append(
             "\nWHAT YOUR LAST ACTIONS DID (the orchestrator's report, not a "
             "suggestion):\n" + "\n".join(lines)
@@ -609,9 +618,7 @@ def build_user_prompt(
             # Each phase gets its own budget, and the TOTAL is uncapped: this
             # is the model's own prior analysis, and condensing it is what
             # made later phases reason from a summary of their own work.
-            chunks.append(
-                f"[{PHASE_TITLES.get(key, key)}] " + _compact(out, limit=200_000)
-            )
+            chunks.append(f"[{PHASE_TITLES.get(key, key)}] " + _compact(out))
         if chunks:
             parts.append("\nPRIOR PHASE DECISIONS: " + "\n".join(chunks))
 
@@ -625,7 +632,7 @@ def build_user_prompt(
             "\nMARKET MEMORY from earlier runs (fresh = reuse as fact, no need "
             "to re-measure; stale = cheap re-verification before relying on "
             "it — it is a hint, not a fact):\n"
-            + _compact(market_memory, limit=3000)
+            + _compact(market_memory)
         )
 
     # --- owner messages (durable mid-research guidance) ---------------------

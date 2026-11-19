@@ -133,15 +133,21 @@ def test_depth_floor_raises_while_the_session_is_young(db, config) -> None:
     assert runner._evidence_floor(10, now) == 10
 
 
-def test_model_call_ceiling_follows_the_time_budget(db, config) -> None:
-    """No run may end on a fixed call counter while hours remain."""
+def test_a_run_has_no_model_call_ceiling_unless_the_owner_sets_one(db, config) -> None:
+    """The model is never told it has run out of moves.
+
+    Time (the session's wall-clock budget), an owner pause/cancel, or the
+    phase's own completion end work — never a call counter. An explicit
+    ceiling still works when the owner asks for one.
+    """
     from test_research_runner import PHASE_OUTPUTS, ScriptedModel, make_runner
 
     runner = make_runner(db, config, ScriptedModel(PHASE_OUTPUTS))
     for mode in ("prompt", "keywords", "auto"):
-        assert runner._model_call_ceiling(mode) >= (
-            config.session_hard_timeout_hours * config.model_calls_per_hour
-        )
+        assert runner._model_call_ceiling(mode) == 0, "no ceiling by default"
+
+    config.mode_model_calls["prompt"] = 500
+    assert runner._model_call_ceiling("prompt") == 500
 
 
 # ------------------------------------------------------------ report honesty
