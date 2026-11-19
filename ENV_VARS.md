@@ -67,6 +67,8 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 | `REPORT_CONTEXT_CHARS` | no | `1200000` | Safety ceiling on the research dossier handed to the report writer — every record arrives whole (nothing is trimmed), and only a dossier larger than this is sampled, with the omission recorded for the model. `0` = no ceiling |
 | `CHAT_TIMEOUT_SECONDS` | no | `240` | How long one answer about a delivered report may take before it is stopped and reported as a timeout (the question stays saved, so it can be asked again) |
 | `CHAT_MAX_TOKENS` | no | `4000` | Completion budget for one answer in the report conversation |
+| `MINI_SESSION_TIMEOUT_SECONDS` | no | `3600` | Wall-clock budget for one mini session (focused live work started from a conversation). It is the only stop besides the owner's cancel — there is no cap on how many mini sessions a conversation may run |
+| `MINI_SESSION_MAX_TOKENS` | no | `4000` | Completion budget for one step of a mini session |
 
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw

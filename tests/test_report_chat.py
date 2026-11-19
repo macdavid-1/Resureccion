@@ -237,7 +237,7 @@ def test_chat_messages_table_is_versioned(db):
     assert {"session_id", "report_id", "role", "text", "created_at", "meta"} <= cols
     with db.read() as conn:
         version = conn.execute("SELECT version FROM schema_version").fetchone()["version"]
-    assert version == 9
+    assert version == 10
 
 
 def test_report_markdown_is_json_serialisable_with_chat_meta(chat_setup):

@@ -238,6 +238,15 @@ class Config:
         # and how much room the answer gets.
         self.chat_timeout_seconds = max(30, _int_env("CHAT_TIMEOUT_SECONDS", 240))
         self.chat_max_tokens = max(500, _int_env("CHAT_MAX_TOKENS", 4_000))
+        # Mini sessions: focused live work approved from a report conversation.
+        # Not bound by the methodology. How many may run in one conversation is
+        # unlimited; the only stop is this wall-clock budget per session.
+        self.mini_session_timeout_seconds = max(
+            60, _int_env("MINI_SESSION_TIMEOUT_SECONDS", 3_600)
+        )
+        self.mini_session_max_tokens = max(
+            500, _int_env("MINI_SESSION_MAX_TOKENS", 4_000)
+        )
         # Prompt budget for the research dossier. 0 means "the model's context
         # window, minus a safe margin" (see report_writer._fit_context).
         # The dossier now also carries the FULL record of every earlier run in

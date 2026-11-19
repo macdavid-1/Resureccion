@@ -556,6 +556,47 @@ table.rt tr:last-child td { border-bottom: none; }
 .chat-ai .chat-bubble a.ev-ref { color: inherit; }
 .chat-ai .chat-bubble table.rt { font-size: 0.76rem; }
 .chat-thinking .chat-bubble { color: var(--text-3); display: flex; align-items: center; gap: 8px; }
+
+/* a mini session proposed in an answer — the owner's one-tap yes */
+.chat-proposal {
+  margin: 8px 0 0 2px; max-width: min(78ch, 88%); padding: 11px 13px;
+  border: 1px solid rgba(201, 162, 39, 0.45); border-radius: var(--r);
+  background: rgba(201, 162, 39, 0.07);
+}
+.chat-proposal-h {
+  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--accent-bright); margin-bottom: 6px;
+}
+.chat-proposal-goal { font-size: 0.84rem; line-height: 1.5; color: var(--text); }
+.chat-proposal-why { font-size: 0.76rem; line-height: 1.5; color: var(--text-3); margin-top: 5px; }
+.chat-proposal-note { font-size: 0.76rem; color: var(--text-3); margin-top: 6px; }
+.chat-proposal-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+/* the strip above the input while a mini session is working */
+.chat-mini {
+  padding: 0 14px; font-size: 0.74rem; line-height: 1.45; color: var(--text-3);
+}
+.chat-mini:not(:empty) { padding: 9px 14px 0; }
+.chat-mini.running {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: var(--text-2); border-top: 1px solid var(--line);
+  padding: 10px 14px; background: rgba(201, 162, 39, 0.05);
+}
+.chat-mini .mini-goal { flex: 1; min-width: 12ch; }
+.chat-mini .mini-goal strong { color: var(--accent-bright); }
+.chat-mini .mini-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent-bright);
+  box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.5); animation: miniPulse 1.6s infinite;
+  flex: none;
+}
+@keyframes miniPulse {
+  0% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.45); }
+  70% { box-shadow: 0 0 0 7px rgba(201, 162, 39, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-mini .mini-dot { animation: none; }
+}
 .chat-form {
   display: flex; gap: 8px; align-items: flex-end;
   padding: 10px 14px 14px; border-top: 1px solid var(--line);

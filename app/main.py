@@ -166,6 +166,18 @@ def create_app() -> FastAPI:
         app.state.browser_auth.on_confirmed = (
             lambda: resume_auth_paused_sessions(app.state)
         )
+        # Mini sessions: focused live work started from a report conversation.
+        # Not bound by the methodology; they share the browser and the record.
+        from app.mini_session import MiniSessionService
+
+        app.state.mini_sessions = MiniSessionService(app.state)
+        try:
+            interrupted_minis = app.state.mini_sessions.store.reconcile_on_boot()
+            if interrupted_minis:
+                print(f"[mini] {interrupted_minis} mini session(s) marked interrupted", flush=True)
+        except Exception as exc:
+            print(f"[mini] boot reconcile failed: {exc}", flush=True)
+
         app.state.recorder = SessionRecorder(
             db,
             config,

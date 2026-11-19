@@ -338,6 +338,41 @@ never linked), and a question the research cannot answer is answered as a gap,
 not a guess. In the dashboard the panel sits under the report — owner messages
 on the right, the analyst's on the left.
 
+### Mini sessions (`app/mini_session.py`)
+
+Some questions cannot be answered from a finished record: a price that may
+have moved, whether a book still exists, a phrase nobody searched, a niche this
+run never touched. For those the analyst can run a **mini session** — a small,
+focused piece of live work inside the same conversation.
+
+- **The owner decides.** The analyst proposes one by ending an answer with a
+  `mini-session` block (`{"goal", "why"}`). The block is parsed out of the
+  reply (never shown as text), stored in the answer's `meta.proposal`, and
+  offered as a **Start mini session** button. The owner can also ask for one in
+  words; nothing ever starts without a tap.
+- **It is not a research run.** No phases, order, output contracts or exit
+gates: the methodology is supplied as reference the model may read and ignore.
+  The model chooses its own actions from the same browser toolkit the research
+  agent uses (`app/actions.py`), and stops as soon as the question is settled.
+- **It carries everything.** A mini session gets the same complete dossier a
+  chat answer gets (every capture, candidate, verification, note, reasoning
+  line, screenshot, phase analysis, earlier run in the chain and the report)
+  plus the whole conversation and its own step results — nothing summarised.
+- **The owner can steer it while it runs.** A message typed into the
+  conversation is delivered to the running mini session (a durable owner-inbox
+  step the model reads on its next step) and answered in the same thread when
+  it finishes, as an analyst message tagged with its mini-session id.
+- **No cap.** A conversation can run as many mini sessions as it needs; the
+  only stops are the owner's cancel and the `MINI_SESSION_TIMEOUT_SECONDS`
+  wall-clock budget. Every session keeps a durable step log
+  (`mini_sessions`, `mini_session_steps`) so the owner can see exactly what it
+  did, and a restart marks anything that was working as interrupted rather than
+  leaving it "running" forever.
+
+Routes: `POST/GET /api/sessions/{id}/reports/{rid}/mini-sessions`,
+`GET /api/sessions/{id}/mini-sessions/{mini_id}` (detail + steps),
+`POST …/mini-sessions/{mini_id}/cancel`.
+
 
 
 ## Research integrity layer (Stage 4)

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from app.config import Config, get_config
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -484,6 +484,37 @@ CREATE TABLE IF NOT EXISTS report_chat_messages (
     meta TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_chat_report ON report_chat_messages(session_id, report_id, id);
+
+-- Mini sessions: focused, self-directed work started from a report
+-- conversation (a live price check, a niche nobody measured). Not bound by
+-- the nine-phase methodology: the model chooses what to do, with the browser,
+-- from the same complete record a chat answer gets. Its steps are the durable
+-- audit trail and its answer lands back in the conversation.
+CREATE TABLE IF NOT EXISTS mini_sessions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id),
+    report_id TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    result TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    meta TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_mini_report ON mini_sessions(session_id, report_id, created_at);
+
+CREATE TABLE IF NOT EXISTS mini_session_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mini_id TEXT NOT NULL REFERENCES mini_sessions(id),
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    meta TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_mini_steps ON mini_session_steps(mini_id, id);
 """
 
 

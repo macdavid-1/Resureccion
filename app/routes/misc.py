@@ -563,84 +563,18 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
 
 
 # ------------------------------------------------------- talking to the analyst
-_EV_RE = __import__("re").compile(r"\[ev:([A-Za-z0-9_\-]+)\]")
-
-
-def _link_chat_citations(text: str, session_id: str, known: set[str]) -> tuple[str, list[str], list[str]]:
-    """Resolve `[ev:ID]` into a clickable evidence link (as the report does).
-
-    A citation naming a record this session never captured is not a link: it
-    is dropped from the text and reported, never left pointing at a 404.
-    """
-    cited: list[str] = []
-    dropped: list[str] = []
-
-    def _sub(m: Any) -> str:
-        ev_id = m.group(1)
-        if ev_id not in known:
-            dropped.append(ev_id)
-            return ""
-        if ev_id not in cited:
-            cited.append(ev_id)
-        return (
-            f'[ev:{ev_id}](/api/sessions/{session_id}/evidence/{ev_id} '
-            f'"Evidence {ev_id} — the captured page behind this answer")'
-        )
-
-    out = _EV_RE.sub(_sub, text)
-    return out, cited, dropped
+class MiniSessionRequest(BaseModel):
+    goal: str
+    title: str = ""
+    # The chat message carrying the proposal, so the UI can mark it started.
+    proposal_message_id: int | None = None
 
 
 def _chat_dossier(st: Any, session_id: str, report: Any) -> dict:
-    """The whole research record, assembled for one conversation."""
-    from app.continuation_build import prior_run_records
-    from app.methodology import PHASE_ORDER
-    from app.report_chat import build_chat_dossier
+    """The whole research record for one conversation (shared with minis)."""
+    from app.report_chat import chat_dossier
 
-    verifications = getattr(st, "verifications", None)
-    if verifications is None:
-        from app.research_data import VerificationStore
-
-        verifications = VerificationStore(st.db)
-    prior_runs: list[dict] = []
-    try:
-        prior_runs = prior_run_records(
-            session_id,
-            sessions=st.sessions,
-            candidates=st.candidates,
-            opportunities=st.opportunities,
-            verifications=verifications,
-            notes=getattr(st, "notes", None),
-            browser_evidence=st.browser_evidence,
-            reports=st.reports,
-            trace=getattr(st, "trace", None),
-            thoughts=getattr(st, "thoughts", None),
-            owner_messages=getattr(st, "owner_messages", None),
-            memory=getattr(st, "research_memory", None),
-        )
-    except Exception:
-        prior_runs = []
-    return build_chat_dossier(
-        session_id,
-        report,
-        sessions=st.sessions,
-        candidates=st.candidates,
-        opportunities=st.opportunities,
-        verifications=verifications,
-        claims=st.claims,
-        browser_evidence=st.browser_evidence,
-        observations=st.observations,
-        notes=getattr(st, "notes", None),
-        thoughts=getattr(st, "thoughts", None),
-        trace=getattr(st, "trace", None),
-        owner_messages=getattr(st, "owner_messages", None),
-        memory=getattr(st, "research_memory", None),
-        reports=st.reports,
-        checkpoints=getattr(st, "checkpoints", None),
-        phase_order=list(PHASE_ORDER),
-        prior_runs=prior_runs,
-        artifacts=getattr(st, "artifacts", None),
-    )
+    return chat_dossier(st, session_id, report)
 
 
 def _report_or_404(request: Request, session_id: str, report_id: str) -> Any:
@@ -684,9 +618,23 @@ async def ask_report_chat(
     if len(question) > 8_000:
         raise HTTPException(status_code=400, detail="message is too long (8000 characters max)")
 
-    from app.report_chat import ChatStore, answer
+    from app.report_chat import ChatStore, answer, extract_proposal, link_citations
 
     chats = ChatStore(st.db)
+    # A mini session for this report is WORKING: a message typed into the same
+    # conversation goes to it, and its answer arrives in the thread when it is
+    # done. Nothing starts, stops or queues: the message is delivered as it is
+    # typed, on the mini session's next step.
+    minis = getattr(st, "mini_sessions", None)
+    if minis is not None:
+        delivered_to = minis.deliver_owner_message(report_id, question)
+        if delivered_to:
+            chats.add(session_id, report_id, role="owner", text=question)
+            return {
+                "report_id": report_id,
+                "delivered_to_mini_session": delivered_to,
+                "messages": [m.to_dict() for m in chats.list(session_id, report_id)],
+            }
     history = chats.list(session_id, report_id)
     owner_msg = chats.add(session_id, report_id, role="owner", text=question)
     st.events.append(
@@ -748,11 +696,22 @@ async def ask_report_chat(
             detail="the analyst returned an empty answer; the question is saved — ask again",
         )
 
+    # The analyst may propose a mini session (a fenced `mini-session` block).
+    # It is never run automatically: the block is split out of the reply and
+    # offered to the owner as one tap.
+    prose, proposal = extract_proposal(text)
     known = {row.get("id") for row in (dossier.get("evidence") or []) if isinstance(row, dict)}
-    linked, cited, dropped = _link_chat_citations(text, session_id, known)
+    linked, cited, dropped = link_citations(prose, session_id, known)
+    meta: dict[str, Any] = {"citations": cited, "dropped_citations": dropped}
+    if proposal:
+        meta["proposal"] = proposal
+        st.events.append(
+            session_id, level="info", actor="agent", action="mini_session_proposed",
+            detail={"report_id": report_id,
+                    "goal": proposal.get("goal", "")[:300]},
+        )
     analyst_msg = chats.add(
-        session_id, report_id, role="analyst", text=linked,
-        meta={"citations": cited, "dropped_citations": dropped},
+        session_id, report_id, role="analyst", text=linked, meta=meta,
     )
     st.events.append(
         session_id, level="info", actor="agent", action="report_question_answered",
@@ -764,6 +723,84 @@ async def ask_report_chat(
         "answer": analyst_msg.to_dict(),
         "messages": [m.to_dict() for m in chats.list(session_id, report_id)],
     }
+
+
+# ------------------------------------------------------------- mini sessions
+@router.post("/sessions/{session_id}/reports/{report_id}/mini-sessions")
+async def start_mini_session(
+    session_id: str, report_id: str, body: MiniSessionRequest, request: Request
+) -> dict:
+    """Start a mini session on this report's conversation.
+
+    The goal comes from the analyst's proposal (or straight from the owner).
+    A mini session is focused work with the live browser, free of the research
+    methodology's phases: it chooses what to do and answers back into the chat.
+    There is no limit on how many may run in one conversation.
+    """
+    _auth(request)
+    st = _st(request)
+    _report_or_404(request, session_id, report_id)
+    minis = getattr(st, "mini_sessions", None)
+    if minis is None:
+        raise HTTPException(status_code=503, detail="mini sessions are not available")
+    try:
+        mini = minis.start(
+            session_id=session_id,
+            report_id=report_id,
+            goal=body.goal,
+            title=body.title,
+            proposal_message_id=body.proposal_message_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"mini_session": mini.to_dict()}
+
+
+@router.get("/sessions/{session_id}/reports/{report_id}/mini-sessions")
+async def list_mini_sessions(session_id: str, report_id: str, request: Request) -> dict:
+    """Every mini session this conversation has run, newest first."""
+    _auth(request)
+    st = _st(request)
+    _report_or_404(request, session_id, report_id)
+    from app.mini_session import MiniSessionStore
+
+    rows = MiniSessionStore(st.db).list(session_id, report_id)
+    return {"mini_sessions": [m.to_dict() for m in rows]}
+
+
+@router.get("/sessions/{session_id}/mini-sessions/{mini_id}")
+async def get_mini_session(session_id: str, mini_id: str, request: Request) -> dict:
+    """One mini session with its complete step log (the live view of it)."""
+    _auth(request)
+    st = _st(request)
+    _session_or_404(request, session_id)
+    from app.mini_session import MiniSessionStore
+
+    store = MiniSessionStore(st.db)
+    mini = store.get(mini_id)
+    if mini is None or mini.session_id != session_id:
+        raise HTTPException(status_code=404, detail="mini session not found")
+    return {
+        "mini_session": mini.to_dict(),
+        "steps": [s.to_dict() for s in store.steps(mini_id)],
+    }
+
+
+@router.post("/sessions/{session_id}/mini-sessions/{mini_id}/cancel")
+async def cancel_mini_session(session_id: str, mini_id: str, request: Request) -> dict:
+    _auth(request)
+    st = _st(request)
+    _session_or_404(request, session_id)
+    from app.mini_session import MiniSessionStore
+
+    store = MiniSessionStore(st.db)
+    mini = store.get(mini_id)
+    if mini is None or mini.session_id != session_id:
+        raise HTTPException(status_code=404, detail="mini session not found")
+    minis = getattr(st, "mini_sessions", None)
+    if minis is None or not minis.cancel(mini_id):
+        raise HTTPException(status_code=400, detail="this mini session is not running")
+    return {"mini_session": store.get(mini_id).to_dict()}  # type: ignore[union-attr]
 
 
 @router.get("/sessions/{session_id}/recordings/{artifact_id}/file")

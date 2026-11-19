@@ -15,6 +15,9 @@
     liveTimer: null, recTimer: null, elapsedTimer: null,
     elapsedAnchor: null, elapsedLive: false,
     lastRefresh: 0,
+    // The open report conversation: its messages, its mini sessions, and the
+    // poll that follows a running mini session back into the thread.
+    chat: null,
   };
 
   // ---------- helpers ----------
@@ -797,6 +800,10 @@
 
   // ---------- reports ----------
   async function renderReportsView() {
+    // Leaving a report closes its conversation: stop following a mini session
+    // in a panel that is no longer on screen.
+    stopChatPolling();
+    state.chat = null;
     const body = $("#reports-body");
     if (!state.sessions.length) {
       body.innerHTML = `<div class="panel"><div class="empty"><div class="mark">▤</div><p>No sessions yet.</p></div></div>`;
@@ -963,6 +970,7 @@
           <div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">Ask the analyst</h2>
             <span class="muted" style="font-size:0.72rem">answered from this run's whole record</span></div>
           <div class="chat-log" id="chat-log"><div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div></div>
+          <div class="chat-mini" id="chat-mini"></div>
           <form class="chat-form" id="chat-form">
             <textarea id="chat-input" rows="2" maxlength="8000" placeholder="e.g. who exactly buys this, and what would make them choose a new book?"></textarea>
             <button class="btn small primary" id="chat-send" type="submit">Send</button>
@@ -1009,58 +1017,182 @@
     const log = $("#chat-log");
     const form = $("#chat-form");
     if (!log || !form) return;
-    let messages = [];
-    try {
-      const data = await api(`/api/sessions/${sid}/reports/${rid}/chat`);
-      messages = Array.isArray(data.messages) ? data.messages : [];
-    } catch (e) {
-      log.innerHTML = `<div class="chat-empty error-text">${esc(e.message)}</div>`;
-    }
-    renderChat(log, messages);
+    stopChatPolling();
+    state.chat = { sid, rid, messages: [], minis: [], dismissed: new Set(), lastDone: new Set() };
+    await refreshChat();
     form.onsubmit = async (ev) => {
       ev.preventDefault();
+      const chat = state.chat;
+      if (!chat) return;
       const input = $("#chat-input");
       const send = $("#chat-send");
       const text = String(input.value || "").trim();
       if (!text || send.disabled) return;
-      messages.push({ role: "owner", text, created_at: new Date().toISOString() });
-      renderChat(log, messages, true);
+      chat.messages.push({ role: "owner", text, created_at: new Date().toISOString() });
+      renderChat();
       input.value = "";
       send.disabled = true;
-      send.textContent = "Thinking…";
+      send.textContent = miniRunning() ? "Sending…" : "Thinking…";
       try {
         const data = await api(`/api/sessions/${sid}/reports/${rid}/chat`, {
           method: "POST",
           body: JSON.stringify({ message: text }),
         });
-        messages = Array.isArray(data.messages) ? data.messages : messages;
-        renderChat(log, messages);
+        if (Array.isArray(data.messages)) chat.messages = data.messages;
+        if (data.delivered_to_mini_session) await refreshMinis();
+        renderChat();
       } catch (e) {
-        renderChat(log, messages);
-        const err = document.createElement("div");
-        err.className = "chat-row chat-ai";
-        err.innerHTML = `<div class="chat-bubble error-text">${esc(e.message)}</div>`;
-        log.appendChild(err);
-        scrollChat(log);
+        renderChat();
+        appendChatError(e.message);
       } finally {
         send.disabled = false;
         send.textContent = "Send";
         input.focus();
       }
     };
+    startChatPolling();
+  }
+
+  function stopChatPolling() {
+    if (state.chat && state.chat.timer) clearInterval(state.chat.timer);
+    if (state.chat) state.chat.timer = null;
+  }
+
+  function startChatPolling() {
+    const chat = state.chat;
+    if (!chat) return;
+    chat.timer = setInterval(() => {
+      if (!state.chat || state.chat !== chat) { clearInterval(chat.timer); return; }
+      refreshMinis().catch(() => {});
+    }, 3000);
+  }
+
+  async function refreshChat() {
+    const chat = state.chat;
+    if (!chat) return;
+    try {
+      const [data, minis] = await Promise.all([
+        api(`/api/sessions/${chat.sid}/reports/${chat.rid}/chat`),
+        api(`/api/sessions/${chat.sid}/reports/${chat.rid}/mini-sessions`).catch(() => ({ mini_sessions: [] })),
+      ]);
+      if (!state.chat || state.chat !== chat) return;
+      chat.messages = Array.isArray(data.messages) ? data.messages : [];
+      chat.minis = Array.isArray(minis.mini_sessions) ? minis.mini_sessions : [];
+      for (const m of chat.minis) {
+        if (m.status === "completed" || m.status === "failed" || m.status === "cancelled" || m.status === "interrupted") {
+          chat.lastDone.add(m.id);
+        }
+      }
+      renderChat();
+    } catch (e) {
+      if (state.chat === chat) appendChatError(e.message);
+    }
+  }
+
+  async function refreshMinis() {
+    const chat = state.chat;
+    if (!chat) return;
+    const data = await api(`/api/sessions/${chat.sid}/reports/${chat.rid}/mini-sessions`);
+    if (!state.chat || state.chat !== chat) return;
+    const before = new Map(chat.minis.map((m) => [m.id, m.status]));
+    chat.minis = Array.isArray(data.mini_sessions) ? data.mini_sessions : [];
+    let finished = false;
+    for (const m of chat.minis) {
+      const was = before.get(m.id);
+      if (was && was !== m.status && (m.status === "completed" || m.status === "failed" || m.status === "cancelled" || m.status === "interrupted")) {
+        finished = true;
+      }
+    }
+    renderMiniStrip();
+    if (finished) await refreshChat();
+  }
+
+  function miniRunning() {
+    const chat = state.chat;
+    if (!chat) return null;
+    return chat.minis.find((m) => m.status === "running" || m.status === "queued") || null;
+  }
+
+  function appendChatError(msg) {
+    const log = $("#chat-log");
+    if (!log) return;
+    const err = document.createElement("div");
+    err.className = "chat-row chat-ai";
+    err.innerHTML = `<div class="chat-bubble error-text">${esc(msg)}</div>`;
+    log.appendChild(err);
+    scrollChat(log);
+  }
+
+  async function startMiniSession(goal, title, proposalMessageId) {
+    const chat = state.chat;
+    if (!chat) return;
+    try {
+      await api(`/api/sessions/${chat.sid}/reports/${chat.rid}/mini-sessions`, {
+        method: "POST",
+        body: JSON.stringify({ goal, title: title || "", proposal_message_id: proposalMessageId ?? null }),
+      });
+      await refreshMinis();
+      await refreshChat();
+    } catch (e) {
+      appendChatError(e.message);
+    }
+  }
+
+  async function cancelMiniSession(miniId) {
+    const chat = state.chat;
+    if (!chat) return;
+    try {
+      await api(`/api/sessions/${chat.sid}/mini-sessions/${miniId}/cancel`, { method: "POST" });
+      await refreshMinis();
+    } catch (e) {
+      appendChatError(e.message);
+    }
+  }
+
+  // The strip above the input: which mini session is working right now.
+  function renderMiniStrip() {
+    const host = $("#chat-mini");
+    const chat = state.chat;
+    if (!host || !chat) return;
+    const active = miniRunning();
+    const input = $("#chat-input");
+    const send = $("#chat-send");
+    if (!active) {
+      const last = chat.minis.find((m) => m.status !== "queued" && m.status !== "running");
+      host.className = "chat-mini";
+      host.innerHTML = last ? `<span class="muted">Last mini session: ${esc(last.title || last.goal)} — ${esc(last.status)}</span>` : "";
+      if (input) input.placeholder = "e.g. who exactly buys this, and what would make them choose a new book?";
+      if (send && !send.dataset.busy) send.textContent = "Send";
+      return;
+    }
+    host.className = "chat-mini running";
+    host.innerHTML = `<span class="mini-dot"></span><span class="mini-goal"><strong>Mini session:</strong> ${esc(active.goal)}</span>`
+      + `<span class="chip">${esc(active.status)}</span>`
+      + `<button class="btn small ghost" type="button" id="mini-cancel">Cancel</button>`;
+    $("#mini-cancel").addEventListener("click", () => cancelMiniSession(active.id));
+    if (input) input.placeholder = "Type to guide the mini session — it reads this on its next step…";
   }
 
   function scrollChat(log) {
     try { log.scrollTop = log.scrollHeight; } catch (e) { /* not scrollable */ }
   }
 
-  function renderChat(log, messages, keepThinking) {
+  function renderChat() {
+    const log = $("#chat-log");
+    const chat = state.chat;
+    if (!log || !chat) return;
     log.innerHTML = "";
-    if (!messages.length) {
+    if (!chat.messages.length) {
       log.innerHTML = `<div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div>`;
+      renderMiniStrip();
       return;
     }
-    for (const m of messages) {
+    // Which proposals already became mini sessions (so a reload does not
+    // re-offer a session that is already running or done).
+    const startedFrom = new Set(
+      chat.minis.map((m) => m.meta && m.meta.proposal_message_id).filter((x) => x != null)
+    );
+    for (const m of chat.messages) {
       const ai = m.role !== "owner";
       const row = document.createElement("div");
       row.className = `chat-row ${ai ? "chat-ai" : "chat-owner"}`;
@@ -1072,15 +1204,47 @@
         bubble.innerHTML = esc(String(m.text || "")).replace(/\n/g, "<br>");
       }
       row.appendChild(bubble);
+      const proposal = ai && m.meta && m.meta.proposal;
+      if (proposal) {
+        row.appendChild(chatProposalCard(m, proposal, startedFrom.has(m.id), chat.dismissed.has(m.id)));
+      }
       log.appendChild(row);
     }
-    if (keepThinking) {
-      const thinking = document.createElement("div");
-      thinking.className = "chat-row chat-ai chat-thinking";
-      thinking.innerHTML = `<div class="chat-bubble"><span class="spinner"></span> reading the research record…</div>`;
-      log.appendChild(thinking);
-    }
+    renderMiniStrip();
     scrollChat(log);
+  }
+
+  // A mini session is proposed in the answer, never started behind the owner's
+  // back: this card is the "yes".
+  function chatProposalCard(message, proposal, started, dismissed) {
+    const card = document.createElement("div");
+    card.className = "chat-proposal";
+    const goal = String(proposal.goal || "");
+    const why = String(proposal.why || "");
+    if (started) {
+      card.innerHTML = `<div class="chat-proposal-h">Mini session</div>`
+        + `<div class="chat-proposal-goal">${esc(goal)}</div>`
+        + `<div class="chat-proposal-note">Started — its answer will appear here.</div>`;
+      return card;
+    }
+    if (dismissed) {
+      card.innerHTML = `<div class="chat-proposal-note">Mini session declined.</div>`;
+      return card;
+    }
+    card.innerHTML = `<div class="chat-proposal-h">Proposed mini session</div>`
+      + `<div class="chat-proposal-goal">${esc(goal)}</div>`
+      + (why ? `<div class="chat-proposal-why">${esc(why)}</div>` : "")
+      + `<div class="chat-proposal-actions">`
+      + `<button class="btn small primary" type="button" data-act="start">Start mini session</button>`
+      + `<button class="btn small ghost" type="button" data-act="no">Not now</button></div>`;
+    card.querySelector('[data-act="start"]').addEventListener("click", () => {
+      startMiniSession(goal, goal, message.id);
+    });
+    card.querySelector('[data-act="no"]').addEventListener("click", () => {
+      if (state.chat) state.chat.dismissed.add(message.id);
+      renderChat();
+    });
+    return card;
   }
 
   // ---------- follow-up run (continues the WHOLE previous session) ----------
