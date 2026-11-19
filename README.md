@@ -336,7 +336,11 @@ and survives restarts. Answers are grounded exactly like the report: `[ev:ID]`
 citations resolve to real evidence pages (unknown ids are dropped and reported,
 never linked), and a question the research cannot answer is answered as a gap,
 not a guess. In the dashboard the panel sits under the report — owner messages
-on the right, the analyst's on the left.
+on the right, the analyst's on the left. Every answer carries a collapsible
+**Reasoning** row: tap it to read that call's chain of thought, fetched from
+the same owner-only thought store the session workspace uses (`GET
+/api/sessions/{id}/thoughts/{thought_id}`), and answers think at
+`CHAT_REASONING_EFFORT` (default `low`).
 
 ### Mini sessions (`app/mini_session.py`)
 
@@ -345,15 +349,19 @@ have moved, whether a book still exists, a phrase nobody searched, a niche this
 run never touched. For those the analyst can run a **mini session** — a small,
 focused piece of live work inside the same conversation.
 
-- **The owner decides.** The analyst proposes one by ending an answer with a
-  `mini-session` block (`{"goal", "why"}`). The block is parsed out of the
-  reply (never shown as text), stored in the answer's `meta.proposal`, and
-  offered as a **Start mini session** button. The owner can also ask for one in
-  words; nothing ever starts without a tap.
+- **The model decides, from the conversation.** When an answer needs a live
+  measurement (or the owner says "go and check"), the analyst ends its reply
+  with a `mini-session` block (`{"goal", "title"}`). The block is parsed out
+  (never shown as text) and the session starts immediately — there is no yes/no
+  card and no purpose prompt: the owner's message was the instruction. The
+  answer says what is being checked; the session's findings arrive in the same
+  thread.
 - **It is not a research run.** No phases, order, output contracts or exit
 gates: the methodology is supplied as reference the model may read and ignore.
   The model chooses its own actions from the same browser toolkit the research
   agent uses (`app/actions.py`), and stops as soon as the question is settled.
+  Mini-session steps think at `MINI_SESSION_REASONING_EFFORT` (default
+  `medium`) while chat answers stay at `low`.
 - **It carries everything.** A mini session gets the same complete dossier a
   chat answer gets (every capture, candidate, verification, note, reasoning
   line, screenshot, phase analysis, earlier run in the chain and the report)
@@ -362,6 +370,12 @@ gates: the methodology is supplied as reference the model may read and ignore.
   conversation is delivered to the running mini session (a durable owner-inbox
   step the model reads on its next step) and answered in the same thread when
   it finishes, as an analyst message tagged with its mini-session id.
+- **It can be monitored like a full run.** The conversation shows a live
+  monitor for the running (or last watched) session: status, the step log as it
+  grows (each action with its measured summary or failure), the **Live browser**
+  frame from the same browser the research session uses, and a **Reasoning**
+  dropdown on every model step that opens that turn's chain of thought. The
+  monitor polls while the session works and keeps its result afterwards.
 - **No cap.** A conversation can run as many mini sessions as it needs; the
   only stops are the owner's cancel and the `MINI_SESSION_TIMEOUT_SECONDS`
   wall-clock budget. Every session keeps a durable step log

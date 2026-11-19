@@ -69,6 +69,8 @@ DeepInfra** (thinking/reasoning model, native vision, 1M context).
 | `CHAT_MAX_TOKENS` | no | `4000` | Completion budget for one answer in the report conversation |
 | `MINI_SESSION_TIMEOUT_SECONDS` | no | `3600` | Wall-clock budget for one mini session (focused live work started from a conversation). It is the only stop besides the owner's cancel — there is no cap on how many mini sessions a conversation may run |
 | `MINI_SESSION_MAX_TOKENS` | no | `4000` | Completion budget for one step of a mini session |
+| `CHAT_REASONING_EFFORT` | no | `low` | Reasoning effort for answers in a report conversation (overrides `MODEL_REASONING_EFFORT` for those calls only) |
+| `MINI_SESSION_REASONING_EFFORT` | no | `medium` | Reasoning effort for mini-session steps (live, tool-using work) |
 
 The model sees the live browser viewport on every iteration (vision ground
 truth) plus structured, redacted evidence digests — it never receives raw

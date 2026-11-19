@@ -45,57 +45,56 @@ HOW TO ANSWER
 - Markdown is welcome (short bullets, a small table when comparing numbers), but keep the shape of a chat reply: usually a few sentences or a tight list.
 - Follow the thread. If the owner says "that one", "the second option", "make it cheaper", resolve it against the conversation and the report — do not restart from scratch. If they ask for a rewrite of a part of the report, write that part; never silently change the record.
 
-STARTING A MINI SESSION
-- Some questions cannot be answered from the finished research: a price or ranking that may have changed, whether a book or category still exists, a phrase nobody searched, a niche this run never touched. For those you can run a MINI SESSION — focused, self-directed work with the live browser, free of the research methodology's phases and contracts (the methodology is a reference you may read, not a cage).
-- Propose one when it would change the answer, or when the owner asks you to go and check something. End your reply with exactly one fenced block, after your answer:
+GOING TO LOOK: MINI SESSIONS
+- Some questions cannot be answered from the finished research: a price or ranking that may have changed, whether a book or category still exists, a phrase nobody searched, a niche this run never touched. For those you START A MINI SESSION — focused, self-directed work with the live browser, free of the research methodology's phases and contracts (the methodology is a reference you may read, not a cage).
+- Start one when the question needs a live measurement, or when the owner asks you to go and check something. There is no approval step and no proposal card: the conversation IS the instruction, so when it is clear what to do, do it. End your reply with exactly one fenced block, after your answer:
 ```mini-session
-{"goal": "<exactly what you will do, specific enough to execute>", "why": "<what this settles for the owner>"}
+{"goal": "<exactly what you will do, specific enough to execute>", "title": "<short label for the owner's monitor>"}
 ```
-- The owner decides whether it runs. Never claim a mini session's findings before it has run, and never propose one for something the record already answers.
-- If they ask you to go find something new: propose the mini session when live measurement is what it needs, and mention the follow-up research run when it needs a whole new investigation.
+- What you write before the block is what the owner reads now: say what you are going to look at and why it settles the question. The mini session runs immediately with this whole record and this whole conversation, and posts its own findings into this same thread when it is done — so never claim its findings in advance, and never start one for something the record already answers.
+- If the request needs a whole new investigation rather than a measurement, say that and mention the follow-up research run instead.
+- If you are unsure what they want, ask in words. Never start a mini session to guess at an ambiguous request.
+- Many mini sessions in one conversation are fine.
 """
 
-# The model's proposal for a mini session, as a fenced block at the end of an
-# answer. It is parsed out (never shown as text) and offered to the owner as a
-# button; nothing starts without the owner accepting it.
-_PROPOSAL_RE = re.compile(
+# The model's decision to run a mini session, as a fenced block at the end of an
+# answer. It is parsed out (never shown as text) and started immediately: the
+# owner already said what they wanted, in the conversation.
+_MINI_RE = re.compile(
     r"```mini-session\s*\n?(\{.*?\})\s*\n?```", re.DOTALL | re.IGNORECASE
 )
 # Some models omit the fence and emit a bare object with the same key.
-_PROPOSAL_BARE_RE = re.compile(
-    r'(?m)^\s*\{\s*"goal"\s*:\s*".*?"\s*,\s*"why"\s*:\s*".*?"\s*\}\s*$', re.DOTALL
+_MINI_BARE_RE = re.compile(
+    r'(?m)^\s*\{\s*"goal"\s*:\s*".*?"(?:\s*,\s*"[a-z_]+"\s*:\s*".*?")*\s*\}\s*$',
+    re.DOTALL,
 )
 
 
-def extract_proposal(text: str) -> tuple[str, dict[str, Any] | None]:
-    """Split a mini-session proposal out of an answer.
+def extract_mini_session(text: str) -> tuple[str, dict[str, Any] | None]:
+    """Split a mini-session instruction out of an answer.
 
-    Returns (answer_without_block, proposal). A malformed block is left in the
-    text: better the owner sees something odd than a silently swallowed
-    instruction.
+    Returns (answer_without_block, {"goal", "title"?}). A malformed block is
+    left in the text: better the owner sees something odd than a silently
+    swallowed instruction.
     """
     raw = str(text or "")
-    match = _PROPOSAL_RE.search(raw)
+    match = _MINI_RE.search(raw)
     if not match:
-        match = _PROPOSAL_BARE_RE.search(raw)
+        match = _MINI_BARE_RE.search(raw)
     if not match:
         return raw.strip(), None
     try:
-        data = json.loads(match.group(1) if match.re is _PROPOSAL_RE else match.group(0))
+        data = json.loads(match.group(1) if match.re is _MINI_RE else match.group(0))
     except Exception:
         return raw.strip(), None
     if not isinstance(data, dict):
         return raw.strip(), None
     goal = " ".join(str(data.get("goal") or "").split())
-    why = " ".join(str(data.get("why") or "").split())
     if not goal:
         return raw.strip(), None
+    title = " ".join(str(data.get("title") or "").split())
     cleaned = (raw[: match.start()] + raw[match.end():]).strip()
-    proposal = {"goal": goal[:2_000], "why": why[:1_000]}
-    kind = str(data.get("kind") or "").strip()
-    if kind:
-        proposal["kind"] = kind[:60]
-    return cleaned, proposal
+    return cleaned, {"goal": goal[:2_000], "title": title[:160]}
 
 
 _EV_RE = re.compile(r"\[ev:([A-Za-z0-9_\-]+)\]")
@@ -514,8 +513,13 @@ async def answer(
     history: list[ChatMessage],
     question: str,
     max_tokens: int = 4_000,
-) -> str:
-    """One analyst turn. Returns the reply text (markdown)."""
+    reasoning_effort: str | None = None,
+) -> tuple[str, int | None]:
+    """One analyst turn. Returns (reply text, thought id) in markdown.
+
+    The thought id is the owner-visible chain of thought this call opened, so
+    the answer in the conversation can offer its reasoning on tap.
+    """
     prompt = render_chat_prompt(dossier, history, question)
     reply = await model.call(
         session_id,
@@ -524,5 +528,7 @@ async def answer(
         label="Answering the owner's question about the report",
         max_tokens=max_tokens,
         text_mode=True,
+        reasoning_effort=reasoning_effort,
     )
-    return str(getattr(reply, "raw", "") or "").strip()
+    text = str(getattr(reply, "raw", "") or "").strip()
+    return text, getattr(reply, "thought_id", None)

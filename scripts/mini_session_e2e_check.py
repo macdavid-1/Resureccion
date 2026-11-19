@@ -49,16 +49,20 @@ def _wait(client, headers, sid, mid, *, timeout=30.0) -> dict:
 class _MiniModel:
     """A scripted mini-session model: two actions, then a cited answer."""
 
-    def __init__(self, *, cite: str, guide_probe: str | None = None) -> None:
+    def __init__(self, *, cite: str, guide_probe: str | None = None,
+                 thought_id: int | None = None) -> None:
         self.cite = cite
         self.guide_probe = guide_probe
+        self.thought_id = thought_id
         self.prompts: list[str] = []
+        self.efforts: list[str | None] = []
 
     async def call(self, session_id, *, system, user, **kw):
         # A real model call takes seconds; the pause lets the owner's message
         # arrive while the session is genuinely working.
         await asyncio.sleep(0.15)
         self.prompts.append(user)
+        self.efforts.append(kw.get("reasoning_effort"))
         assert "THE RESEARCH RECORD (complete" in user, "the record must be complete"
         assert "NOT bound" in user, "the methodology must be reference, not a cage"
         nxt: dict
@@ -76,6 +80,9 @@ class _MiniModel:
         reply = type("R", (), {})()
         reply.content = nxt
         reply.raw = json.dumps(nxt)
+        # Every turn in a real run opens a thought row; the first turn uses the
+        # one this script created so the monitor has something to fetch.
+        reply.thought_id = self.thought_id if len(self.prompts) == 1 else None
         return reply
 
 
@@ -100,11 +107,13 @@ async def main() -> int:
         # 1. The UI ships the mini-session surface.
         page = client.get("/static/app.js")
         assert page.status_code == 200
-        for marker in ("startMiniSession", "chat-proposal", "chat-mini"):
+        for marker in ("mini-monitor", "reasoningToggle", "loadMiniFrame", "chat-mini-started"):
             assert marker in page.text, f"app.js is missing {marker}"
+        assert "chat-proposal" not in page.text, "the approval card must be gone"
         css = client.get("/static/styles.css")
-        assert ".chat-proposal" in css.text and ".chat-mini" in css.text
-        print("[1] mini-session UI assets serve OK")
+        for marker in (".mini-monitor", ".reasoning-body", ".chat-mini-started"):
+            assert marker in css.text, f"styles.css is missing {marker}"
+        print("[1] mini-session monitor + reasoning UI assets serve OK")
 
         # 2. Login + session.
         r = client.post("/api/auth/login",
@@ -132,32 +141,25 @@ async def main() -> int:
         cite = evidence[0].id
         print(f"[3] research completed ({len(evidence)} captures)")
 
-        # 4. The answer proposes a mini session; nothing starts by itself.
-        class _Proposer:
+        # 4. The analyst decides to go and look: the answer starts the session
+        # itself — no approval card, no purpose prompt.
+        chat_thought = app.state.thoughts.begin(sid, label="Answering the owner's question")
+        app.state.thoughts.finish(chat_thought)
+        goal = "Verify the #1 grief memoir still sells at $8.99"
+
+        class _Decider:
             async def call(self, session_id, *, system, user, **kw):
                 reply = type("R", (), {})()
-                goal = "Verify the #1 grief memoir still sells at $8.99"
-                why = "the ceiling may have moved"
+                reply.thought_id = chat_thought
                 reply.raw = (
-                    "The record prices it at $8.99.\n\n```mini-session\n"
-                    + json.dumps({"goal": goal, "why": why})
+                    "The record prices it at $8.99. I'll check the live page now.\n\n```mini-session\n"
+                    + json.dumps({"goal": goal, "title": "price check"})
                     + "\n```"
                 )
                 return reply
 
-        app.state.chat_model = _Proposer()
-        r = client.post(f"/api/sessions/{sid}/reports/{rid}/chat", headers=h,
-                        json={"message": "is that price still right?"})
-        assert r.status_code == 200, r.text
-        answer = r.json()["answer"]
-        proposal = answer["meta"].get("proposal")
-        assert proposal and proposal["goal"].startswith("Verify the #1 grief memoir"), answer
-        assert "mini-session" not in answer["text"], "the block leaked into the bubble"
-        assert client.get(f"/api/sessions/{sid}/reports/{rid}/mini-sessions",
-                          headers=h).json()["mini_sessions"] == []
-        print(f"[4] mini session proposed (not started): {proposal['goal'][:48]}…")
+        app.state.chat_model = _Decider()
 
-        # 5. Start it, guide it mid-run, get its answer in the thread.
         class _Executor:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, dict]] = []
@@ -170,7 +172,9 @@ async def main() -> int:
         executor = _Executor()
         app.state.mini_executor = executor
         guide = "also check the UK price"
-        model = _MiniModel(cite=cite, guide_probe=guide)
+        mini_thought = app.state.thoughts.begin(sid, label="Mini session: price check · step 1")
+        app.state.thoughts.finish(mini_thought)
+        model = _MiniModel(cite=cite, guide_probe=guide, thought_id=mini_thought)
         app.state.mini_model = model
 
         service = app.state.mini_sessions
@@ -183,11 +187,23 @@ async def main() -> int:
             return await original(session_id, system=system, user=user, **kw)
 
         model.call = _call
-        r = client.post(f"/api/sessions/{sid}/reports/{rid}/mini-sessions", headers=h,
-                        json={"goal": proposal["goal"], "title": "price check",
-                              "proposal_message_id": answer["id"]})
+        r = client.post(f"/api/sessions/{sid}/reports/{rid}/chat", headers=h,
+                        json={"message": "is that price still right?"})
         assert r.status_code == 200, r.text
-        mini_id = r.json()["mini_session"]["id"]
+        payload = r.json()
+        answer = payload["answer"]
+        assert "mini-session" not in answer["text"], "the block leaked into the bubble"
+        assert answer["meta"]["mini_session"]["goal"] == goal, answer
+        assert answer["meta"]["thought_id"] == chat_thought
+        assert payload["mini_session"]["title"] == "price check"
+        mini_id = payload["mini_session"]["id"]
+        # The chat answer's reasoning is reachable on tap.
+        detail = client.get(f"/api/sessions/{sid}/thoughts/{chat_thought}", headers=h)
+        assert detail.status_code == 200 and "detail" in detail.json()["thought"]
+        # And the monitor's live-view endpoint answers for the session.
+        frame = client.get(f"/api/sessions/{sid}/live-view/frame", headers=h)
+        assert frame.status_code in (200, 204), frame.status_code
+        print(f"[4] answer started the mini session itself: {goal[:48]}…")
         # A message typed now goes to the running session, not to the analyst.
         r = client.post(f"/api/sessions/{sid}/reports/{rid}/chat", headers=h,
                         json={"message": "focus on the paperback"})
@@ -197,8 +213,17 @@ async def main() -> int:
         mini = done["mini_session"]
         assert mini["status"] == "completed", mini["error"]
         assert f"/api/sessions/{sid}/evidence/{cite}" in mini["result"]
-        assert mini["meta"]["proposal_message_id"] == answer["id"]
         assert [c[0] for c in executor.calls] == ["open_category", "open_product"], executor.calls
+        # Monitor: every model turn carries its own reasoning handle.
+        note = next(s for s in done["steps"] if s["kind"] == "note")
+        assert note["meta"]["thought_id"] == mini_thought
+        assert model.efforts and set(model.efforts) == {"medium"}, model.efforts
+        thought = client.get(
+            f"/api/sessions/{sid}/thoughts/{mini_thought}", headers=h
+        ).json()["thought"]
+        # The model's own note becomes the thought's one-line summary, so the
+        # monitor's reasoning list reads like the session, not like plumbing.
+        assert thought["label"] == "opening the category", thought["label"]
         assert any(s["kind"] == "owner" and "paperback" in s["text"] for s in done["steps"])
         assert [s["meta"].get("summary") for s in done["steps"] if s["kind"] == "action"] == [
             "open_category ok", "open_product ok",

@@ -308,6 +308,7 @@ class ModelClient:
         reference_images: list[bytes] | None = None,
         label: str = "Thinking",
         text_mode: bool = False,
+        reasoning_effort: str | None = None,
     ) -> ModelReply:
         """One model call. Retries transient failures.
 
@@ -329,6 +330,10 @@ class ModelClient:
         (one thought row per call, labeled `label`). The stream is an
         enhancement only — see `_request` for the fallback contract: any
         endpoint that will not stream gets exactly the plain request.
+
+        `reasoning_effort` overrides MODEL_REASONING_EFFORT for this call only:
+        a report conversation answers at low effort, a mini session thinks at
+        medium, while the research agent keeps the configured default.
         """
         if not self.is_configured:
             raise ModelConfigError(
@@ -371,7 +376,9 @@ class ModelClient:
         # ones that aren't, so this stays safe across model swaps. Omitted
         # entirely when MODEL_THINKING=false.
         if self.config.model_thinking_enabled:
-            payload["reasoning_effort"] = self.config.model_reasoning_effort
+            payload["reasoning_effort"] = (
+                reasoning_effort or self.config.model_reasoning_effort
+            )
         started = time.monotonic()
         last_error: Exception | None = None
         client = await self._ensure_client()

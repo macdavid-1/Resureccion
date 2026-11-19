@@ -41,6 +41,16 @@ DEFAULT_MODEL = "XiaomiMiMo/MiMo-V2.6-Flash"
 _REASONING_EFFORTS = ("none", "low", "medium", "high")
 
 
+def _effort_env(name: str, default: str) -> str:
+    """One reasoning-effort knob, validated loudly at boot."""
+    effort = os.environ.get(name, default).strip().lower()
+    if effort not in _REASONING_EFFORTS:
+        raise RuntimeError(
+            f"{name} must be one of {', '.join(_REASONING_EFFORTS)}, got {effort!r}"
+        )
+    return effort
+
+
 class Config:
     """Central runtime configuration. Instantiated once per process."""
 
@@ -201,13 +211,7 @@ class Config:
         self.model_thinking_enabled = os.environ.get("MODEL_THINKING", "true").strip().lower() in (
             "1", "true", "yes", "on"
         )
-        effort = os.environ.get("MODEL_REASONING_EFFORT", "high").strip().lower()
-        if effort not in _REASONING_EFFORTS:
-            raise RuntimeError(
-                f"MODEL_REASONING_EFFORT must be one of {', '.join(_REASONING_EFFORTS)}, "
-                f"got {effort!r}"
-            )
-        self.model_reasoning_effort = effort
+        self.model_reasoning_effort = _effort_env("MODEL_REASONING_EFFORT", "high")
         # Completion budget. On an OpenAI-compatible API a reasoning model's
         # thinking tokens are billed against max_tokens, so at high effort it
         # can spend the whole allowance thinking and leave nothing for the
@@ -246,6 +250,13 @@ class Config:
         )
         self.mini_session_max_tokens = max(
             500, _int_env("MINI_SESSION_MAX_TOKENS", 4_000)
+        )
+        # Talking about a finished report is shallow work (low effort); a mini
+        # session is live, tool-using work (medium). Both are per-call overrides
+        # of MODEL_REASONING_EFFORT, which stays the research agent's setting.
+        self.chat_reasoning_effort = _effort_env("CHAT_REASONING_EFFORT", "low")
+        self.mini_session_reasoning_effort = _effort_env(
+            "MINI_SESSION_REASONING_EFFORT", "medium"
         )
         # Prompt budget for the research dossier. 0 means "the model's context
         # window, minus a safe margin" (see report_writer._fit_context).

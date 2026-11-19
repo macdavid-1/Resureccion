@@ -264,6 +264,25 @@ async def test_reasoning_effort_can_be_lowered():
 
 
 @pytest.mark.asyncio
+async def test_a_call_can_override_the_reasoning_effort():
+    """Chat answers think at low, mini sessions at medium, research keeps the
+    configured default — per call, not per process."""
+    cfg = _config(model_reasoning_effort="high")
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return _response({"ok": True})
+
+    client = ModelClient(cfg, transport=_transport(handler))
+    await client.call("s1", system="s", user="u", reasoning_effort="low")
+    await client.call("s1", system="s", user="u", reasoning_effort="medium")
+    await client.call("s1", system="s", user="u")
+    assert [b["reasoning_effort"] for b in seen] == ["low", "medium", "high"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_thinking_disabled_omits_reasoning_effort():
     """MODEL_THINKING=false must not send the parameter at all."""
     cfg = _config(model_thinking_enabled=False)
@@ -284,6 +303,24 @@ def test_reasoning_effort_is_validated(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_REASONING_EFFORT", "ultra")
     with pytest.raises(RuntimeError, match="MODEL_REASONING_EFFORT"):
         Config()
+    monkeypatch.delenv("MODEL_REASONING_EFFORT")
+    monkeypatch.setenv("CHAT_REASONING_EFFORT", "ultra")
+    with pytest.raises(RuntimeError, match="CHAT_REASONING_EFFORT"):
+        Config()
+    monkeypatch.delenv("CHAT_REASONING_EFFORT")
+    monkeypatch.setenv("MINI_SESSION_REASONING_EFFORT", "ultra")
+    with pytest.raises(RuntimeError, match="MINI_SESSION_REASONING_EFFORT"):
+        Config()
+
+
+def test_conversation_and_mini_session_reasoning_defaults(monkeypatch) -> None:
+    """Chat talks at low effort; live mini-session work at medium."""
+    monkeypatch.delenv("CHAT_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("MINI_SESSION_REASONING_EFFORT", raising=False)
+    cfg = Config()
+    assert cfg.chat_reasoning_effort == "low"
+    assert cfg.mini_session_reasoning_effort == "medium"
+    assert cfg.model_reasoning_effort == "high", "research keeps its own setting"
 
 
 def test_single_source_of_truth_for_model_default() -> None:

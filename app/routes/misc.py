@@ -566,8 +566,6 @@ async def export_reports_pdf(body: ReportsPdfRequest, session_id: str, request: 
 class MiniSessionRequest(BaseModel):
     goal: str
     title: str = ""
-    # The chat message carrying the proposal, so the UI can mark it started.
-    proposal_message_id: int | None = None
 
 
 def _chat_dossier(st: Any, session_id: str, report: Any) -> dict:
@@ -618,7 +616,7 @@ async def ask_report_chat(
     if len(question) > 8_000:
         raise HTTPException(status_code=400, detail="message is too long (8000 characters max)")
 
-    from app.report_chat import ChatStore, answer, extract_proposal, link_citations
+    from app.report_chat import ChatStore, answer, extract_mini_session, link_citations
 
     chats = ChatStore(st.db)
     # A mini session for this report is WORKING: a message typed into the same
@@ -652,7 +650,7 @@ async def ask_report_chat(
         model = owned_client
     timeout = float(getattr(st.config, "chat_timeout_seconds", 240) or 240)
     try:
-        text = await asyncio.wait_for(
+        text, thought_id = await asyncio.wait_for(
             answer(
                 model=model,
                 session_id=session_id,
@@ -660,6 +658,7 @@ async def ask_report_chat(
                 history=history,
                 question=question,
                 max_tokens=int(getattr(st.config, "chat_max_tokens", 4_000) or 4_000),
+                reasoning_effort=getattr(st.config, "chat_reasoning_effort", "low"),
             ),
             timeout=timeout,
         )
@@ -696,20 +695,37 @@ async def ask_report_chat(
             detail="the analyst returned an empty answer; the question is saved — ask again",
         )
 
-    # The analyst may propose a mini session (a fenced `mini-session` block).
-    # It is never run automatically: the block is split out of the reply and
-    # offered to the owner as one tap.
-    prose, proposal = extract_proposal(text)
+    # The analyst can decide to go and look: a fenced `mini-session` block at
+    # the end of its answer. It is split out of the reply (never shown as text)
+    # and started immediately — the owner's message in the conversation was the
+    # instruction, so there is no card to approve. The block's prose is what
+    # the owner reads now; the session posts its own findings back into the
+    # thread when it is done.
+    prose, mini_request = extract_mini_session(text)
     known = {row.get("id") for row in (dossier.get("evidence") or []) if isinstance(row, dict)}
     linked, cited, dropped = link_citations(prose, session_id, known)
     meta: dict[str, Any] = {"citations": cited, "dropped_citations": dropped}
-    if proposal:
-        meta["proposal"] = proposal
-        st.events.append(
-            session_id, level="info", actor="agent", action="mini_session_proposed",
-            detail={"report_id": report_id,
-                    "goal": proposal.get("goal", "")[:300]},
-        )
+    if thought_id:
+        meta["thought_id"] = int(thought_id)
+    started_mini = None
+    if mini_request and minis is not None:
+        try:
+            started_mini = minis.start(
+                session_id=session_id,
+                report_id=report_id,
+                goal=mini_request["goal"],
+                title=mini_request.get("title") or "",
+            )
+            meta["mini_session"] = {
+                "id": started_mini.id,
+                "goal": started_mini.goal,
+                "title": started_mini.title,
+            }
+        except Exception as exc:
+            st.events.append(
+                session_id, level="warn", actor="agent", action="mini_session_start_failed",
+                detail={"report_id": report_id, "error": f"{type(exc).__name__}: {exc}"[:300]},
+            )
     analyst_msg = chats.add(
         session_id, report_id, role="analyst", text=linked, meta=meta,
     )
@@ -717,12 +733,15 @@ async def ask_report_chat(
         session_id, level="info", actor="agent", action="report_question_answered",
         detail={"report_id": report_id, "chars": len(linked), "citations": len(cited)},
     )
-    return {
+    body_out: dict[str, Any] = {
         "report_id": report_id,
         "question": owner_msg.to_dict(),
         "answer": analyst_msg.to_dict(),
         "messages": [m.to_dict() for m in chats.list(session_id, report_id)],
     }
+    if started_mini is not None:
+        body_out["mini_session"] = started_mini.to_dict()
+    return body_out
 
 
 # ------------------------------------------------------------- mini sessions
@@ -749,7 +768,6 @@ async def start_mini_session(
             report_id=report_id,
             goal=body.goal,
             title=body.title,
-            proposal_message_id=body.proposal_message_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

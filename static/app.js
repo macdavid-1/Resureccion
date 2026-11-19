@@ -969,6 +969,14 @@
         <div class="panel chat-panel" id="rep-chat">
           <div class="panel-h"><h2 style="text-transform:none;letter-spacing:0">Ask the analyst</h2>
             <span class="muted" style="font-size:0.72rem">answered from this run's whole record</span></div>
+          <div class="mini-monitor" id="mini-monitor" hidden>
+            <div class="mini-monitor-head" id="mm-head"></div>
+            <div class="mini-monitor-body">
+              <div class="mm-goal" id="mm-goal"></div>
+              <img id="mm-img" class="mini-live hidden" alt="Live browser view of the mini session">
+              <div class="mini-steps" id="mm-steps"></div>
+            </div>
+          </div>
           <div class="chat-log" id="chat-log"><div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div></div>
           <div class="chat-mini" id="chat-mini"></div>
           <form class="chat-form" id="chat-form">
@@ -1018,7 +1026,12 @@
     const form = $("#chat-form");
     if (!log || !form) return;
     stopChatPolling();
-    state.chat = { sid, rid, messages: [], minis: [], dismissed: new Set(), lastDone: new Set() };
+    state.chat = {
+      sid, rid, messages: [], minis: [],
+      watchId: null, detail: null, stepsKey: "",
+      thoughts: new Map(), openThoughts: new Set(), hiddenWatches: new Set(),
+      liveTimer: null, liveOn: false,
+    };
     await refreshChat();
     form.onsubmit = async (ev) => {
       ev.preventDefault();
@@ -1039,8 +1052,13 @@
           body: JSON.stringify({ message: text }),
         });
         if (Array.isArray(data.messages)) chat.messages = data.messages;
-        if (data.delivered_to_mini_session) await refreshMinis();
+        // The analyst decided to go and look (or the message went to the
+        // running session): open its monitor straight away.
+        if (data.mini_session) chat.watchId = data.mini_session.id;
+        if (data.delivered_to_mini_session) chat.watchId = data.delivered_to_mini_session;
+        await refreshMinis();
         renderChat();
+        await loadMiniDetail();
       } catch (e) {
         renderChat();
         appendChatError(e.message);
@@ -1055,7 +1073,8 @@
 
   function stopChatPolling() {
     if (state.chat && state.chat.timer) clearInterval(state.chat.timer);
-    if (state.chat) state.chat.timer = null;
+    if (state.chat && state.chat.liveTimer) clearInterval(state.chat.liveTimer);
+    if (state.chat) { state.chat.timer = null; state.chat.liveTimer = null; }
   }
 
   function startChatPolling() {
@@ -1064,7 +1083,7 @@
     chat.timer = setInterval(() => {
       if (!state.chat || state.chat !== chat) { clearInterval(chat.timer); return; }
       refreshMinis().catch(() => {});
-    }, 3000);
+    }, 2000);
   }
 
   async function refreshChat() {
@@ -1089,6 +1108,9 @@
     }
   }
 
+  // Poll the list every 2s; the watched (or running) session's steps every 2s
+  // too, so the monitor moves while the model works — the same live view a
+  // full research run gets.
   async function refreshMinis() {
     const chat = state.chat;
     if (!chat) return;
@@ -1096,15 +1118,20 @@
     if (!state.chat || state.chat !== chat) return;
     const before = new Map(chat.minis.map((m) => [m.id, m.status]));
     chat.minis = Array.isArray(data.mini_sessions) ? data.mini_sessions : [];
+    const active = miniRunning();
+    if (!chat.watchId && active && !chat.hiddenWatches.has(active.id)) chat.watchId = active.id;
     let finished = false;
     for (const m of chat.minis) {
       const was = before.get(m.id);
-      if (was && was !== m.status && (m.status === "completed" || m.status === "failed" || m.status === "cancelled" || m.status === "interrupted")) {
-        finished = true;
-      }
+      if (was && was !== m.status && isFinalMini(m.status)) finished = true;
     }
     renderMiniStrip();
+    if (chat.watchId) await loadMiniDetail();
     if (finished) await refreshChat();
+  }
+
+  function isFinalMini(status) {
+    return ["completed", "failed", "cancelled", "interrupted"].includes(status);
   }
 
   function miniRunning() {
@@ -1123,30 +1150,213 @@
     scrollChat(log);
   }
 
-  async function startMiniSession(goal, title, proposalMessageId) {
-    const chat = state.chat;
-    if (!chat) return;
-    try {
-      await api(`/api/sessions/${chat.sid}/reports/${chat.rid}/mini-sessions`, {
-        method: "POST",
-        body: JSON.stringify({ goal, title: title || "", proposal_message_id: proposalMessageId ?? null }),
-      });
-      await refreshMinis();
-      await refreshChat();
-    } catch (e) {
-      appendChatError(e.message);
-    }
-  }
-
   async function cancelMiniSession(miniId) {
     const chat = state.chat;
     if (!chat) return;
     try {
       await api(`/api/sessions/${chat.sid}/mini-sessions/${miniId}/cancel`, { method: "POST" });
       await refreshMinis();
+      await loadMiniDetail();
     } catch (e) {
       appendChatError(e.message);
     }
+  }
+
+  function watchMini(miniId) {
+    if (!state.chat) return;
+    state.chat.hiddenWatches.delete(miniId);
+    state.chat.watchId = miniId;
+    state.chat.detail = null;
+    state.chat.stepsKey = "";
+    renderMiniStrip();
+    renderMiniMonitor();
+    loadMiniDetail().catch(() => {});
+    const host = $("#mini-monitor");
+    if (host) host.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  // The report conversation's monitor: the running (or last watched) mini
+  // session, its step log, its result and — on tap — the reasoning behind any
+  // step. The same idea as the session workspace's live view and thought feed.
+  async function loadMiniDetail() {
+    const chat = state.chat;
+    if (!chat || !chat.watchId) return;
+    const id = chat.watchId;
+    let data;
+    try {
+      data = await api(`/api/sessions/${chat.sid}/mini-sessions/${id}`);
+    } catch { return; }
+    if (!state.chat || state.chat !== chat || chat.watchId !== id) return;
+    chat.detail = data;
+    renderMiniMonitor();
+    const status = data.mini_session?.status;
+    if ((status === "running" || status === "queued") && chat.liveOn) loadMiniFrame();
+  }
+
+  function renderMiniMonitor() {
+    const host = $("#mini-monitor");
+    const chat = state.chat;
+    if (!host) return;
+    const detail = chat && chat.detail;
+    if (!chat || !detail) { host.hidden = true; return; }
+    const mini = detail.mini_session;
+    host.hidden = false;
+    const running = mini.status === "running" || mini.status === "queued";
+    host.className = `mini-monitor ${running ? "running" : mini.status}`;
+    const head = $("#mm-head");
+    head.innerHTML = `<span class="mini-dot"></span>`
+      + `<span class="mm-title">${esc(mini.title || mini.goal)}</span>`
+      + `<span class="chip">${esc(mini.status)}</span>`
+      + (running ? `<button class="btn small ghost" type="button" id="mm-cancel">Cancel</button>` : "")
+      + `<button class="btn small ${chat.liveOn ? "primary" : "ghost"}" type="button" id="mm-live">`
+      + `${chat.liveOn ? "Hide live view" : "Live browser"}</button>`
+      + `<button class="btn small ghost" type="button" id="mm-close">Close</button>`;
+    const cancel = $("#mm-cancel");
+    if (cancel) cancel.addEventListener("click", () => cancelMiniSession(mini.id));
+    $("#mm-live").addEventListener("click", () => { setMiniLive(!chat.liveOn); renderMiniMonitor(); });
+    $("#mm-close").addEventListener("click", () => {
+      if (state.chat) {
+        // Closing stays closed for THIS session: the poll must not pop the
+        // monitor back open two seconds later.
+        state.chat.hiddenWatches.add(mini.id);
+        state.chat.watchId = null;
+        state.chat.detail = null;
+      }
+      setMiniLive(false);
+      host.hidden = true;
+    });
+    $("#mm-goal").textContent = mini.goal;
+    $("#mm-img").classList.toggle("hidden", !chat.liveOn);
+    renderMiniSteps();
+  }
+
+  function setMiniLive(on) {
+    const chat = state.chat;
+    if (!chat) return;
+    chat.liveOn = !!on;
+    if (chat.liveTimer) { clearInterval(chat.liveTimer); chat.liveTimer = null; }
+    const img = $("#mm-img");
+    if (chat.liveOn) {
+      if (img) img.classList.remove("hidden");
+      loadMiniFrame();
+      chat.liveTimer = setInterval(loadMiniFrame, 2500);
+    } else if (img) {
+      img.classList.add("hidden");
+      if (img.src) { URL.revokeObjectURL(img.src); img.removeAttribute("src"); }
+    }
+  }
+
+  // A mini session drives the SAME browser as its research session, so the
+  // full run's live-view endpoint shows exactly what it is looking at.
+  async function loadMiniFrame() {
+    const chat = state.chat;
+    const img = $("#mm-img");
+    if (!chat || !img || !chat.liveOn) return;
+    try {
+      const res = await fetch(`/api/sessions/${chat.sid}/live-view/frame`, { headers: authHeaders() });
+      if (res.status !== 200) return;
+      const blob = await res.blob();
+      if (!state.chat || state.chat !== chat || !chat.liveOn) return;
+      if (img.src) URL.revokeObjectURL(img.src);
+      img.src = URL.createObjectURL(blob);
+    } catch { /* no frame yet: the browser may still be opening */ }
+  }
+
+  function miniStepLabel(step) {
+    const text = String(step.text || "");
+    if (step.kind === "action") {
+      const meta = step.meta || {};
+      const summary = String(meta.summary || "").trim();
+      const failed = String(meta.error || "").trim();
+      return { title: text, sub: failed ? `failed: ${failed}` : summary, bad: !!failed };
+    }
+    if (step.kind === "owner") return { title: `You: ${text}`, sub: "", bad: false };
+    if (step.kind === "answer") return { title: "Answered in the conversation", sub: "", bad: false };
+    return { title: text, sub: "", bad: false };
+  }
+
+  function renderMiniSteps() {
+    const chat = state.chat;
+    const wrap = $("#mm-steps");
+    if (!chat || !wrap) return;
+    const steps = Array.isArray(chat.detail?.steps) ? chat.detail.steps : [];
+    const key = steps.map((s) => `${s.id}:${s.kind}`).join("|")
+      + `|${chat.detail?.mini_session?.status}`;
+    if (key === chat.stepsKey) return;   // nothing new: keep open reasoning panels
+    chat.stepsKey = key;
+    wrap.innerHTML = "";
+    if (!steps.length) {
+      wrap.innerHTML = `<div class="muted mini-step-empty">Nothing yet — the analyst is reading the record before it acts.</div>`;
+      return;
+    }
+    for (const step of steps) {
+      const row = document.createElement("div");
+      row.className = `mini-step ${step.kind}${(step.meta && step.meta.error) ? " bad" : ""}`;
+      const label = miniStepLabel(step);
+      row.innerHTML = `<div class="mini-step-top"><span class="mini-step-kind">${esc(step.kind)}</span>`
+        + `<span class="mini-step-title">${esc(label.title)}</span>`
+        + `<span class="mini-step-time">${esc(fmtClock(step.created_at))}</span></div>`
+        + (label.sub ? `<div class="mini-step-sub${label.bad ? " error-text" : ""}">${esc(label.sub)}</div>` : "");
+      const thoughtId = step.meta && step.meta.thought_id;
+      if (thoughtId) row.appendChild(reasoningToggle(thoughtId));
+      wrap.appendChild(row);
+    }
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  // "Reasoning" dropdown: the chain of thought behind one model call, fetched
+  // on tap from the session's own thought store — the same owner-only feed the
+  // session workspace shows.
+  function reasoningToggle(thoughtId) {
+    const id = Number(thoughtId);
+    const chat = state.chat;
+    const wrap = document.createElement("div");
+    wrap.className = "reasoning";
+    const open = !!(chat && chat.openThoughts.has(id));
+    wrap.innerHTML = `<button type="button" class="reasoning-head" aria-expanded="${open ? "true" : "false"}">`
+      + `<span class="reasoning-caret">▾</span> Reasoning</button>`
+      + `<pre class="reasoning-body"${open ? "" : " hidden"}></pre>`;
+    const btn = wrap.querySelector(".reasoning-head");
+    const pre = wrap.querySelector(".reasoning-body");
+    const paint = () => {
+      const cached = state.chat && state.chat.thoughts.get(id);
+      pre.textContent = cached?.detail ?? "Loading the model's reasoning…";
+    };
+    paint();
+    btn.addEventListener("click", async () => {
+      const c = state.chat;
+      if (!c) return;
+      if (c.openThoughts.has(id)) {
+        c.openThoughts.delete(id);
+        btn.setAttribute("aria-expanded", "false");
+        pre.hidden = true;
+        return;
+      }
+      c.openThoughts.add(id);
+      btn.setAttribute("aria-expanded", "true");
+      pre.hidden = false;
+      if (c.thoughts.has(id)) { paint(); return; }
+      try {
+        const data = await api(`/api/sessions/${c.sid}/thoughts/${id}`);
+        c.thoughts.set(id, data.thought || {});
+        paint();
+      } catch (e) {
+        pre.textContent = `Reasoning unavailable: ${e.message}`;
+      }
+    });
+    return wrap;
+  }
+
+  // Inline marker under the answer that started a mini session: the model's
+  // own decision, not a prompt for the owner to approve.
+  function miniStartedRow(mini) {
+    const el = document.createElement("div");
+    el.className = "chat-mini-started";
+    el.innerHTML = `<span class="mini-dot"></span>`
+      + `<span>Mini session started — <b>${esc(String(mini.goal || ""))}</b></span>`
+      + `<button class="btn small ghost" type="button" data-act="watch">Watch</button>`;
+    el.querySelector('[data-act="watch"]').addEventListener("click", () => watchMini(mini.id));
+    return el;
   }
 
   // The strip above the input: which mini session is working right now.
@@ -1158,17 +1368,25 @@
     const input = $("#chat-input");
     const send = $("#chat-send");
     if (!active) {
-      const last = chat.minis.find((m) => m.status !== "queued" && m.status !== "running");
+      const last = chat.minis.find((m) => isFinalMini(m.status));
       host.className = "chat-mini";
-      host.innerHTML = last ? `<span class="muted">Last mini session: ${esc(last.title || last.goal)} — ${esc(last.status)}</span>` : "";
+      host.innerHTML = last
+        ? `<span class="muted">Last mini session: ${esc(last.title || last.goal)} — ${esc(last.status)}</span>`
+          + `<button class="btn small ghost" type="button" id="mini-last-watch">Watch</button>`
+        : "";
+      const watch = $("#mini-last-watch");
+      if (watch) watch.addEventListener("click", () => watchMini(last.id));
       if (input) input.placeholder = "e.g. who exactly buys this, and what would make them choose a new book?";
       if (send && !send.dataset.busy) send.textContent = "Send";
       return;
     }
     host.className = "chat-mini running";
-    host.innerHTML = `<span class="mini-dot"></span><span class="mini-goal"><strong>Mini session:</strong> ${esc(active.goal)}</span>`
+    host.innerHTML = `<span class="mini-dot"></span>`
+      + `<span class="mini-goal"><strong>Mini session working:</strong> ${esc(active.goal)}</span>`
       + `<span class="chip">${esc(active.status)}</span>`
+      + `<button class="btn small ghost" type="button" id="mini-watch">Watch</button>`
       + `<button class="btn small ghost" type="button" id="mini-cancel">Cancel</button>`;
+    $("#mini-watch").addEventListener("click", () => watchMini(active.id));
     $("#mini-cancel").addEventListener("click", () => cancelMiniSession(active.id));
     if (input) input.placeholder = "Type to guide the mini session — it reads this on its next step…";
   }
@@ -1183,19 +1401,16 @@
     if (!log || !chat) return;
     log.innerHTML = "";
     if (!chat.messages.length) {
-      log.innerHTML = `<div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation.</div>`;
+      log.innerHTML = `<div class="chat-empty">Ask anything about this research — the books, the numbers, the buyers, what to do next. It remembers the conversation. When it needs a live measurement, it goes and takes it.</div>`;
       renderMiniStrip();
       return;
     }
-    // Which proposals already became mini sessions (so a reload does not
-    // re-offer a session that is already running or done).
-    const startedFrom = new Set(
-      chat.minis.map((m) => m.meta && m.meta.proposal_message_id).filter((x) => x != null)
-    );
     for (const m of chat.messages) {
       const ai = m.role !== "owner";
       const row = document.createElement("div");
       row.className = `chat-row ${ai ? "chat-ai" : "chat-owner"}`;
+      const stack = document.createElement("div");
+      stack.className = "chat-stack";
       const bubble = document.createElement("div");
       bubble.className = "chat-bubble";
       if (ai) {
@@ -1203,48 +1418,26 @@
       } else {
         bubble.innerHTML = esc(String(m.text || "")).replace(/\n/g, "<br>");
       }
-      row.appendChild(bubble);
-      const proposal = ai && m.meta && m.meta.proposal;
-      if (proposal) {
-        row.appendChild(chatProposalCard(m, proposal, startedFrom.has(m.id), chat.dismissed.has(m.id)));
+      stack.appendChild(bubble);
+      const meta = m.meta || {};
+      // The answer that decided to go and look: a marker, not a card.
+      if (meta.mini_session && meta.mini_session.id) {
+        stack.appendChild(miniStartedRow(meta.mini_session));
       }
+      // The answer a mini session posted back into the thread.
+      if (meta.mini_session_id) {
+        const done = document.createElement("div");
+        done.className = "chat-mini-result";
+        done.innerHTML = `<span class="mini-dot"></span><span>From a mini session</span>`;
+        stack.appendChild(done);
+      }
+      // The chain of thought behind this answer, on tap.
+      if (ai && meta.thought_id) stack.appendChild(reasoningToggle(meta.thought_id));
+      row.appendChild(stack);
       log.appendChild(row);
     }
     renderMiniStrip();
     scrollChat(log);
-  }
-
-  // A mini session is proposed in the answer, never started behind the owner's
-  // back: this card is the "yes".
-  function chatProposalCard(message, proposal, started, dismissed) {
-    const card = document.createElement("div");
-    card.className = "chat-proposal";
-    const goal = String(proposal.goal || "");
-    const why = String(proposal.why || "");
-    if (started) {
-      card.innerHTML = `<div class="chat-proposal-h">Mini session</div>`
-        + `<div class="chat-proposal-goal">${esc(goal)}</div>`
-        + `<div class="chat-proposal-note">Started — its answer will appear here.</div>`;
-      return card;
-    }
-    if (dismissed) {
-      card.innerHTML = `<div class="chat-proposal-note">Mini session declined.</div>`;
-      return card;
-    }
-    card.innerHTML = `<div class="chat-proposal-h">Proposed mini session</div>`
-      + `<div class="chat-proposal-goal">${esc(goal)}</div>`
-      + (why ? `<div class="chat-proposal-why">${esc(why)}</div>` : "")
-      + `<div class="chat-proposal-actions">`
-      + `<button class="btn small primary" type="button" data-act="start">Start mini session</button>`
-      + `<button class="btn small ghost" type="button" data-act="no">Not now</button></div>`;
-    card.querySelector('[data-act="start"]').addEventListener("click", () => {
-      startMiniSession(goal, goal, message.id);
-    });
-    card.querySelector('[data-act="no"]').addEventListener("click", () => {
-      if (state.chat) state.chat.dismissed.add(message.id);
-      renderChat();
-    });
-    return card;
   }
 
   // ---------- follow-up run (continues the WHOLE previous session) ----------

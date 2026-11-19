@@ -557,20 +557,72 @@ table.rt tr:last-child td { border-bottom: none; }
 .chat-ai .chat-bubble table.rt { font-size: 0.76rem; }
 .chat-thinking .chat-bubble { color: var(--text-3); display: flex; align-items: center; gap: 8px; }
 
-/* a mini session proposed in an answer — the owner's one-tap yes */
-.chat-proposal {
-  margin: 8px 0 0 2px; max-width: min(78ch, 88%); padding: 11px 13px;
-  border: 1px solid rgba(201, 162, 39, 0.45); border-radius: var(--r);
-  background: rgba(201, 162, 39, 0.07);
+/* the answer that sent the analyst off to measure something */
+.chat-stack { display: flex; flex-direction: column; gap: 6px; max-width: min(78ch, 88%); }
+.chat-stack .chat-bubble { max-width: 100%; }
+.chat-mini-started, .chat-mini-result {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 0.74rem; line-height: 1.5; color: var(--text-2);
+  border-left: 2px solid rgba(201, 162, 39, 0.5); padding: 5px 0 5px 9px;
 }
-.chat-proposal-h {
-  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.09em;
-  text-transform: uppercase; color: var(--accent-bright); margin-bottom: 6px;
+.chat-mini-started b { color: var(--text); font-weight: 600; }
+.chat-mini-started .btn { margin-left: auto; }
+.chat-mini-result { color: var(--text-3); }
+
+/* reasoning: the chain of thought behind one answer / one mini-session step */
+.reasoning { margin-top: 4px; }
+.reasoning-head {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: none; border: none; padding: 2px 0; cursor: pointer;
+  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-3);
 }
-.chat-proposal-goal { font-size: 0.84rem; line-height: 1.5; color: var(--text); }
-.chat-proposal-why { font-size: 0.76rem; line-height: 1.5; color: var(--text-3); margin-top: 5px; }
-.chat-proposal-note { font-size: 0.76rem; color: var(--text-3); margin-top: 6px; }
-.chat-proposal-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.reasoning-head:hover { color: var(--accent-bright); }
+.reasoning-caret { display: inline-block; transition: transform 120ms ease; }
+.reasoning-head[aria-expanded="true"] .reasoning-caret { transform: rotate(180deg); }
+.reasoning-body {
+  margin: 6px 0 0; padding: 9px 11px; max-height: 260px; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: var(--mono); font-size: 0.7rem; line-height: 1.5;
+  color: var(--text-3); background: var(--bg-inset);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+
+/* the mini-session monitor, inside the conversation */
+.mini-monitor {
+  border-bottom: 1px solid var(--line); background: var(--bg-inset);
+}
+.mini-monitor-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 14px; font-size: 0.78rem; color: var(--text-2);
+}
+.mini-monitor-head .mm-title { flex: 1; min-width: 12ch; color: var(--text); font-weight: 600; }
+.mini-monitor.running .mini-dot { background: var(--accent-bright); }
+.mini-monitor-body { padding: 0 14px 12px; }
+.mini-monitor .mm-goal { font-size: 0.76rem; line-height: 1.5; color: var(--text-3); margin: 0 0 8px; }
+.mini-live {
+  display: block; width: 100%; max-height: 34vh; object-fit: contain;
+  background: #0b0b0d; border: 1px solid var(--line); border-radius: var(--r);
+  margin: 0 0 8px;
+}
+.mini-steps { display: flex; flex-direction: column; gap: 6px; max-height: 34vh; overflow-y: auto; }
+.mini-step {
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--bg); font-size: 0.76rem; line-height: 1.5;
+}
+.mini-step.bad { border-color: rgba(200, 80, 80, 0.45); }
+.mini-step-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.mini-step-kind {
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-3); flex: none;
+}
+.mini-step-title { flex: 1; min-width: 14ch; color: var(--text); overflow-wrap: anywhere; }
+.mini-step-time { font-family: var(--mono); font-size: 0.6rem; color: var(--text-3); flex: none; }
+.mini-step-sub { margin-top: 4px; color: var(--text-3); font-size: 0.72rem; overflow-wrap: anywhere; }
+.mini-step.owner { border-color: rgba(201, 162, 39, 0.4); }
+.mini-step.owner .mini-step-title { color: var(--accent-bright); }
+.mini-step.answer { border-color: rgba(201, 162, 39, 0.55); }
+.mini-step-empty { padding: 4px 0 2px; font-size: 0.74rem; }
 
 /* the strip above the input while a mini session is working */
 .chat-mini {

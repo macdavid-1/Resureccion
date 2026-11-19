@@ -399,20 +399,15 @@ class MiniSessionService:
         report_id: str,
         goal: str,
         title: str = "",
-        proposal_message_id: int | None = None,
     ) -> MiniSession:
         goal = " ".join(str(goal or "").split())
         if not goal:
             raise ValueError("a mini session needs a goal")
-        meta: dict[str, Any] = {}
-        if proposal_message_id is not None:
-            meta["proposal_message_id"] = int(proposal_message_id)
         mini = self.store.create(
             session_id=session_id,
             report_id=report_id,
             goal=goal,
             title=(title or goal)[:160],
-            meta=meta,
         )
         self._cancel[mini.id] = False
         task = asyncio.create_task(self._run(mini.id))
@@ -426,6 +421,11 @@ class MiniSessionService:
         self.st.events.append(
             session_id, level="info", actor="agent", action="mini_session_started",
             detail={"mini_id": mini.id, "report_id": report_id, "goal": goal[:300]},
+        )
+        self._trace(
+            session_id, "owner",
+            f"Mini session started from the report conversation: {goal}",
+            {"mini_id": mini.id, "report_id": report_id},
         )
         return mini
 
@@ -523,20 +523,36 @@ class MiniSessionService:
                     dossier=dossier, thread=thread, goal=mini.goal,
                     steps=steps, owner_notes=new_owner,
                 )
+                step_number = 1 + sum(1 for s in steps if s.kind == "note")
                 reply = await model.call(
                     session_id,
                     system=MINI_SYSTEM,
                     user=prompt,
-                    label=f"Mini session: {mini.title[:90]}",
+                    label=f"Mini session: {mini.title[:70]} · step {step_number}",
                     max_tokens=int(
                         getattr(self.st.config, "mini_session_max_tokens", 4_000) or 4_000
                     ),
+                    # Live, tool-using work: think harder than a chat answer.
+                    reasoning_effort=getattr(
+                        self.st.config, "mini_session_reasoning_effort", "medium"
+                    ),
                 )
+                thought_id = getattr(reply, "thought_id", None)
                 note, actions, done, answer = parse_reply(
                     getattr(reply, "content", None) or getattr(reply, "raw", None)
                 )
                 if note:
-                    store.add_step(mini_id, kind="note", text=note)
+                    store.add_step(
+                        mini_id, kind="note", text=note,
+                        meta={"thought_id": thought_id} if thought_id else {},
+                    )
+                    # The session monitor reads the thought's one-line summary:
+                    # the model's own note beats a generic label.
+                    if thought_id and getattr(self.st, "thoughts", None) is not None:
+                        try:
+                            self.st.thoughts.summarize(int(thought_id), note)
+                        except Exception:
+                            pass
                 if done:
                     result_text = answer or note or "The mini session finished without an answer."
                     known = {
@@ -546,7 +562,11 @@ class MiniSessionService:
                     linked, cited, dropped = link_citations(result_text, session_id, known)
                     store.add_step(
                         mini_id, kind="answer", text=linked,
-                        meta={"citations": cited, "dropped_citations": dropped},
+                        meta={
+                            "citations": cited,
+                            "dropped_citations": dropped,
+                            **({"thought_id": thought_id} if thought_id else {}),
+                        },
                     )
                     finish = store.get(mini_id)
                     store.update(
@@ -568,11 +588,18 @@ class MiniSessionService:
                             "mini_goal": mini.goal,
                             "citations": cited,
                             "dropped_citations": dropped,
+                            **({"thought_id": thought_id} if thought_id else {}),
                         },
                     )
                     self._event(
                         session_id, "mini_session_finished", mini_id,
                         {"chars": len(linked), "citations": len(cited)},
+                    )
+                    self._trace(
+                        session_id, "discovery",
+                        f"Mini session finished: {mini.goal} — {len(linked)} chars, "
+                        f"{len(cited)} citation(s), answered in the conversation",
+                        {"mini_id": mini_id},
                     )
                     return
                 if not actions:
@@ -591,6 +618,12 @@ class MiniSessionService:
                     )
                     summary = str(getattr(outcome, "summary", "") or "")
                     error = str(getattr(outcome, "error", "") or "")
+                    self._trace(
+                        session_id, "browser",
+                        f"Mini session {item['action']}: "
+                        + (error and f"FAILED — {error}" or summary or "no result"),
+                        {"mini_id": mini_id, "action": item["action"]},
+                    )
                     store.add_step(
                         mini_id,
                         kind="action",
@@ -636,6 +669,19 @@ class MiniSessionService:
                 session_id, level="info", actor="agent", action=action,
                 detail={"mini_id": mini_id, **(detail or {})},
             )
+        except Exception:
+            pass
+
+    def _trace(
+        self, session_id: str, kind: str, text: str, detail: dict | None = None
+    ) -> None:
+        """Put the mini session on the session's own timeline, so a run being
+        watched the normal way shows what it is doing too."""
+        trace = getattr(self.st, "trace", None)
+        if trace is None:
+            return
+        try:
+            trace.record(session_id, kind, text, detail=detail or {})
         except Exception:
             pass
 

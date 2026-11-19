@@ -27,7 +27,7 @@ from app.mini_session import (
     parse_reply,
     render_mini_prompt,
 )
-from app.report_chat import ChatStore, extract_proposal
+from app.report_chat import ChatStore, extract_mini_session
 
 
 def _login(client) -> dict:
@@ -70,17 +70,21 @@ class _FakeExecutor:
 class _ScriptedMiniModel:
     """Replays JSON replies and records every prompt it was given."""
 
-    def __init__(self, replies: list[dict | str]) -> None:
+    def __init__(self, replies: list[dict | str], *, thought_ids: list[int] | None = None) -> None:
         self.replies = list(replies)
         self.prompts: list[str] = []
         self.systems: list[str] = []
         self.labels: list[str] = []
+        self.efforts: list[str | None] = []
+        self.thought_ids = list(thought_ids or [])
 
     async def call(self, session_id, *, system, user, **kw):
         self.prompts.append(user)
         self.systems.append(system)
         self.labels.append(str(kw.get("label") or ""))
+        self.efforts.append(kw.get("reasoning_effort"))
         reply = type("Reply", (), {})()
+        reply.thought_id = self.thought_ids.pop(0) if self.thought_ids else None
         nxt = self.replies.pop(0) if self.replies else {"done": True, "answer": "finished"}
         reply.content = nxt if isinstance(nxt, dict) else None
         reply.raw = nxt if isinstance(nxt, str) else json.dumps(nxt)
@@ -153,68 +157,83 @@ def test_mini_tables_are_versioned(db):
     assert version == 10
 
 
-# ------------------------------------------------------------- the proposal
-def test_extract_proposal_splits_the_answer_and_keeps_the_goal():
+# ------------------------------------------------- the model's own decision
+def test_extract_mini_session_splits_the_answer_and_keeps_the_goal():
     text = (
-        "The record prices it at $8.99 [ev:abc].\n\n"
+        "The record prices it at $8.99 [ev:abc]. I'll check the live price now.\n\n"
         '```mini-session\n{"goal": "Check the current #1 price in the UK",'
-        ' "why": "the price may have moved"}\n```'
+        ' "title": "UK price"}\n```'
     )
-    prose, proposal = extract_proposal(text)
-    assert "```" not in prose and prose.endswith("[ev:abc].")
-    assert proposal["goal"] == "Check the current #1 price in the UK"
-    assert proposal["why"] == "the price may have moved"
+    prose, request = extract_mini_session(text)
+    assert "```" not in prose and prose.endswith("I'll check the live price now.")
+    assert request == {"goal": "Check the current #1 price in the UK", "title": "UK price"}
 
 
-def test_extract_proposal_is_forgiving_but_never_swallows_text():
+def test_extract_mini_session_is_forgiving_but_never_swallows_text():
     # Malformed block: shown, not eaten.
-    prose, proposal = extract_proposal("Answer.\n```mini-session\n{not json}\n```")
-    assert proposal is None and "mini-session" in prose
-    # No goal: no proposal.
-    assert extract_proposal('```mini-session\n{"why": "because"}\n```')[1] is None
+    prose, request = extract_mini_session("Answer.\n```mini-session\n{not json}\n```")
+    assert request is None and "mini-session" in prose
+    # No goal: no session.
+    assert extract_mini_session('```mini-session\n{"why": "because"}\n```')[1] is None
     # A plain answer is untouched.
-    prose, proposal = extract_proposal("Just an answer.")
-    assert (prose, proposal) == ("Just an answer.", None)
+    assert extract_mini_session("Just an answer.") == ("Just an answer.", None)
 
 
-def test_chat_answer_offers_a_mini_session_without_starting_it(mini_setup):
+def test_chat_answer_starts_the_mini_session_it_decided_on(mini_setup):
     client, headers, sid, rid = mini_setup
+    st = client.app.state
+    goal = "Open the #1 grief memoir and read its price"
 
-    class _Proposer(_ScriptedMiniModel):
+    class _Decider:
+        def __init__(self) -> None:
+            self.efforts: list[str | None] = []
+
         async def call(self, session_id, *, system, user, **kw):
+            self.efforts.append(kw.get("reasoning_effort"))
             reply = type("Reply", (), {})()
+            reply.thought_id = None
             reply.raw = (
-                "I can check the live price.\n\n"
-                '```mini-session\n{"goal": "Open the #1 grief memoir and read its price",'
-                ' "why": "to see whether $8.99 is still the ceiling"}\n```'
+                f"I'll look at it now.\n\n```mini-session\n{json.dumps({'goal': goal, 'title': 'price check'})}\n```"
             )
             return reply
 
-    client.app.state.chat_model = _Proposer([])
+    decider = _Decider()
+    st.chat_model = decider
+    st.mini_model = _ScriptedMiniModel([{"done": True, "answer": "Still $8.99."}])
+
     res = client.post(
         f"/api/sessions/{sid}/reports/{rid}/chat",
-        headers=headers, json={"message": "is that price still right?"},
+        headers=headers,
+        json={"message": "is that price still right?"},
     )
     assert res.status_code == 200, res.text
-    answer = res.json()["answer"]
-    assert "mini-session" not in answer["text"], "the block must not reach the bubble"
-    assert answer["meta"]["proposal"]["goal"].startswith("Open the #1 grief memoir")
+    payload = res.json()
+    # The model decided; it did not ask permission.
+    mini_id = payload["mini_session"]["id"]
+    assert payload["mini_session"]["goal"] == goal
+    assert payload["mini_session"]["title"] == "price check"
+    assert "mini-session" not in payload["answer"]["text"], "the block must not reach the bubble"
+    assert payload["answer"]["meta"]["mini_session"]["id"] == mini_id
+    # Chat is shallow work; a mini session thinks harder (medium).
+    assert decider.efforts == ["low"]
 
-    # Nothing ran: a proposal is an offer.
-    listed = client.get(
-        f"/api/sessions/{sid}/reports/{rid}/mini-sessions", headers=headers
-    ).json()["mini_sessions"]
-    assert listed == []
+    body = _wait_for_mini(client, headers, sid, mini_id)
+    assert body["mini_session"]["status"] == "completed", body["mini_session"]["error"]
+    assert "Still $8.99." in body["mini_session"]["result"]
+    assert st.mini_model.efforts and set(st.mini_model.efforts) == {"medium"}
+    # It is in the thread, marked as the mini session's answer.
+    rows = ChatStore(st.db).list(sid, rid)
+    assert rows[-1].meta["mini_session_id"] == mini_id
+    assert [r.role for r in rows] == ["owner", "analyst", "analyst"]
 
 
-# ------------------------------------------------------------ running the work
 def test_mini_session_chooses_its_steps_and_answers_in_the_thread(mini_setup):
     client, headers, sid, rid = mini_setup
     st = client.app.state
     evidence = st.browser_evidence.list(sid, limit=10_000_000)
     cite = evidence[0].id
     chat = ChatStore(st.db)
-    asked = chat.add(sid, rid, role="owner", text="how does it compare now?")
+    chat.add(sid, rid, role="owner", text="how does it compare now?")
     chat.add(sid, rid, role="analyst", text="It sits at $8.99 in a thin field.")
 
     model = _ScriptedMiniModel([
@@ -231,8 +250,7 @@ def test_mini_session_chooses_its_steps_and_answers_in_the_thread(mini_setup):
 
     res = client.post(
         f"/api/sessions/{sid}/reports/{rid}/mini-sessions",
-        headers=headers,
-        json={"goal": "Check whether the #1 book's price moved", "proposal_message_id": asked.id},
+        headers=headers, json={"goal": "Check whether the #1 book's price moved"},
     )
     assert res.status_code == 200, res.text
     mini_id = res.json()["mini_session"]["id"]
@@ -241,8 +259,8 @@ def test_mini_session_chooses_its_steps_and_answers_in_the_thread(mini_setup):
     assert body["mini_session"]["status"] == "completed", body["mini_session"]["error"]
     assert "[ev:" in body["mini_session"]["result"]
     assert f"/api/sessions/{sid}/evidence/{cite}" in body["mini_session"]["result"]
-    assert body["mini_session"]["meta"]["proposal_message_id"] == asked.id
     assert body["mini_session"]["finished_at"]
+    assert set(model.efforts) == {"medium"}
 
     kinds = [s["kind"] for s in body["steps"]]
     assert kinds.count("action") == 2 and kinds[-1] == "answer"
@@ -466,6 +484,63 @@ def test_reply_parsing_is_forgiving():
     assert parse_reply({"answer": "here it is"})[2:] == (True, "here it is")
     # Garbage does not crash the loop.
     assert parse_reply("not json") == ("", [], False, "")
+
+
+def test_reasoning_is_reachable_for_chat_answers_and_mini_steps(mini_setup):
+    """The owner taps "Reasoning" and gets that call's chain of thought."""
+    client, headers, sid, rid = mini_setup
+    st = client.app.state
+    chat_thought = st.thoughts.begin(sid, label="Answering the owner's question about the report")
+    st.thoughts.finish(chat_thought)
+    mini_thought = st.thoughts.begin(sid, label="Mini session: price check · step 1")
+    st.thoughts.finish(mini_thought)
+
+    class _Answerer:
+        async def call(self, session_id, *, system, user, **kw):
+            reply = type("Reply", (), {})()
+            reply.raw = "The record prices it at $8.99."
+            reply.thought_id = chat_thought
+            return reply
+
+    st.chat_model = _Answerer()
+    res = client.post(
+        f"/api/sessions/{sid}/reports/{rid}/chat",
+        headers=headers, json={"message": "what is the price?"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["answer"]["meta"]["thought_id"] == chat_thought
+    detail = client.get(
+        f"/api/sessions/{sid}/thoughts/{chat_thought}", headers=headers
+    )
+    assert detail.status_code == 200
+    assert "detail" in detail.json()["thought"]
+
+    # A mini session's turns carry their own thought ids on the steps, so the
+    # monitor can open the reasoning behind each one.
+    st.mini_model = _ScriptedMiniModel(
+        [
+            {"note": "read the top book", "actions": [{"action": "reload", "args": {}}]},
+            {"note": "settled", "done": True, "answer": "Unchanged."},
+        ],
+        thought_ids=[mini_thought],
+    )
+    res = client.post(
+        f"/api/sessions/{sid}/reports/{rid}/mini-sessions",
+        headers=headers, json={"goal": "check the price"},
+    )
+    body = _wait_for_mini(client, headers, sid, res.json()["mini_session"]["id"])
+    note = next(s for s in body["steps"] if s["kind"] == "note")
+    assert note["meta"]["thought_id"] == mini_thought
+    # The model's own note becomes the thought's one-line summary.
+    thought = st.thoughts.get(mini_thought)
+    assert thought.label == "read the top book"
+    # Reasoning stays owner-only and session-scoped.
+    other = client.post(
+        "/api/sessions", headers=headers, json={"prompt": "other", "mode": "prompt"}
+    ).json()["session"]["id"]
+    assert client.get(
+        f"/api/sessions/{other}/thoughts/{mini_thought}", headers=headers
+    ).status_code == 404
 
 
 def test_render_mini_prompt_carries_record_thread_steps_and_owner_notes():
