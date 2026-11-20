@@ -723,7 +723,7 @@ def _demand_signal_count(evidence_records: list[dict[str, Any]]) -> int:
     for e in evidence_records:
         data = e.get("data") or {}
         kind = e.get("kind", "")
-        if kind == "kdspy_panel":
+        if kind in ("kdspy_panel", "book_scout_scan"):
             continue
         elif kind == "search_results":
             results = data.get("results") or []

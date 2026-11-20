@@ -44,7 +44,9 @@ app/
   marketplace.py      # Marketplace abstraction (18 Amazon domains, explicit/auto plan)
   redact.py           # Secret hygiene: credential-shaped keys never leave the server
   browser_store.py    # Durable auth-state / extension / login-window / evidence stores
-  kdspy.py            # KDSpy Pro Firefox add-on validation + camoufox launch args
+  firefox_addon.py    # Shared Firefox add-on lifecycle (install/validate/launch/state)
+  kdspy.py            # KDSpy Pro Firefox add-on (thin subclass of firefox_addon)
+  book_scout.py       # Scrivy Book Scout add-on: BSR badges on search results + parsing
   browser_manager.py  # Persistent Camoufox (anti-detect Firefox) via Playwright (lifecycle, pages, crashes)
   amazon_auth.py      # Amazon auth state detection + one-shot login window + cookie import
   evidence_capture.py # Structured, redacted page/evidence extraction + screenshots
@@ -77,9 +79,10 @@ $DATA_DIR/
   uploads/<session_id>/...
   exports/<session_id>/...
   reports/<session_id>/...
-  browser_profiles/kdspy/   # PERSISTENT Camoufox profile: cookies, localStorage, KDSpy add-on state
+  browser_profiles/kdspy/   # PERSISTENT Camoufox profile: cookies, localStorage, add-on state
   browser_downloads/
   extensions/kdspy-firefox/ # KDSpy Pro Firefox add-on (one-tap AMO install or XPI upload)
+  extensions/scrivy-book-scout/ # Scrivy Book Scout add-on (BSR on search results)
 ```
 
 Everything under `$DATA_DIR` must be mapped to Hugging Face Spaces persistent storage. `DATA_DIR=/data` is the expected value in the Space.
@@ -156,9 +159,15 @@ shell required, on the preview or on the deployed Space:
    license activation — same persistent profile, so Amazon stays signed in
    while KDSpy activates. (ZIP / folder-file upload remains available as a
    manual fallback.)
-3. Amazon and KDSpy state are shown as status chips in Settings; the research
-   agent pauses safely and waits if a marketplace wall is ever hit mid-run.
-4. **Device relay — your phone's IP (optional but recommended).** Settings →
+3. **Scrivy Book Scout install — one tap.** Settings → Scrivy Book Scout →
+   **Install add-on** downloads the vendor's real package from Mozilla Add-ons
+   (add-on 3038371), validates it, and relaunches the browser with both add-ons
+   loaded. **Verify live** then opens an Amazon book search and reports the
+   measured result (e.g. "7/16 results carry a BSR · Median BSR #22,617") — a
+   green status chip alone is not treated as proof.
+4. Amazon, KDSpy and Book Scout state are shown as status chips in Settings; the
+   research agent pauses safely and waits if a marketplace wall is ever hit mid-run.
+5. **Device relay — your phone's IP (optional but recommended).** Settings →
    Device Relay → **Enable**, copy the token, then run the one-file client on
    your phone (Termux: `pkg install python; pip install nothing — stdlib only`)
    or any always-on home device:
@@ -237,6 +246,18 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
   reCAPTCHA) are clickable (`disable_coop`). The profile generates its
   fingerprint once and caches it under `$DATA_DIR` — the identity is stable
   across restarts, which is itself an anti-detection property.
+- **Scrivy Book Scout** ships as a second Firefox add-on, loaded into the SAME
+  Camoufox at launch: it reads each search result's product page in the
+  background and renders a rank badge under the book, so one search capture
+  yields BSR for the whole page instead of one product visit per book. The
+  `book_scout_scan` action reads only what the add-on rendered (each badge's
+  BSR/sales/revenue, the niche snapshot and its details table) and records it
+  as a third-party **estimate** — it never moves a filter verdict alone. One-tap
+  install from Settings → Scrivy Book Scout → Install add-on; **Verify live**
+  opens a real Amazon book search and reports how many results actually carry a
+  BSR, so "loaded" and "working" are never the same claim. If the add-on is
+  absent or has rendered nothing, the action fails with the reason and the
+  model falls back to `open_product` per book.
 - KDSpy Pro ships as the **Firefox add-on (XPI)**, loaded *natively* by
   Camoufox via its `addons` launch option — KDSpy data is never faked:
   installed from Settings → KDSpy Firefox add-on (one tap from Mozilla

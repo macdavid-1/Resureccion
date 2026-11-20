@@ -1654,6 +1654,7 @@ _KIND_LABELS = {
     "autocomplete_frontier": "buyer-language frontier",
     "demand_language": "buyer language",
     "kdspy_panel": "KDSpy Pro panel (third-party estimate)",
+    "book_scout_scan": "Scrivy Book Scout BSR scan (third-party add-on)",
     "keyword_research": "backend keyword research",
     "category_research": "store category research",
 }

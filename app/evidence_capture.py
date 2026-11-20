@@ -17,7 +17,9 @@ passes through `redact()` (see app/redact.py).
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -197,6 +199,40 @@ class EvidenceCollector:
             marketplace=marketplace,
             kind="kdspy_panel",
             data=panel,
+            screenshot=screenshot,
+        )
+
+    async def capture_book_scout(
+        self,
+        page: Any,
+        *,
+        session_id: str,
+        marketplace: Marketplace,
+        query: str = "",
+        wait_seconds: float = 45.0,
+        screenshot: bool = True,
+    ) -> CapturedEvidence:
+        """Read the Scrivy Book Scout add-on's BSR badges on THIS page.
+
+        Amazon prints BSR only on a product page, so a search-results capture
+        used to have none. Book Scout reads each result's page and injects a
+        badge with BSR (plus its own estimated sales/revenue), and a niche
+        snapshot bar for the page. It fills those in asynchronously, one book
+        at a time, so this waits for badges to settle before reading.
+
+        Nothing is invented: if the add-on is absent or has rendered nothing,
+        this raises and the caller falls back to opening product pages. The
+        stored record keeps the add-on's own strings (`BSR #1,234`) and labels
+        sales/revenue as the add-on's estimates.
+        """
+        data = await read_book_scout(page, wait_seconds=wait_seconds)
+        data["query"] = query or data.get("query") or ""
+        return await self._persist(
+            page,
+            session_id=session_id,
+            marketplace=marketplace,
+            kind="book_scout_scan",
+            data=data,
             screenshot=screenshot,
         )
 
@@ -943,6 +979,131 @@ async def _extract_review_snippets(page: Any, max_items: int = 4) -> list[dict[s
             }
         )
     return out
+
+
+# Read exactly what the Scrivy Book Scout add-on rendered. Selectors are the
+# add-on's own page surface (`.scrivy-badge[data-asin]`, `.scrivy-niche-bar`,
+# its details table). Nothing is computed here: the add-on's strings are kept.
+_BOOK_SCOUT_JS = """
+() => {
+  const txt = (el) => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+  const statList = (root) => Array.from(root.querySelectorAll('.scrivy-stat')).map((s) => ({
+    label: txt(s.querySelector('.scrivy-stat-label')),
+    value: txt(s.querySelector('.scrivy-stat-value')),
+  })).filter((s) => s.label || s.value);
+  const badges = Array.from(document.querySelectorAll('.scrivy-badge[data-asin]')).map((b) => {
+    const card = b.closest('[data-component-type="s-search-result"]');
+    return {
+      asin: b.getAttribute('data-asin') || '',
+      text: txt(b),
+      title: card ? txt(card.querySelector('h2')) : '',
+      stats: statList(b),
+      indie: !!b.querySelector('.scrivy-indie-pill'),
+      unavailable: /(rank unavailable|not analyzed|fetching rank)/i.test(txt(b)),
+    };
+  });
+  const bar = document.querySelector('.scrivy-niche-bar');
+  // The details table is behind the add-on's own "Details" toggle and is
+  // rendered synchronously on click. Expanding it is not a workaround — it is
+  // the page control a person would press to see the same numbers.
+  const detail = bar ? bar.querySelector('.scrivy-niche-detail') : null;
+  if (detail && detail.hidden) {
+    const toggle = bar.querySelector('.scrivy-detail-toggle');
+    if (toggle) { try { toggle.click(); } catch (e) {} }
+  }
+  const rows = Array.from(
+    document.querySelectorAll('.scrivy-niche-detail table.scrivy-table tr[data-asin]')
+  ).map((tr) => {
+    const titleCell = tr.querySelector('.scrivy-td-text');
+    return {
+      asin: tr.getAttribute('data-asin') || '',
+      cells: Array.from(tr.querySelectorAll('td')).map((td) => txt(td)),
+      title: (titleCell && titleCell.getAttribute('title')) || txt(titleCell),
+    };
+  });
+  return {
+    url: location.href,
+    query: (() => { try { return new URL(location.href).searchParams.get('k') || ''; }
+                    catch { return ''; } })(),
+    badges: badges,
+    niche: { text: txt(bar), stats: bar ? statList(bar) : [], rows: rows },
+  };
+}
+"""
+
+
+async def read_book_scout(page: Any, *, wait_seconds: float = 45.0) -> dict[str, Any]:
+    """Read Scrivy Book Scout's rendered data on this page (normalized).
+
+    Public entry point shared by the research action and the owner's live
+    check in Settings. Raises `EvidenceCaptureError` with a precise reason
+    when the add-on is absent or has rendered nothing — never an empty
+    "success" that would read like a measured page.
+    """
+    from app.book_scout import parse_page_payload
+
+    payload = await _extract_book_scout(page, wait_seconds=wait_seconds)
+    if payload is None:
+        raise EvidenceCaptureError(
+            "Scrivy Book Scout is not present on this page — the add-on may "
+            "not be installed/loaded, or this page is not an Amazon book "
+            "search. Open a books search and capture again, or read BSR "
+            "from each product page."
+        )
+    data = parse_page_payload(payload)
+    if not data["badges"] and not (data.get("niche") or {}).get("stats"):
+        raise EvidenceCaptureError(
+            "Scrivy Book Scout rendered no badges on this page yet — no "
+            "analyzed results to read. Scroll the results, wait for the "
+            "badges to fill in, and capture again."
+        )
+    return data
+
+
+async def _extract_book_scout(
+    page: Any, *, wait_seconds: float = 45.0, poll_seconds: float = 1.0
+) -> dict[str, Any] | None:
+    """Read Book Scout's rendered badges, waiting for its async fetches.
+
+    The add-on injects every badge as "Fetching rank…" and fills them in one
+    book at a time (its own concurrency limit), so a single immediate read
+    would capture nothing. Poll until the set of analyzed ASINs stops growing
+    (3 quiet polls) or a badge set is complete, bounded by ``wait_seconds``.
+    Returns None when the add-on never rendered on this page.
+    """
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    quiet = 0
+    last_sig: tuple[str, ...] = ()
+    payload: dict[str, Any] | None = None
+    while True:
+        try:
+            fresh = await page.evaluate(_BOOK_SCOUT_JS)
+        except Exception:
+            return None
+        if not isinstance(fresh, dict):
+            return None
+        payload = fresh
+        badges = [b for b in (fresh.get("badges") or []) if isinstance(b, dict)]
+        if not badges and not (fresh.get("niche") or {}).get("stats"):
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(poll_seconds)
+            continue
+        analyzed = tuple(sorted(
+            str(b.get("asin") or "") for b in badges
+            if [s for s in (b.get("stats") or []) if isinstance(s, dict)]
+        ))
+        pending = any(b.get("unavailable") for b in badges)
+        if analyzed == last_sig:
+            quiet += 1
+        else:
+            quiet = 0
+            last_sig = analyzed
+        if analyzed and not pending and quiet >= 2:
+            return payload
+        if time.monotonic() >= deadline:
+            return payload
+        await asyncio.sleep(poll_seconds)
 
 
 async def _extract_kdspy_panel(page: Any) -> dict[str, Any] | None:

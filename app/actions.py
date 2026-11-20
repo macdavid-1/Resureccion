@@ -662,6 +662,74 @@ class ActionExecutor:
         finally:
             await self.browser.close_page(page)
 
+    async def _do_book_scout_scan(self, session_id: str, args: dict[str, Any]) -> ActionResult:
+        """Read BSR for a whole search results page via Scrivy Book Scout.
+
+        Amazon prints a rank only on a product page, so a search capture used
+        to be rank-blind. The Book Scout add-on reads each result's page and
+        renders the rank under the book; this action opens a search (or reads
+        the page already open, when no query is given) and captures what the
+        add-on rendered — every badge, the niche snapshot and its details
+        table. If the add-on is not loaded it fails precisely, and the model
+        falls back to `open_product` per book.
+        """
+        mkt = self._marketplace_for(args)
+        query = str(args.get("query") or "").strip()
+        url = str(args.get("url") or "").strip()
+        page = None
+        opened = False
+        if url.startswith("http"):
+            page = await self.browser.new_page()
+            page = await self.browser.navigate(page, url)
+            opened = True
+        elif query:
+            # The Books catalogue is where the add-on's BSR badges belong; a
+            # Kindle/all search mixes storefronts whose ranks are not the
+            # print ranks the research is about.
+            page = await self.browser.open_marketplace(
+                mkt, _SEARCH_PATH.format(query=quote_plus(query)) + _DEPARTMENT_PARAM["books"]
+            )
+            opened = True
+        else:
+            page = await self._working_page(session_id)
+        try:
+            if opened:
+                await self._check_auth_wall(page, session_id)
+            captured = await self.collector.capture_book_scout(
+                page,
+                session_id=session_id,
+                marketplace=mkt,
+                query=query,
+                wait_seconds=float(args.get("wait_seconds") or 45.0),
+                screenshot=bool(args.get("screenshot", True)),
+            )
+            counts = (captured.record.data or {}).get("counts") or {}
+            niche = [
+                f"{s.get('label')} {s.get('value')}".strip()
+                for s in ((captured.record.data or {}).get("niche") or {}).get("stats", [])
+                if isinstance(s, dict)
+            ]
+            summary = (
+                f"Book Scout: {counts.get('with_bsr', 0)}/"
+                f"{counts.get('badges', 0)} results carry a BSR"
+                + (f" · {counts.get('unavailable', 0)} unavailable" if counts.get("unavailable") else "")
+                + (f" · niche: {', '.join(niche[:5])}" if niche else "")
+            )
+            return ActionResult(
+                action="book_scout_scan", ok=True, marketplace=mkt.code,
+                url=scrub_url(page.url), evidence_ids=[captured.record.id],
+                summary=summary,
+            )
+        except EvidenceCaptureError as exc:
+            return ActionResult(
+                action="book_scout_scan", ok=False, marketplace=mkt.code,
+                url=scrub_url(page.url), evidence_ids=[],
+                summary="Scrivy Book Scout data not available", error=str(exc),
+            )
+        finally:
+            if opened:
+                await self.browser.close_page(page)
+
     # ------------------------------------------------------- external sources
     async def _open_external(self, url: str) -> Any:
         """Open an allow-listed external page. Deny-by-default on host."""

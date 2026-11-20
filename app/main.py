@@ -13,6 +13,7 @@ from app.amazon_auth import AmazonAuthManager
 from app.artifacts import ArtifactStore
 from app.autonomy import AutonomySupervisor, resume_auth_paused_sessions
 from app.backup import BackupManager
+from app.book_scout import BookScoutManager
 from app.browser import BrowserRegistry
 from app.browser_manager import BrowserManager
 from app.browser_store import (
@@ -113,7 +114,15 @@ def create_app() -> FastAPI:
         app.state.login_windows = LoginWindowStore(db)
         app.state.browser_evidence = BrowserEvidenceStore(db)
         app.state.kdspy = KDSpyManager(config, app.state.extension_states)
-        app.state.browser_manager = BrowserManager(config, app.state.kdspy, app.state.browser_evidence)
+        # Scrivy Book Scout: the add-on that puts each search result's BSR on
+        # the page, so a search capture carries ranks without one page per book.
+        app.state.book_scout = BookScoutManager(config, app.state.extension_states)
+        app.state.browser_manager = BrowserManager(
+            config,
+            app.state.kdspy,
+            app.state.browser_evidence,
+            book_scout=app.state.book_scout,
+        )
         app.state.amazon_auth = AmazonAuthManager(
             config, app.state.browser_manager, app.state.browser_auth, app.state.login_windows
         )
@@ -125,6 +134,7 @@ def create_app() -> FastAPI:
         app.state.interactive.amazon_auth = app.state.amazon_auth
         app.state.kdspy.validate_installation()  # record pre-launch state
         app.state.kdspy.firefox_addon_state()  # record Firefox add-on pre-launch state
+        app.state.book_scout.firefox_addon_state()  # record Book Scout pre-launch state
         app.state.login_windows.expire_stale()
 
         # --- owner-device egress relay ("phone IP" mode) ---------------------

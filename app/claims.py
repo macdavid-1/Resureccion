@@ -74,7 +74,7 @@ EVIDENCE_QUALITY_WEIGHTS: dict[str, float] = {
 # is excluded from evidence-coverage / corroboration math and makes a claim
 # that cites ONLY it "estimate-backed" — i.e. not supported — until deeper
 # research produces a real page capture behind the same fact.
-ESTIMATE_KINDS: frozenset[str] = frozenset({"kdspy_panel"})
+ESTIMATE_KINDS: frozenset[str] = frozenset({"kdspy_panel", "book_scout_scan"})
 
 # Page captures that ARE observations of the live marketplace.
 PAGE_CAPTURE_KINDS: frozenset[str] = frozenset({
@@ -121,7 +121,7 @@ def evidence_quality_from_kind(kind: str) -> str:
     Everything the model asserts without a capture is 'model_inference' by
     construction.
     """
-    if kind == "kdspy_panel":
+    if kind in ("kdspy_panel", "book_scout_scan"):
         return EQ_EXTENSION
     if kind in PAGE_CAPTURE_KINDS:
         return EQ_DIRECT

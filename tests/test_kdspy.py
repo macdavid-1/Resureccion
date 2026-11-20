@@ -93,7 +93,7 @@ def test_unsupported_build_records_honest_runtime_failure(
 
     monkeypatch.setattr(camoufox_engine, "addons_supported", lambda *a, **k: False)
     mgr = browser_manager.BrowserManager(config, kdspy, evidence=None)
-    mgr._validate_kdspy_on_camoufox()
+    mgr._validate_addons_on_camoufox()
 
     state = kdspy.firefox_addon_state_stored()
     assert state.status == EXT_FAILED

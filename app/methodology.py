@@ -285,7 +285,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=(),
         produces=("signal",),
         allowed_actions=(
-            "search_marketplace", "open_category", "autocomplete",
+            "search_marketplace", "book_scout_scan", "open_category", "autocomplete",
             "bestsellers", "new_releases", "related_products",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
@@ -334,7 +334,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("signal", "discovered"),
         produces=("discovered",),
         allowed_actions=(
-            "search_marketplace", "autocomplete", "open_category",
+            "search_marketplace", "book_scout_scan", "autocomplete", "open_category",
             "related_products", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
@@ -367,7 +367,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("discovered", "rejected"),
         allowed_actions=(
-            "search_marketplace",             "open_product", "related_products",
+            "search_marketplace", "book_scout_scan", "open_product", "related_products",
             "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
@@ -444,7 +444,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("discovered", "rejected"),
         allowed_actions=(
-            "search_marketplace", "autocomplete", "kdspy_data",
+            "search_marketplace", "book_scout_scan", "autocomplete", "kdspy_data",
             "open_product", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
@@ -483,7 +483,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("discovered", "rejected"),
         allowed_actions=(
-            "search_marketplace", "open_product", "read_reviews",
+            "search_marketplace", "book_scout_scan", "open_product", "read_reviews",
             "capture_evidence", "record_observation", "wait", "forum_search",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
@@ -509,7 +509,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("discovered",),
         allowed_actions=(
-            "search_marketplace", "open_product", "autocomplete",
+            "search_marketplace", "book_scout_scan", "open_product", "autocomplete",
             "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,
@@ -539,7 +539,7 @@ SPECS: dict[str, PhaseSpec] = {
         consumes=("discovered",),
         produces=("verified", "rejected"),
         allowed_actions=(
-            "search_marketplace", "open_product", "read_reviews",
+            "search_marketplace", "book_scout_scan", "open_product", "read_reviews",
             "kdspy_data", "capture_evidence", "record_observation", "wait",
             *BROWSER_ACTIONS,
             *RECORD_EDIT_ACTIONS,

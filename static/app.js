@@ -2192,9 +2192,10 @@
   // ---------- settings ----------
   async function refreshSettings() {
     try {
-      const [az, kd] = await Promise.all([
+      const [az, kd, bs] = await Promise.all([
         api("/api/browser/auth/amazon").catch(() => null),
         api("/api/browser/extensions/kdspy").catch(() => null),
+        api("/api/browser/extensions/book-scout").catch(() => null),
       ]);
       const setChip = (id, ok, warn) => {
         const c = $(id);
@@ -2274,6 +2275,19 @@
           kdBtn.textContent = "Install from Web Store";
         }
       }
+      if (bs) {
+        const st = bs.firefox_addon?.status || bs.extension?.status;
+        const ok = st === "validated" || st === "installed";
+        const v = bs.firefox_addon?.version || bs.extension?.version;
+        $("#set-bs-state").textContent =
+          st === "validated" ? `Loaded in browser${v ? ` · v${v}` : ""} — BSR appears on search results` :
+          st === "installed" ? "Installed — loads on next browser launch" :
+          st === "failed" ? `Problem: ${bs.firefox_addon?.detail?.error || "invalid add-on"}` :
+          "Not installed — one tap from Mozilla Add-ons";
+        setChip("#set-bs-chip", ok, !!st && !ok);
+        const btn = $("#set-bs-install");
+        if (!btn.disabled) btn.textContent = ok ? "Update add-on" : "Install add-on";
+      }
       try {
         const sys = await api("/api/system");
         const mOk = !!sys.model?.api_key_set;
@@ -2287,6 +2301,66 @@
       const m = await api("/api/methodology");
       $("#set-version").textContent = `${m.title || "9-phase methodology"} · Resurrección`;
     } catch {}
+  }
+
+  // ---------- Scrivy Book Scout: install + live verification ----------
+  // The add-on is the only honest source of BSR on a search results page, so
+  // the settings row offers a one-tap AMO install and a button that actually
+  // opens a search in the real browser and reports what the add-on rendered.
+  function bindBookScout() {
+    const note = $("#set-bs-note");
+    const say = (msg) => { note.hidden = !msg; note.textContent = msg || ""; };
+
+    $("#set-bs-install").addEventListener("click", async () => {
+      const btn = $("#set-bs-install");
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Fetching…';
+      say("Downloading Scrivy Book Scout from Mozilla Add-ons…");
+      try {
+        const res = await fetch("/api/browser/extensions/book-scout/install-amo", {
+          method: "POST", headers: authHeaders(),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        say(`Installed${data.manifest?.version ? ` v${data.manifest.version}` : ""} — the browser restarts to load it.`);
+        await refreshSettings();
+      } catch (err) {
+        say("");
+        toast(err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+    });
+
+    $("#set-bs-verify").addEventListener("click", async () => {
+      const btn = $("#set-bs-verify");
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Checking…';
+      say("Opening a real Amazon book search in the browser — this takes a minute…");
+      try {
+        const res = await fetch("/api/browser/extensions/book-scout/verify", {
+          method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({ query: "grief memoir" }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        const c = data.counts || {};
+        const niche = (data.niche || []).slice(0, 4)
+          .map((s) => `${s.label} ${s.value}`).join(" · ");
+        const first = (data.sample || [])[0];
+        say(`Live: ${c.with_bsr}/${c.badges} results carry a BSR`
+          + (first ? ` — first: ${first.bsr} on ${first.asin}` : "")
+          + (niche ? ` · ${niche}` : ""));
+      } catch (err) {
+        say(`Verification failed: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+    });
   }
 
   function bindKdspyUpload() {
@@ -2432,6 +2506,7 @@
     $("#tb-record").addEventListener("click", toggleRecording);
     rbBind();
     bindKdspyUpload();
+    bindBookScout();
     bindOwnerMessages();
   }
 

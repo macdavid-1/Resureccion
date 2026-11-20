@@ -493,6 +493,7 @@ class BrowserStatus:
     headless: bool
     profile_dir: str
     kdspy_loaded: bool
+    book_scout_loaded: bool
     open_pages: int
     last_launched_at: str | None
     last_activity_at: str | None
@@ -515,6 +516,7 @@ class BrowserStatus:
             "headless": self.headless,
             "profile_dir": self.profile_dir,
             "kdspy_loaded": self.kdspy_loaded,
+            "book_scout_loaded": self.book_scout_loaded,
             "open_pages": self.open_pages,
             "last_launched_at": self.last_launched_at,
             "last_activity_at": self.last_activity_at,
@@ -538,9 +540,13 @@ class BrowserManager:
         kdspy: KDSpyManager,
         evidence: BrowserEvidenceStore,
         relay: Any = None,
+        book_scout: Any = None,
     ) -> None:
         self.config = config
         self.kdspy = kdspy
+        # Scrivy Book Scout (BSR on search results) — optional so a bare
+        # manager (tests, scripts) keeps working; both add-ons load together.
+        self.book_scout = book_scout
         self.evidence = evidence
         self.relay = relay
         self.profile_dir = config.browser_profiles_dir / "kdspy"
@@ -579,6 +585,7 @@ class BrowserManager:
         self._egress_force_direct_reason: str | None = None
         self._crash_count = 0
         self._kdspy_extension_id: str | None = None
+        self._book_scout_extension_id: str | None = None
         self._idle_task: asyncio.Task | None = None
         # Amazon's delivery location is pinned once per launch: the profile is
         # persistent, so later launches normally inherit it, and retrying on
@@ -614,6 +621,7 @@ class BrowserManager:
             headless=self.config.browser_headless,
             profile_dir=str(self.profile_dir),
             kdspy_loaded=self._kdspy_extension_id is not None,
+            book_scout_loaded=self._book_scout_extension_id is not None,
             open_pages=len(self._context.pages) if self.is_running and self._context else 0,
             last_launched_at=_iso_from(self._last_launched),
             last_activity_at=_iso_from(self._last_activity),
@@ -732,7 +740,7 @@ class BrowserManager:
             self._proxy_refusal_last = 0.0
             self._last_launched = time.time()
             self._touch()
-            self._validate_kdspy_on_camoufox()
+            self._validate_addons_on_camoufox()
             self._arm_idle_shutdown()
             return self.status()
 
@@ -748,7 +756,7 @@ class BrowserManager:
         kwargs = camoufox_engine.launch_kwargs(
             self.config,
             relay_addr=relay_addr,
-            addons=self.kdspy.firefox_addon_args(),
+            addons=self._addon_args(),
             egress_mode=self._egress_mode,
         )
         self._camoufox = camoufox_engine.AsyncCamoufox(**kwargs)
@@ -760,10 +768,19 @@ class BrowserManager:
         privacy.apply_context_privacy(self._context)
         self._engine_kind = "camoufox"
 
-    def _validate_kdspy_on_camoufox(self) -> None:
-        """KDSpy state after a camoufox launch.
+    def _addon_args(self) -> list[str]:
+        """Every installed Firefox add-on to load at launch (KDSpy, Book Scout…)."""
+        args = list(self.kdspy.firefox_addon_args())
+        if self.book_scout is not None:
+            for path in self.book_scout.firefox_addon_args():
+                if path not in args:
+                    args.append(path)
+        return args
 
-        The KDSpy Firefox add-on (XPI) loads natively on this engine, so an
+    def _validate_addons_on_camoufox(self) -> None:
+        """Add-on state after a camoufox launch (KDSpy and Scrivy Book Scout).
+
+        Both Firefox add-ons (XPI) load natively on this engine, so an
         installed add-on is validated and recorded — but only when the build
         can actually load add-ons. A stale build silently drops the ``addons``
         config key; recording "validated" there would claim *Loaded in
@@ -771,20 +788,23 @@ class BrowserManager:
         build is incapable, the durable state becomes a precise failure with
         the exact fix command instead of a comfortable lie.
         """
-        if not self.kdspy.firefox_addon_is_configured():
-            return
-        self.kdspy.firefox_addon_state()
-        if camoufox_engine.addons_supported() is False:
-            self.kdspy.record_firefox_runtime_failure(
-                "this Camoufox build cannot load add-ons — run: "
-                "python scripts/camoufox_ensure.py --fetch, then restart the app"
-            )
-            self._kdspy_extension_id = None
-            return
-        self.kdspy.record_firefox_runtime_validated(
-            str(self.kdspy.firefox_addon_path)
-        )
-        self._kdspy_extension_id = "camoufox-addon"
+        for mgr, attr in (
+            (self.kdspy, "_kdspy_extension_id"),
+            (self.book_scout, "_book_scout_extension_id"),
+        ):
+            if mgr is None or not mgr.firefox_addon_is_configured():
+                setattr(self, attr, None)
+                continue
+            mgr.firefox_addon_state()
+            if camoufox_engine.addons_supported() is False:
+                mgr.record_firefox_runtime_failure(
+                    "this Camoufox build cannot load add-ons — run: "
+                    "python scripts/camoufox_ensure.py --fetch, then restart the app"
+                )
+                setattr(self, attr, None)
+                continue
+            mgr.record_firefox_runtime_validated(str(mgr.firefox_addon_path))
+            setattr(self, attr, "camoufox-addon")
 
     async def _teardown_context(self) -> None:
         if self._context is not None:
@@ -809,6 +829,7 @@ class BrowserManager:
                 pass
             self._playwright = None
         self._kdspy_extension_id = None
+        self._book_scout_extension_id = None
 
     async def shutdown(self) -> None:
         """Explicit stop (app shutdown or owner request)."""

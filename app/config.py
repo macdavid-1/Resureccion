@@ -396,6 +396,26 @@ class Config:
         ).expanduser().resolve()
         # One-tap Firefox add-on install: the owner-verified AMO download URL
         # (addons.mozilla.org only). A version bump is just a new URL here.
+        # Scrivy Book Scout (addons.mozilla.org): the add-on that shows each
+        # Amazon search result's BSR, so a search capture can carry ranks
+        # without opening a page per book. Same install/validate/launch path as
+        # KDSpy; loads in the same browser, so both add-ons are available.
+        self.book_scout_firefox_path = Path(
+            os.environ.get(
+                "BOOK_SCOUT_FIREFOX_PATH",
+                str(self.data_dir / "extensions" / "scrivy-book-scout"),
+            )
+        )
+        self.book_scout_amo_url = os.environ.get(
+            "BOOK_SCOUT_AMO_URL",
+            (
+                "https://addons.mozilla.org/firefox/downloads/latest/"
+                "scrivy-book-scout/addon-3038371-latest.xpi"
+            ),
+        ).strip()
+        self.book_scout_expected_min_version = os.environ.get(
+            "BOOK_SCOUT_EXPECTED_MIN_VERSION", "0.1.0"
+        ).strip()
         self.kdspy_amo_url = os.environ.get(
             "KDSPY_AMO_URL",
             "https://addons.mozilla.org/firefox/downloads/file/4802008/kdspy_v5-5.13.56.xpi",

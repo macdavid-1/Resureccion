@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import hmac
 from typing import Any
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from app.amazon_auth import AmazonAuthError, AmazonAuthManager
+from app.book_scout import BookScoutManager
 from app.browser_manager import BrowserManager, BrowserManagerError
 from app.browser_store import BrowserEvidenceStore, LoginWindowStore
 from app.interactive import InteractiveError, InteractiveSessionManager
@@ -53,6 +55,10 @@ def _amazon_auth(request: Request) -> AmazonAuthManager:
 
 def _kdspy(request: Request) -> KDSpyManager:
     return request.app.state.kdspy
+
+
+def _book_scout(request: Request) -> BookScoutManager:
+    return request.app.state.book_scout
 
 
 def _interactive(request: Request) -> InteractiveSessionManager:
@@ -323,6 +329,128 @@ async def kdspy_install_files(
         "manifest": info.to_safe_dict(),
         "extension": mgr.state().to_dict(),
         "note": "restart the browser (or reload the setup browser) to load the extension",
+    }
+
+
+# --------------------------------------------------------------- book scout
+@router.get("/extensions/book-scout")
+async def book_scout_state(request: Request) -> dict:
+    """Scrivy Book Scout (BSR on search results): installed/loaded state."""
+    _auth(request)
+    mgr = _book_scout(request)
+    st = mgr.firefox_addon_state_stored()
+    return {
+        "extension": st.to_dict(),
+        "firefox_addon": st.to_dict(),
+        "engine": request.app.state.config.browser_engine,
+        "amo_url": mgr.amo_url,
+        "addon": mgr.name,
+        "purpose": "BSR for every result on an Amazon book search page",
+    }
+
+
+@router.post("/extensions/book-scout/install-amo")
+async def book_scout_install_amo(request: Request) -> dict:
+    """One-tap install of the real Scrivy Book Scout add-on from AMO."""
+    _auth(request)
+    mgr = _book_scout(request)
+    try:
+        info = await mgr.install_from_amo()
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "source": "mozilla_addons",
+        "manifest": info.to_safe_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        "note": "Scrivy Book Scout installed — loads on the camoufox engine at next launch",
+    }
+
+
+@router.post("/extensions/book-scout/install-xpi")
+async def book_scout_install_xpi(request: Request, file: UploadFile = File(...)) -> dict:
+    _auth(request)
+    mgr = _book_scout(request)
+    data = await file.read()
+    try:
+        info = mgr.install_firefox_xpi(data)
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "manifest": info.to_safe_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+    }
+
+
+@router.delete("/extensions/book-scout")
+async def book_scout_remove(request: Request) -> dict:
+    _auth(request)
+    mgr = _book_scout(request)
+    try:
+        mgr.remove()
+    except KDSpyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    state = mgr.validate_installation()
+    await _maybe_restart_browser(request)
+    return {"removed": True, "extension": state.to_dict()}
+
+
+class BookScoutVerifyRequest(BaseModel):
+    query: str = "grief memoir"
+    wait_seconds: float = Field(default=60.0, ge=5.0, le=180.0)
+
+
+@router.post("/extensions/book-scout/verify")
+async def book_scout_verify(
+    request: Request, body: BookScoutVerifyRequest | None = None
+) -> dict:
+    """Live check: open a real Amazon book search and read the add-on's badges.
+
+    This is the only honest way to answer "is it working" — it launches the
+    browser, loads the add-on and reads what it actually renders. Nothing is
+    cached or inferred: the response carries the counts, a few real badges and
+    the niche snapshot the add-on produced.
+    """
+    _auth(request)
+    req = body or BookScoutVerifyRequest()
+    query = " ".join((req.query or "").split()) or "grief memoir"
+    mgr = _browser(request)
+    from app.evidence_capture import EvidenceCaptureError, read_book_scout
+
+    mkt = get_marketplace("us")
+    page = None
+    try:
+        await mgr.launch()
+        page = await mgr.open_marketplace(
+            mkt, f"/s?k={quote_plus(query)}&i=stripbooks"
+        )
+        data = await read_book_scout(page, wait_seconds=float(req.wait_seconds))
+    except BrowserManagerError as exc:
+        raise HTTPException(status_code=503, detail=f"browser unavailable: {exc}") from exc
+    except EvidenceCaptureError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        if page is not None:
+            try:
+                await mgr.close_page(page)
+            except Exception:
+                pass
+    counts = data.get("counts") or {}
+    sample = [
+        b for b in (data.get("badges") or []) if b.get("bsr")
+    ][:8]
+    return {
+        "ok": True,
+        "query": query,
+        "marketplace": mkt.code,
+        "url": data.get("url"),
+        "counts": counts,
+        "niche": (data.get("niche") or {}).get("stats") or [],
+        "sample": sample,
+        "note": data.get("note"),
     }
 
 
