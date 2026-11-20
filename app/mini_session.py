@@ -68,7 +68,7 @@ ACTIONS YOU CAN RUN (args are plain JSON; marketplace defaults to the run's plan
 - read_reviews {asin, max_reviews?} — real customer reviews, with a screenshot of the review section.
 - related_products {asin, marketplace?} / bestsellers {path?} / new_releases {path?} / open_category {path}
 - kdspy_data {asin?} — KDSpy's own keyword panel for the current page, when the add-on is loaded.
-- book_scout_scan {query?, url?, marketplace?} — Scrivy Book Scout's BSR for a whole search results page (each result's badge + the niche snapshot). Cheaper than opening every book; no query reads the page already open.
+- book_scout_scan {query?, url?, marketplace?} — BSR for a whole search results page: Book Scout's badges + niche snapshot when the add-on is loaded, otherwise each result's product page is fetched in-session and Amazon's printed rank read. Cheaper than opening every book by hand; no query reads the page already open.
 - google_suggest {query} / forum_search {query} / goodreads_check {query} — external demand signals (mid-research only by methodology; free here).
 - capture_evidence {note} — record what is on screen as evidence (a screenshot plus a note).
 - record_observation {content} — note something about the market that has no field of its own.

@@ -28,7 +28,7 @@ from app.marketplace import (
     resolve_plan,
     signin_marketplaces,
 )
-from app.redact import redact
+from app.redact import redact, scrub_url
 from app.routes.deps import require_owner_sync
 from app.security import AuthError
 
@@ -346,18 +346,56 @@ async def book_scout_state(request: Request) -> dict:
         "amo_url": mgr.amo_url,
         "addon": mgr.name,
         "purpose": "BSR for every result on an Amazon book search page",
+        # The vendor package ships in the repo: install needs no account and
+        # no network, which is the path the Settings button takes.
+        "bundled": {
+            "available": mgr.bundled_xpi.is_file(),
+            "path": str(mgr.bundled_xpi),
+        },
+    }
+
+
+@router.post("/extensions/book-scout/install-bundled")
+async def book_scout_install_bundled(request: Request) -> dict:
+    """Install the add-on from the package shipped with the app."""
+    _auth(request)
+    mgr = _book_scout(request)
+    try:
+        info = mgr.install_bundled()
+    except ExtensionInstallError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    await _maybe_restart_browser(request)
+    return {
+        "installed": True,
+        "source": "bundled",
+        "manifest": info.to_safe_dict(),
+        "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        "note": "Scrivy Book Scout installed from the bundled package",
     }
 
 
 @router.post("/extensions/book-scout/install-amo")
 async def book_scout_install_amo(request: Request) -> dict:
-    """One-tap install of the real Scrivy Book Scout add-on from AMO."""
+    """Install/update the add-on from Mozilla Add-ons, falling back to the
+    bundled package when the network is unavailable."""
     _auth(request)
     mgr = _book_scout(request)
     try:
         info = await mgr.install_from_amo()
     except ExtensionInstallError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if not mgr.bundled_xpi.is_file():
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        try:
+            info = mgr.install_bundled()
+        except ExtensionInstallError as exc2:
+            raise HTTPException(status_code=502, detail=f"{exc}; bundled: {exc2}") from exc2
+        await _maybe_restart_browser(request)
+        return {
+            "installed": True,
+            "source": "bundled_fallback",
+            "manifest": info.to_safe_dict(),
+            "firefox_addon": mgr.firefox_addon_state_stored().to_dict(),
+        }
     await _maybe_restart_browser(request)
     return {
         "installed": True,
@@ -418,16 +456,70 @@ async def book_scout_verify(
     req = body or BookScoutVerifyRequest()
     query = " ".join((req.query or "").split()) or "grief memoir"
     mgr = _browser(request)
-    from app.evidence_capture import EvidenceCaptureError, read_book_scout
+    from app.bsr_scan import scan_page_bsr
+    from app.evidence_capture import (
+        EvidenceCaptureError,
+        book_scout_present,
+        read_book_scout,
+    )
 
     mkt = get_marketplace("us")
     page = None
+    counts: dict[str, int] = {}
+    sample: list[dict] = []
+    niche: list[dict] = []
+    source = "addon"
+    note = ""
     try:
         await mgr.launch()
         page = await mgr.open_marketplace(
             mkt, f"/s?k={quote_plus(query)}&i=stripbooks"
         )
-        data = await read_book_scout(page, wait_seconds=float(req.wait_seconds))
+        # The add-on is a convenience, not a requirement: when it is not
+        # running, the same BSR is read from each result's product page in this
+        # same browser session. The response says which path produced it.
+        if await book_scout_present(page):
+            data = await read_book_scout(page, wait_seconds=float(req.wait_seconds))
+            counts = data.get("counts") or {}
+            sample = [b for b in (data.get("badges") or []) if b.get("bsr")][:8]
+            niche = (data.get("niche") or {}).get("stats") or []
+            note = data.get("note") or ""
+            url = data.get("url")
+        else:
+            native = await scan_page_bsr(page, max_items=12)
+            if not native.get("with_bsr"):
+                raise EvidenceCaptureError(
+                    "The add-on is not loaded and Amazon returned no product "
+                    "page for the results"
+                    + (f" ({native.get('blocked')} robot check)" if native.get("blocked") else "")
+                    + " — nothing was measured. Retry once the page loads "
+                    "normally, or install the add-on."
+                )
+            source = "product_pages"
+            counts = {
+                "badges": native["scanned"],
+                "with_bsr": native["with_bsr"],
+                "unavailable": native["failed"],
+                "indie": sum(1 for r in native["rows"] if r.get("indie")),
+            }
+            sample = [
+                {
+                    "asin": r["asin"],
+                    "bsr": f"#{r['rank']:,}" if r.get("rank") else "",
+                    "title": r.get("title") or "",
+                    "category": r.get("category") or "",
+                    "stats": [{"label": "BSR", "value": f"#{r['rank']:,}"}]
+                    if r.get("rank")
+                    else [],
+                }
+                for r in native["rows"]
+                if r.get("rank")
+            ][:8]
+            url = scrub_url(page.url)
+            note = (
+                "Add-on not loaded: these ranks were read from each result's "
+                "own product page (no estimated sales/revenue)."
+            )
     except BrowserManagerError as exc:
         raise HTTPException(status_code=503, detail=f"browser unavailable: {exc}") from exc
     except EvidenceCaptureError as exc:
@@ -438,19 +530,16 @@ async def book_scout_verify(
                 await mgr.close_page(page)
             except Exception:
                 pass
-    counts = data.get("counts") or {}
-    sample = [
-        b for b in (data.get("badges") or []) if b.get("bsr")
-    ][:8]
     return {
         "ok": True,
         "query": query,
         "marketplace": mkt.code,
-        "url": data.get("url"),
+        "source": source,
+        "url": url,
         "counts": counts,
-        "niche": (data.get("niche") or {}).get("stats") or [],
+        "niche": niche,
         "sample": sample,
-        "note": data.get("note"),
+        "note": note,
     }
 
 

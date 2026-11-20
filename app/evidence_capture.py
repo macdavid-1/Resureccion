@@ -236,6 +236,49 @@ class EvidenceCollector:
             screenshot=screenshot,
         )
 
+    async def capture_bsr_scan(
+        self,
+        page: Any,
+        *,
+        session_id: str,
+        marketplace: Marketplace,
+        asins: list[str] | None = None,
+        max_items: int = 16,
+        screenshot: bool = True,
+    ) -> CapturedEvidence:
+        """Read each search result's BSR straight from its product page.
+
+        This is the add-on-free path: the fetches run inside the search page
+        with the profile's own session, exactly like Book Scout's own fetch,
+        and only Amazon's printed rank is recorded — no estimated sales or
+        revenue, because none is read. A wall or a failed fetch is counted as
+        a failure, never as a book without a rank.
+        """
+        from app.bsr_scan import scan_page_bsr
+
+        result = await scan_page_bsr(page, asins=asins, max_items=max_items)
+        if not result["rows"]:
+            raise EvidenceCaptureError(
+                "No search results found to scan — open an Amazon book search "
+                "first, then capture."
+            )
+        if result["with_bsr"] == 0:
+            blocked = result.get("blocked") or 0
+            raise EvidenceCaptureError(
+                "Amazon returned no product page for any result"
+                + (f" ({blocked} robot check{'s' if blocked != 1 else ''})" if blocked else "")
+                + " — the rank could not be read. Retry after the wall clears, "
+                "or open a product page and read the rank directly."
+            )
+        return await self._persist(
+            page,
+            session_id=session_id,
+            marketplace=marketplace,
+            kind="bsr_scan",
+            data=result,
+            screenshot=screenshot,
+        )
+
     async def capture_reviews(
         self,
         page: Any,
@@ -1030,6 +1073,30 @@ _BOOK_SCOUT_JS = """
   };
 }
 """
+
+
+_BOOK_SCOUT_PRESENT_JS = """
+() => !!document.querySelector('.scrivy-badge[data-asin], .scrivy-niche-bar')
+"""
+
+
+async def book_scout_present(page: Any, *, wait_seconds: float = 2.5) -> bool:
+    """Is the Book Scout add-on actually running on this page?
+
+    Checked before paying for a long badge wait: no add-on means the native
+    product-page scan is the right path, not a 45-second timeout ending in an
+    error.
+    """
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while True:
+        try:
+            if await page.evaluate(_BOOK_SCOUT_PRESENT_JS):
+                return True
+        except Exception:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
 
 
 async def read_book_scout(page: Any, *, wait_seconds: float = 45.0) -> dict[str, Any]:

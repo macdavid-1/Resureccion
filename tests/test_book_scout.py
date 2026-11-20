@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -240,6 +241,53 @@ def test_both_addons_load_in_the_same_browser(tmp_path, monkeypatch, db):
     assert mgr.firefox_addon_state_stored().status == "validated"
 
 
+# ------------------------------------------------------- bundled package
+VENDOR_XPI = Path(__file__).resolve().parent.parent / "vendor" / "scrivy-book-scout.xpi"
+
+
+def test_the_vendor_package_ships_with_the_app(tmp_path, monkeypatch, db):
+    """No account, no download, no owner step: the XPI is in the repo."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    from app import config as config_mod
+
+    config_mod.get_config.cache_clear()
+    cfg = Config()
+    cfg.ensure_dirs()
+    mgr = BookScoutManager(cfg, ExtensionStore(db))
+    assert mgr.bundled_xpi.is_file(), "vendor/scrivy-book-scout.xpi must ship in the repo"
+    info = mgr.install_bundled()
+    assert info.version.startswith("0.1.")
+    assert mgr.firefox_addon_state_stored().status in ("installed", "validated")
+    assert mgr.firefox_addon_path.joinpath("content", "amazon.js").is_file()
+
+
+def test_startup_install_is_idempotent_and_quiet_when_already_present(tmp_path, monkeypatch, db):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    from app import config as config_mod
+
+    config_mod.get_config.cache_clear()
+    cfg = Config()
+    cfg.ensure_dirs()
+    mgr = BookScoutManager(cfg, ExtensionStore(db))
+    assert mgr.ensure_installed() is True
+    manifest_file = mgr.firefox_addon_path / "manifest.json"
+    before = manifest_file.stat().st_mtime_ns
+    assert mgr.ensure_installed() is True  # a no-op, not a reinstall
+    assert manifest_file.stat().st_mtime_ns == before
+
+
+def test_startup_install_reports_failure_instead_of_raising(tmp_path, monkeypatch, db):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("BOOK_SCOUT_BUNDLED_XPI", str(tmp_path / "nope.xpi"))
+    from app import config as config_mod
+
+    config_mod.get_config.cache_clear()
+    cfg = Config()
+    cfg.ensure_dirs()
+    mgr = BookScoutManager(cfg, ExtensionStore(db))
+    assert mgr.ensure_installed() is False  # startup must never crash on this
+
+
 # ------------------------------------------------------------------ parsing
 def test_parse_badge_keeps_the_addons_own_strings():
     raw = _badge_payload()["badges"][0]
@@ -439,6 +487,15 @@ def _login(client) -> dict:
     return {"X-Auth-Token": token}
 
 
+def test_the_app_installs_the_bundled_addon_on_boot(api_client) -> None:
+    """No owner step: the shipped package is installed when the app starts."""
+    mgr = api_client.app.state.book_scout
+    state = mgr.firefox_addon_state_stored()
+    assert state.status in ("installed", "validated")
+    assert mgr.firefox_addon_path.joinpath("manifest.json").is_file()
+    assert mgr.firefox_addon_args() == [str(mgr.firefox_addon_path)]
+
+
 def test_book_scout_state_requires_auth(api_client) -> None:
     assert api_client.get("/api/browser/extensions/book-scout").status_code == 401
 
@@ -462,6 +519,22 @@ def test_book_scout_state_and_install_route(api_client) -> None:
     after = api_client.get("/api/browser/extensions/book-scout", headers=headers).json()
     assert after["extension"]["version"] == "0.1.2"
     assert after["extension"]["status"] in ("installed", "validated")
+
+
+def test_install_bundled_route_installs_the_shipped_package(api_client) -> None:
+    headers = _login(api_client)
+    res = api_client.post(
+        "/api/browser/extensions/book-scout/install-bundled", headers=headers
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["source"] == "bundled"
+    assert body["manifest"]["version"].startswith("0.1.")
+    state = api_client.get(
+        "/api/browser/extensions/book-scout", headers=headers
+    ).json()
+    assert state["bundled"]["available"] is True
+    assert state["extension"]["status"] in ("installed", "validated")
 
 
 def test_book_scout_live_verify_route_uses_the_real_browser(api_client) -> None:

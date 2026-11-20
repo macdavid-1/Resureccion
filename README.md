@@ -47,6 +47,8 @@ app/
   firefox_addon.py    # Shared Firefox add-on lifecycle (install/validate/launch/state)
   kdspy.py            # KDSpy Pro Firefox add-on (thin subclass of firefox_addon)
   book_scout.py       # Scrivy Book Scout add-on: BSR badges on search results + parsing
+  bsr_scan.py         # BSR without the add-on: in-page /dp/<asin> reads + rank parsing
+vendor/scrivy-book-scout.xpi  # AMO-signed add-on shipped with the app (installed on first boot)
   browser_manager.py  # Persistent Camoufox (anti-detect Firefox) via Playwright (lifecycle, pages, crashes)
   amazon_auth.py      # Amazon auth state detection + one-shot login window + cookie import
   evidence_capture.py # Structured, redacted page/evidence extraction + screenshots
@@ -159,11 +161,16 @@ shell required, on the preview or on the deployed Space:
    license activation — same persistent profile, so Amazon stays signed in
    while KDSpy activates. (ZIP / folder-file upload remains available as a
    manual fallback.)
-3. **Scrivy Book Scout install — one tap.** Settings → Scrivy Book Scout →
-   **Install add-on** downloads the vendor's real package from Mozilla Add-ons
-   (add-on 3038371), validates it, and relaunches the browser with both add-ons
-   loaded. **Verify live** then opens an Amazon book search and reports the
-   measured result (e.g. "7/16 results carry a BSR · Median BSR #22,617") — a
+3. **Scrivy Book Scout (optional).** BSR capture already works without it: the
+   scan reads each result's product page in the browser session and parses
+   Amazon's printed rank. Installing it adds instant badges, estimated
+   sales/revenue and the niche snapshot — Settings → Scrivy Book Scout →
+   **Install add-on** installs the AMO-signed package that ships in the repo
+   (`vendor/scrivy-book-scout.xpi`, also installed automatically on first boot —
+   no account, no download, works offline; Mozilla Add-ons remains the update
+   path), validates it and relaunches the browser. **Verify live**
+   then opens an Amazon book search and reports which path answered and the
+   measured result (e.g. "14/16 results carry a BSR · best #1,443: Books") — a
    green status chip alone is not treated as proof.
 4. Amazon, KDSpy and Book Scout state are shown as status chips in Settings; the
    research agent pauses safely and waits if a marketplace wall is ever hit mid-run.
@@ -246,18 +253,27 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
   reCAPTCHA) are clickable (`disable_coop`). The profile generates its
   fingerprint once and caches it under `$DATA_DIR` — the identity is stable
   across restarts, which is itself an anti-detection property.
-- **Scrivy Book Scout** ships as a second Firefox add-on, loaded into the SAME
-  Camoufox at launch: it reads each search result's product page in the
-  background and renders a rank badge under the book, so one search capture
-  yields BSR for the whole page instead of one product visit per book. The
-  `book_scout_scan` action reads only what the add-on rendered (each badge's
-  BSR/sales/revenue, the niche snapshot and its details table) and records it
-  as a third-party **estimate** — it never moves a filter verdict alone. One-tap
-  install from Settings → Scrivy Book Scout → Install add-on; **Verify live**
-  opens a real Amazon book search and reports how many results actually carry a
-  BSR, so "loaded" and "working" are never the same claim. If the add-on is
-  absent or has rendered nothing, the action fails with the reason and the
-  model falls back to `open_product` per book.
+- **BSR for a whole search page — with or without an add-on.** Amazon prints a
+  book's rank only on its product page, so a search capture used to be
+  rank-blind. Two paths close that gap, and the capability does not depend on
+  any extension being installed:
+  - *Native* (`app/bsr_scan.py`, always available): from the search page, fetch
+    each result's `/dp/<asin>` inside the browser (same origin, the profile's
+    own Amazon session — the add-on's own trick), and parse the printed rank +
+    category chain with the add-on's patterns (US + localized). Two at a time
+    with human pacing; the **first** wall is retried once, four walls in a row
+    stop the scan (nothing is gained by hammering), and a failed fetch is
+    recorded as a failure — never as a book without a rank. Stored as
+    `bsr_scan`, an ordinary page observation.
+  - *Add-on* (`app/book_scout.py`): if Scrivy Book Scout is loaded, its badges
+    answer instantly for the whole page — BSR plus the add-on's estimated
+    sales/revenue, an Indie pill, a niche snapshot and details table. That is
+    recorded as `book_scout_scan`, a third-party **estimate** that can never
+    move a filter verdict alone.
+  One action covers both (`book_scout_scan`); `Verify live` in Settings opens a
+  real Amazon book search and reports which path answered and how many results
+  actually carry a BSR, so "installed" and "working" are never the same claim.
+  The add-on is a convenience, not a requirement — Settings says so.
 - KDSpy Pro ships as the **Firefox add-on (XPI)**, loaded *natively* by
   Camoufox via its `addons` launch option — KDSpy data is never faked:
   installed from Settings → KDSpy Firefox add-on (one tap from Mozilla

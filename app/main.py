@@ -134,7 +134,11 @@ def create_app() -> FastAPI:
         app.state.interactive.amazon_auth = app.state.amazon_auth
         app.state.kdspy.validate_installation()  # record pre-launch state
         app.state.kdspy.firefox_addon_state()  # record Firefox add-on pre-launch state
-        app.state.book_scout.firefox_addon_state()  # record Book Scout pre-launch state
+        # Book Scout ships with the app (vendor/scrivy-book-scout.xpi): install
+        # it from the bundled, AMO-signed package on first boot so the add-on
+        # needs no account, no download and no owner step. A no-op once present.
+        app.state.book_scout.ensure_installed()
+        app.state.book_scout.firefox_addon_state()  # record Book Scout state
         app.state.login_windows.expire_stale()
 
         # --- owner-device egress relay ("phone IP" mode) ---------------------

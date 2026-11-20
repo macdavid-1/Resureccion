@@ -416,6 +416,15 @@ class Config:
         self.book_scout_expected_min_version = os.environ.get(
             "BOOK_SCOUT_EXPECTED_MIN_VERSION", "0.1.0"
         ).strip()
+        # The vendor package ships WITH the repo (it needs no account), so the
+        # add-on installs offline and deterministically — the AMO URL above is
+        # only the update path when someone asks for a newer build.
+        self.book_scout_bundled_xpi = Path(
+            os.environ.get(
+                "BOOK_SCOUT_BUNDLED_XPI",
+                str(Path(__file__).resolve().parent.parent / "vendor" / "scrivy-book-scout.xpi"),
+            )
+        ).expanduser()
         self.kdspy_amo_url = os.environ.get(
             "KDSPY_AMO_URL",
             "https://addons.mozilla.org/firefox/downloads/file/4802008/kdspy_v5-5.13.56.xpi",

@@ -201,7 +201,8 @@ evidence exists.
 | `KDSPY_FIREFOX_PATH` | no | `$DATA_DIR/extensions/kdspy-firefox` | Extracted KDSpy Firefox add-on lives here (installed via Settings — one-tap from Mozilla Add-ons or manual XPI upload; loaded natively by the camoufox engine) |
 | `KDSPY_AMO_URL` | no | The verified KDSpy v5.13.56 download on addons.mozilla.org | One-tap Firefox add-on install source. Must be an `https://addons.mozilla.org/…​.xpi` URL (enforced in code); a version bump is just a new URL here |
 | `KDSPY_MIN_VERSION` | no | — | Optional minimum version enforcement |
-| `BOOK_SCOUT_FIREFOX_PATH` | no | `$DATA_DIR/extensions/scrivy-book-scout` | Scrivy Book Scout add-on (BSR on Amazon search results) — installed from Settings, loaded natively beside KDSpy |
+| `BOOK_SCOUT_BUNDLED_XPI` | no | `vendor/scrivy-book-scout.xpi` | The AMO-signed package shipped in the repo. Installed automatically on first boot and by Settings → Install add-on, so no account or download is needed (works offline) |
+| `BOOK_SCOUT_FIREFOX_PATH` | no | `$DATA_DIR/extensions/scrivy-book-scout` | Where the Scrivy Book Scout add-on is extracted (BSR on Amazon search results), loaded natively beside KDSpy |
 | `BOOK_SCOUT_AMO_URL` | no | Scrivy Book Scout 0.1.x on addons.mozilla.org | One-tap install source. Must be an `https://addons.mozilla.org/…​.xpi` URL (enforced in code) |
 | `BOOK_SCOUT_EXPECTED_MIN_VERSION` | no | `0.1.0` | Refuse a package below this version (the add-on's DOM contract is what the capture reads) |
 | `BROWSER_LOGIN_WINDOW_SECONDS` | no | `900` | Interactive browser session TTL (Amazon sign-in / KDSpy setup from the phone). Hard-capped at 2700s |

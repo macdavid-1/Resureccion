@@ -2283,7 +2283,7 @@
           st === "validated" ? `Loaded in browser${v ? ` · v${v}` : ""} — BSR appears on search results` :
           st === "installed" ? "Installed — loads on next browser launch" :
           st === "failed" ? `Problem: ${bs.firefox_addon?.detail?.error || "invalid add-on"}` :
-          "Not installed — one tap from Mozilla Add-ons";
+          "Optional — BSR capture works without it (each result's product page is read directly)";
         setChip("#set-bs-chip", ok, !!st && !ok);
         const btn = $("#set-bs-install");
         if (!btn.disabled) btn.textContent = ok ? "Update add-on" : "Install add-on";
@@ -2316,9 +2316,9 @@
       const label = btn.textContent;
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Fetching…';
-      say("Downloading Scrivy Book Scout from Mozilla Add-ons…");
+      say("Installing Scrivy Book Scout from the bundled package…");
       try {
-        const res = await fetch("/api/browser/extensions/book-scout/install-amo", {
+        const res = await fetch("/api/browser/extensions/book-scout/install-bundled", {
           method: "POST", headers: authHeaders(),
         });
         const data = await res.json().catch(() => ({}));
@@ -2351,8 +2351,9 @@
         const niche = (data.niche || []).slice(0, 4)
           .map((s) => `${s.label} ${s.value}`).join(" · ");
         const first = (data.sample || [])[0];
-        say(`Live: ${c.with_bsr}/${c.badges} results carry a BSR`
-          + (first ? ` — first: ${first.bsr} on ${first.asin}` : "")
+        const via = data.source === "addon" ? "add-on" : "product pages (no add-on needed)";
+        say(`Live via ${via}: ${c.with_bsr}/${c.badges} results carry a BSR`
+          + (first ? ` — first: ${first.bsr} on ${first.asin}${first.category ? ` (${first.category})` : ""}` : "")
           + (niche ? ` · ${niche}` : ""));
       } catch (err) {
         say(`Verification failed: ${err.message}`);

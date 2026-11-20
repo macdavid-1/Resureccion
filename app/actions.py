@@ -36,7 +36,11 @@ from app.browser_manager import (
     BrowserManagerError,
 )
 from app.events import EventLog
-from app.evidence_capture import EvidenceCaptureError, EvidenceCollector
+from app.evidence_capture import (
+    EvidenceCaptureError,
+    EvidenceCollector,
+    book_scout_present,
+)
 from app.frontier import ALIAS, SUGGEST_JS, mid_for
 from app.marketplace import (
     AMAZON_MARKETPLACES,
@@ -670,8 +674,11 @@ class ActionExecutor:
         renders the rank under the book; this action opens a search (or reads
         the page already open, when no query is given) and captures what the
         add-on rendered — every badge, the niche snapshot and its details
-        table. If the add-on is not loaded it fails precisely, and the model
-        falls back to `open_product` per book.
+        table. Without the add-on the same ranks are read natively: each result's
+        `/dp/<asin>` is fetched from the search page itself (same session, the
+        add-on's own trick) and the printed rank parsed — so this action works
+        with nothing installed. Only Amazon's own ranks are recorded on that
+        path; the add-on's sales/revenue estimates are not.
         """
         mkt = self._marketplace_for(args)
         query = str(args.get("query") or "").strip()
@@ -695,25 +702,53 @@ class ActionExecutor:
         try:
             if opened:
                 await self._check_auth_wall(page, session_id)
-            captured = await self.collector.capture_book_scout(
+            # Add-on first (instant badges + its own sales/revenue estimates),
+            # then the add-on-free path: fetch each result's product page in
+            # this same browser session and read Amazon's printed rank. The
+            # capability does not depend on the add-on being installed.
+            if await book_scout_present(page):
+                captured = await self.collector.capture_book_scout(
+                    page,
+                    session_id=session_id,
+                    marketplace=mkt,
+                    query=query,
+                    wait_seconds=float(args.get("wait_seconds") or 45.0),
+                    screenshot=bool(args.get("screenshot", True)),
+                )
+                counts = (captured.record.data or {}).get("counts") or {}
+                niche = [
+                    f"{s.get('label')} {s.get('value')}".strip()
+                    for s in ((captured.record.data or {}).get("niche") or {}).get("stats", [])
+                    if isinstance(s, dict)
+                ]
+                summary = (
+                    f"Book Scout: {counts.get('with_bsr', 0)}/"
+                    f"{counts.get('badges', 0)} results carry a BSR"
+                    + (f" · {counts.get('unavailable', 0)} unavailable" if counts.get("unavailable") else "")
+                    + (f" · niche: {', '.join(niche[:5])}" if niche else "")
+                )
+                return ActionResult(
+                    action="book_scout_scan", ok=True, marketplace=mkt.code,
+                    url=scrub_url(page.url), evidence_ids=[captured.record.id],
+                    summary=summary,
+                )
+            captured = await self.collector.capture_bsr_scan(
                 page,
                 session_id=session_id,
                 marketplace=mkt,
-                query=query,
-                wait_seconds=float(args.get("wait_seconds") or 45.0),
+                max_items=int(args.get("max_items") or 16),
                 screenshot=bool(args.get("screenshot", True)),
             )
-            counts = (captured.record.data or {}).get("counts") or {}
-            niche = [
-                f"{s.get('label')} {s.get('value')}".strip()
-                for s in ((captured.record.data or {}).get("niche") or {}).get("stats", [])
-                if isinstance(s, dict)
-            ]
+            result = captured.record.data or {}
+            best = min(
+                (r for r in result.get("rows") or [] if r.get("rank")),
+                key=lambda r: r.get("rank") or 0,
+                default=None,
+            )
             summary = (
-                f"Book Scout: {counts.get('with_bsr', 0)}/"
-                f"{counts.get('badges', 0)} results carry a BSR"
-                + (f" · {counts.get('unavailable', 0)} unavailable" if counts.get("unavailable") else "")
-                + (f" · niche: {', '.join(niche[:5])}" if niche else "")
+                f"BSR scan (add-on not loaded — read each product page): "
+                f"{result.get('with_bsr', 0)}/{result.get('scanned', 0)} results carry a BSR"
+                + (f" · best #{best['rank']:,}: {best.get('category')}" if best else "")
             )
             return ActionResult(
                 action="book_scout_scan", ok=True, marketplace=mkt.code,

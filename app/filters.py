@@ -725,6 +725,10 @@ def _demand_signal_count(evidence_records: list[dict[str, Any]]) -> int:
         kind = e.get("kind", "")
         if kind in ("kdspy_panel", "book_scout_scan"):
             continue
+        elif kind == "bsr_scan":
+            # Amazon's own printed ranks, read from the product pages.
+            if any(r.get("rank") for r in data.get("rows") or []):
+                signals += 1
         elif kind == "search_results":
             results = data.get("results") or []
             if any((r.get("review_count") or 0) > 0 for r in results):

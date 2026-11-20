@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
-from app.browser_store import ExtensionStore
+from app.browser_store import EXT_INSTALLED, EXT_VALIDATED, ExtensionStore
 from app.config import Config
-from app.firefox_addon import FirefoxAddonManager
+from app.firefox_addon import ExtensionInstallError, FirefoxAddonManager
 
 # Durable state row name and on-disk directory for the add-on.
 BOOK_SCOUT_ADDON_NAME = "scrivy-book-scout"
@@ -57,6 +58,47 @@ class BookScoutManager(FirefoxAddonManager):
             min_version=lambda: config.book_scout_expected_min_version,
             amo_url=lambda: config.book_scout_amo_url,
         )
+
+    # ------------------------------------------------------ bundled package
+    @property
+    def bundled_xpi(self) -> Path:
+        """The vendor package shipped in the repo (no account, no network)."""
+        return Path(self.config.book_scout_bundled_xpi)
+
+    def install_bundled(self) -> Any:
+        """Install the add-on from the vendored, AMO-signed package.
+
+        Same validation path as an upload or an AMO download — the bytes are
+        just already on disk, so the feature works in an offline deploy and
+        the owner never has to fetch or upload anything.
+        """
+        path = self.bundled_xpi
+        if not path.is_file():
+            raise ExtensionInstallError(
+                f"the bundled Book Scout package is missing at {path} — "
+                "reinstall from Mozilla Add-ons instead"
+            )
+        return self.install_firefox_xpi(path.read_bytes())
+
+    def ensure_installed(self) -> bool:
+        """Install the bundled package unless this browser already has it.
+
+        Called at startup: the add-on ships with the app, so "install the
+        extension first" is not a setup step the owner can forget. Never
+        raises — a failure is recorded in the add-on state (Settings shows it)
+        and the capture still fails precisely at research time.
+        """
+        try:
+            state = self.validate_installation()
+        except Exception:
+            state = None
+        if state is not None and state.status in (EXT_VALIDATED, EXT_INSTALLED):
+            return True
+        try:
+            self.install_bundled()
+            return True
+        except Exception:
+            return False
 
 
 # --------------------------------------------------------------------- parse
