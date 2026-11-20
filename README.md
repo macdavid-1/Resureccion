@@ -317,6 +317,20 @@ it probes *through* the finished proxy and pinpoints 407 (auth) vs 502
   (search, open category/product, reviews, related, autocomplete, bestsellers,
   new releases, KDSpy reads, capture, observe, wait); the backend validates
   everything against the phase contract before executing.
+- **Cheap steps, one expensive commitment** — a step has two shapes: an
+  *explore* step returns browser actions and a one-line note, and a *commit*
+  step writes the phase's analysis once. The output contract is required only
+  on the commit, so a long phase no longer rewrites its entire findings
+  document on every step (that rewrite was the reason output tokens ran to
+  tens of millions while input stayed flat). Cut-off answers are retried once
+  with a shorter-answer instruction and a 32k ceiling instead of doubling to
+  64k.
+- **Honest token accounting** — usage is recorded per call (the reply carries
+  its own counts, added exactly once to the session's durable total), so a
+  resumed run cannot re-add totals it already stored. Every model call logs
+  its prompt/completion counts and the cap it was given, and a provider
+  reporting more output than the request allowed raises
+  `model_usage_over_limit` instead of quietly inflating the total.
 - **Depth over speed**: priority order is integrity > evidence > depth >
   opportunity quality > breadth > efficiency > speed. Sessions pause durably
   (never corrupt) on auth walls, model failures, or browser crashes, and are

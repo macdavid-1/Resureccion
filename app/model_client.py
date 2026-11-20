@@ -54,7 +54,10 @@ MAX_REFERENCE_IMAGES_PARTS = 6
 # opportunity dossiers) and adversarial verdict tables are the calls most
 # likely to outgrow the configured limit, and losing them to truncation at
 # the very end of a long run is exactly what this prevents.
-MAX_TOKENS_CEILING = 65_536
+# A JSON analysis step that needs more than this is not going to produce a
+# usable answer by being given more rope: retrying with 65k made one call cost
+# tens of thousands of reasoning tokens for output that was then thrown away.
+MAX_TOKENS_CEILING = 32_768
 
 
 class ModelConfigError(Exception):
@@ -177,6 +180,9 @@ class ModelUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    # Calls whose reported completion count exceeded the tokens the request
+    # allowed (see `ModelClient.call`). Diagnostic, never an estimate.
+    implausible_calls: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -185,6 +191,7 @@ class ModelUsage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "cost_usd": round(self.cost_usd, 6),
+            "implausible_calls": self.implausible_calls,
         }
 
 
@@ -192,7 +199,13 @@ class ModelUsage:
 class ModelReply:
     content: dict[str, Any]
     raw: str
+    # Cumulative totals for this client (the whole run). Kept for callers that
+    # predate per-call accounting.
     usage: ModelUsage
+    # THIS call's own usage. Durable accounting must add this exactly once;
+    # adding the cumulative total to a stored snapshot double-counts as soon as
+    # the snapshot and the client disagree about where the run starts.
+    call_usage: ModelUsage
     model: str
     elapsed_seconds: float
     # The owner-visible thought this call opened (None when no store is
@@ -401,8 +414,22 @@ class ModelClient:
                     and int(payload.get("max_tokens") or 0) < MAX_TOKENS_CEILING
                 ):
                     previous = int(payload.get("max_tokens") or 0)
+                    messages = list(payload.get("messages") or [])
+                    if messages and isinstance(messages[0], dict):
+                        # More room is not the only lever: a reasoner that ran
+                        # out of window was also told to be briefer, so the
+                        # retry does not simply burn the larger budget too.
+                        messages[0] = {
+                            **messages[0],
+                            "content": str(messages[0].get("content") or "")
+                            + "\n\nIMPORTANT: your previous answer was cut off by the "
+                            "token limit. Answer the same request again, complete "
+                            "but decisively SHORTER: no restating of inputs, no "
+                            "repetition, only the required JSON.",
+                        }
                     payload = {
                         **payload,
+                        "messages": messages,
                         "max_tokens": min(previous * 2, MAX_TOKENS_CEILING),
                     }
                     if self.events is not None:
@@ -445,10 +472,36 @@ class ModelClient:
                     raise ModelError("model returned empty content")
                 content = {} if text_mode else _extract_json(raw)
                 usage = data.get("usage") or {}
+                prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                completion_tokens = int(usage.get("completion_tokens") or 0)
+                cost_usd = float(usage.get("cost") or 0.0)
                 self.usage.calls += 1
-                self.usage.prompt_tokens += int(usage.get("prompt_tokens") or 0)
-                self.usage.completion_tokens += int(usage.get("completion_tokens") or 0)
-                self.usage.cost_usd += float(usage.get("cost") or 0.0)
+                self.usage.prompt_tokens += prompt_tokens
+                self.usage.completion_tokens += completion_tokens
+                self.usage.cost_usd += cost_usd
+                call_usage = ModelUsage(
+                    calls=1,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cost_usd=cost_usd,
+                )
+                # A call cannot legitimately answer with more tokens than it was
+                # allowed to generate. When a provider reports that anyway, the
+                # owner sees it in the log instead of watching a number explode
+                # with no explanation.
+                allowed = int(payload.get("max_tokens") or 0)
+                if allowed and completion_tokens > allowed:
+                    self.usage.implausible_calls += 1
+                    if self.events is not None:
+                        self.events.append(
+                            session_id, level="warn", actor="model",
+                            action="model_usage_over_limit",
+                            detail={
+                                "completion_tokens": completion_tokens,
+                                "max_tokens": allowed,
+                                "label": label[:120],
+                            },
+                        )
                 elapsed = time.monotonic() - started
                 # Field contracts apply to JSON replies only: a text deliverable
                 # (the report) has no fields to check.
@@ -473,7 +526,13 @@ class ModelClient:
                             "model": self._model,
                             "attempt": attempt,
                             "elapsed_seconds": round(elapsed, 1),
-                            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                            "prompt_tokens": prompt_tokens,
+                            # Output is the number that must be visible when it
+                            # runs away: per call, with the cap it was given and
+                            # which call it was (label names the phase/step).
+                            "completion_tokens": completion_tokens,
+                            "max_tokens": int(payload.get("max_tokens") or 0),
+                            "label": label[:120],
                         },
                     )
                 self._finish_thought(thought_id, status=STATUS_DONE)
@@ -481,6 +540,7 @@ class ModelClient:
                     content=content,
                     raw=raw,
                     usage=self.usage,
+                    call_usage=call_usage,
                     model=self._model,
                     elapsed_seconds=elapsed,
                     thought_id=thought_id,

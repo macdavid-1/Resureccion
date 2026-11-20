@@ -456,6 +456,9 @@ class ResearchRunner:
         # Per-session all-time usage (prior runs merged on resume) — see
         # _record_model_usage.
         self._usage_prior: dict[str, dict] = {}
+        # Last cumulative `usage` seen per session, for legacy reply shapes
+        # that carry no per-call counts (see _record_model_usage).
+        self._usage_prior_seen: dict[str, tuple[int, int, int, float]] = {}
         # Deep-discovery layers (deterministic, durable, session-scoped):
         # whitespace scores, cross-session market memory, the adjacency log.
         self._ws_scores: dict[str, dict[str, WhitespaceScore]] = {}
@@ -690,19 +693,51 @@ class ResearchRunner:
         return stored
 
     def _record_model_usage(self, session_id: str, reply: Any) -> None:
-        """Checkpoint this session's cumulative token/cost usage (durable).
+        """Add ONE call's usage to this session's durable totals.
 
-        `reply.usage` is the ModelClient's cumulative totals for the current
-        run (the registry builds a fresh client per run); totals from PRIOR
-        runs of the same session (crash/resume) are re-loaded from the
-        checkpoint once and added, so the checkpoint always holds the
-        session's all-time spend. This feeds the session detail endpoint so
-        the owner can see what research costs. Accounting never breaks
-        research — any failure here is swallowed.
+        The unit of accounting is the call, not the client. `reply.call_usage`
+        is this call's own counts and is added exactly once to a running total
+        that starts from the checkpoint; that is what the session detail shows
+        the owner. (The previous version added the client's CUMULATIVE total to
+        a stored snapshot on every call — correct only while both sides agree
+        on the starting point, and silently multiplied the moment a resumed
+        run, a re-prompt or a rebuilt client disagreed. Output counts in
+        particular ran away.)
+
+        Accounting never breaks research — any failure here is swallowed.
         """
-        u = getattr(reply, "usage", None)
-        if u is None:
-            return
+        u = getattr(reply, "call_usage", None)
+        delta = None
+        if u is not None:
+            delta = {
+                "calls": int(getattr(u, "calls", 0)),
+                "failed_calls": int(getattr(u, "failed_calls", 0)),
+                "prompt_tokens": int(getattr(u, "prompt_tokens", 0)),
+                "completion_tokens": int(getattr(u, "completion_tokens", 0)),
+                "cost_usd": float(getattr(u, "cost_usd", 0.0)),
+            }
+        else:
+            # Legacy reply shapes (test doubles, older callers): treat the
+            # cumulative usage as a delta ONLY once per object identity.
+            cumulative = getattr(reply, "usage", None)
+            if cumulative is None:
+                return
+            last = self._usage_prior_seen.get(session_id)
+            current = (
+                int(getattr(cumulative, "calls", 0)),
+                int(getattr(cumulative, "prompt_tokens", 0)),
+                int(getattr(cumulative, "completion_tokens", 0)),
+                float(getattr(cumulative, "cost_usd", 0.0)),
+            )
+            prev = last or (0, 0, 0, 0.0)
+            self._usage_prior_seen[session_id] = current
+            delta = {
+                "calls": max(0, current[0] - prev[0]),
+                "failed_calls": 0,
+                "prompt_tokens": max(0, current[1] - prev[1]),
+                "completion_tokens": max(0, current[2] - prev[2]),
+                "cost_usd": max(0.0, current[3] - prev[3]),
+            }
         if session_id not in self._usage_prior:
             prior: dict = {}
             try:
@@ -713,12 +748,15 @@ class ResearchRunner:
             self._usage_prior[session_id] = prior
         prior = self._usage_prior[session_id]
         total = {
-            "calls": int(prior.get("calls", 0)) + int(getattr(u, "calls", 0)),
-            "failed_calls": int(prior.get("failed_calls", 0)) + int(getattr(u, "failed_calls", 0)),
-            "prompt_tokens": int(prior.get("prompt_tokens", 0)) + int(getattr(u, "prompt_tokens", 0)),
-            "completion_tokens": int(getattr(u, "completion_tokens", 0)) + int(prior.get("completion_tokens", 0)),
-            "cost_usd": round(float(prior.get("cost_usd", 0.0)) + float(getattr(u, "cost_usd", 0.0)), 6),
+            "calls": int(prior.get("calls", 0)) + delta["calls"],
+            "failed_calls": int(prior.get("failed_calls", 0)) + delta["failed_calls"],
+            "prompt_tokens": int(prior.get("prompt_tokens", 0)) + delta["prompt_tokens"],
+            "completion_tokens": int(prior.get("completion_tokens", 0)) + delta["completion_tokens"],
+            "cost_usd": round(float(prior.get("cost_usd", 0.0)) + delta["cost_usd"], 6),
         }
+        # The cache becomes the new baseline immediately, so a failed save can
+        # under-report but never double-report.
+        self._usage_prior[session_id] = total
         try:
             self.checkpoints.save(session_id, "model_usage", total)
         except Exception:
@@ -1286,7 +1324,12 @@ class ResearchRunner:
                     async with keepalive():
                         reply = await self.model.call(
                             session_id, system=system, user=call_user,
-                            expect_fields=spec.output_contract,
+                            # The contract is checked BELOW, not by the client:
+                            # an explore step dispatches actions and owes no
+                            # analysis at all, so requiring the full contract
+                            # on every step made the model rewrite the phase's
+                            # whole findings document dozens of times.
+                            expect_fields=(),
                             screenshot_png=screenshot_png,
                             reference_images=ref_images,
                             # The thought's summary until the reply lands:
@@ -1296,6 +1339,20 @@ class ResearchRunner:
                                 + (f" · retry {contract_attempt}" if contract_attempt else "")
                             ),
                         )
+                    # Explore (actions requested) → the fresh evidence comes
+                    # back and the phase stays open. Commit (no actions) → the
+                    # analysis is due NOW, and only now.
+                    if not (isinstance(reply.content.get("actions"), list)
+                            and reply.content.get("actions")):
+                        missing_fields = [
+                            f for f in spec.output_contract if f not in reply.content
+                        ]
+                        if missing_fields:
+                            raise ModelContractError(
+                                f"model output missing fields: {missing_fields}",
+                                missing=missing_fields,
+                                raw=str(getattr(reply, "raw", "") or ""),
+                            )
                     timings.finish(call_key, outcome="ok")
                     break
                 except asyncio.CancelledError:
@@ -1802,6 +1859,9 @@ class ResearchRunner:
         return ModelReply(
             content=content, raw=raw,
             usage=usage if isinstance(usage, ModelUsage) else ModelUsage(),
+            # Nothing new was generated: the call that produced this text was
+            # already counted when it returned its (contract-violating) answer.
+            call_usage=ModelUsage(),
             model=str(getattr(self.model, "_model", "") or ""),
             elapsed_seconds=0.0,
         )

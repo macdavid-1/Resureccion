@@ -675,20 +675,28 @@ def build_user_prompt(
     )
 
     # --- output format -------------------------------------------------------
+    # Two shapes, and the cheap one is the common one. An EXPLORE step returns
+    # actions and a one-line note — nothing else. The phase's analysis is
+    # written ONCE, on the step that commits. (Before this split, every explore
+    # step had to re-emit the whole analysis contract, so a long phase rewrote
+    # its entire findings document dozens of times: output tokens exploded
+    # while input stayed flat.)
     parts.append(
-        "\nRESPOND WITH JSON ONLY, an object with exactly these keys: "
+        "\nRESPOND WITH JSON ONLY. Exactly one of two shapes:\n"
+        "(a) EXPLORE — you want the browser to gather more evidence first:\n"
+        '   {"actions": [{"action": "<one of the allowed actions>", "args": {...}}, ...], '
+        '"activity_note": "<one sentence>"}\n'
+        "   Nothing else: do NOT repeat the analysis here, do not restate the "
+        "evidence, do not re-emit the phase contract. It is re-prompted with "
+        "the fresh evidence and costs output tokens for no gain.\n"
+        "(b) COMMIT — the phase is ready to close: an object with exactly these "
+        "keys: "
         + _compact(list(spec.output_contract))
-        + " — plus optional key 'notes' (your free-form notes for this run, "
-        "including anything you learned that no field holds and any owner "
-        "instruction you had to override), and optional key 'actions': "
-        "a list of browser actions you want "
-        "executed BEFORE your next analysis, each "
-        '{"action": "<one of the allowed actions>", "args": {...}}. '
-        "If 'actions' is present and non-empty this is an EXPLORE step: the "
-        "orchestrator runs the actions and re-prompts you with fresh evidence; "
-        "keep the analysis fields filled with your best current judgment, but "
-        "know the phase stays open. Leave 'actions' out entirely to COMMIT and "
-        "end the phase."
+        + " (and no 'actions' key). This is where the analysis is actually "
+        "written, once, from everything gathered.\n"
+        "Both shapes may include optional key 'notes' (free-form notes for this "
+        "run — anything learned that no field holds, any owner instruction you "
+        "had to override)."
     )
     parts.append(
         "\nOPERATOR VISIBILITY: additionally include the optional key "
